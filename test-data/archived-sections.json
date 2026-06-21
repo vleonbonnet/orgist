@@ -1,0 +1,37 @@
+{
+  "sections": [
+    {
+      "added_at": "2025-06-01T10:00:00.000000Z",
+      "archived_at": "2026-02-01T10:00:00.000000Z",
+      "id": "arch-section-1",
+      "is_archived": true,
+      "is_collapsed": false,
+      "is_deleted": false,
+      "name": "Archived Section",
+      "project_id": "fixture-project",
+      "section_order": 100,
+      "updated_at": "2026-02-01T10:00:00.000000Z",
+      "user_id": "fixture-user"
+    },
+    {
+      "added_at": "2025-03-01T10:00:00.000000Z",
+      "archived_at": "2025-12-15T10:00:00.000000Z",
+      "id": "arch-section-2",
+      "is_archived": true,
+      "is_collapsed": false,
+      "is_deleted": false,
+      "name": "Old Archived Section",
+      "project_id": "fixture-project",
+      "section_order": 101,
+      "updated_at": "2025-12-15T10:00:00.000000Z",
+      "user_id": "fixture-user"
+    }
+  ],
+  "completed_info": [
+    {"completed_items": 3, "section_id": "arch-section-1"},
+    {"completed_items": 1, "section_id": "arch-section-2"}
+  ],
+  "has_more": false,
+  "next_cursor": null,
+  "total": 2
+}

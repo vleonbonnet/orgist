@@ -1,0 +1,39 @@
+{
+  "items": [
+    {
+      "id": "mock-completed-1",
+      "content": "Completed root task",
+      "description": "This task was completed",
+      "project_id": "fixture-project",
+      "section_id": null,
+      "parent_id": null,
+      "labels": [],
+      "priority": 1,
+      "due": null,
+      "deadline": null,
+      "duration": null,
+      "order": 100,
+      "created_at": "2026-02-01T10:00:00.000000Z",
+      "completed_at": "2026-02-15T14:30:00.000000Z",
+      "checked": true
+    },
+    {
+      "id": "mock-completed-2",
+      "content": "Completed section task",
+      "description": "",
+      "project_id": "fixture-project",
+      "section_id": "fixture-section",
+      "parent_id": null,
+      "labels": [],
+      "priority": 2,
+      "due": null,
+      "deadline": null,
+      "duration": null,
+      "order": 101,
+      "created_at": "2026-02-05T09:00:00.000000Z",
+      "completed_at": "2026-02-20T11:00:00.000000Z",
+      "checked": true
+    }
+  ],
+  "next_cursor": null
+}

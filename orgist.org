@@ -1,0 +1,392 @@
+#+TITLE: Orgist
+
+* Overview
+
+Orgist is an Emacs Lisp package for bidirectional synchronization between the
+[[https://developer.todoist.com/sync/v9/][Todoist Sync API v1]] and Org-Mode files.
+
+- *Read path* (Todoist \to Org): fully implemented, incremental via sync tokens.
+- *Write path* (Org \to Todoist): diff engine and command generation complete;
+  runs in dry-run mode by default.
+
+Feature summary:
+
+- One org file per root project, subprojects as headings, sections as headings.
+- Tasks with priorities, labels (tags), due dates, deadlines, recurrence,
+  titles and descriptions (pandoc markdown \to org, =--wrap=none=),
+  duration (time ranges), hierarchy.
+- Comments and activity log pulled into logbook entries.
+- Collaborator name resolution (=ASSIGNEE= property).
+- Reminders: relative (\to DEADLINE warning days), absolute (\to active timestamps),
+  location (\to =REMINDER-LOC= property).
+- Labels as first-class objects with color-to-face mapping.
+- Timezone-aware date conversion using the user profile.
+- Quick-add via natural language (=M-x orgist-quick-add=).
+- Project-level comments (pre-heading text).
+- Subprocess offloading for large syncs (UI stays responsive).
+- Rate limit handling (HTTP 429 + retry-after backoff).
+- File attachments synced bidirectionally via =org-attach=.
+- Offline test suite with cached API responses (180+ tests).
+
+* Architecture
+
+#+begin_example
+Todoist Sync API ──► JSON parse ──► Org-Mode buffers (one file per root project)
+       │
+  sync_token ──► incremental sync on next call
+       │
+  resource_types: projects, sections, items,
+                  labels, reminders, collaborators,
+                  user, user_plan_limits
+       │
+  snapshot store ──► diff engine ──► Sync API commands (write-back)
+#+end_example
+
+** Element Mapping
+
+| Todoist              | Org-Mode                               |
+|----------------------+----------------------------------------|
+| Root project         | Standalone =.org= file                   |
+| Subproject           | Heading in parent file                 |
+| Section              | Heading with =SECTION= property          |
+| Task / Item          | =* TODO= heading (pandoc markdown \to org) |
+| Priority (1–4)       | =[#A]=, =[#B]=, =[#C]= or none               |
+| Labels               | =:tag1:tag2:=                            |
+| Due date             | =SCHEDULED:=                             |
+| Deadline             | =DEADLINE:=                              |
+| Duration             | Time range in SCHEDULED (=13:00-14:00=)  |
+| Description          | Body text (pandoc markdown \to org)      |
+| Comments             | Logbook =Note= entries                   |
+| Activity (state)     | Logbook state-change entries           |
+| Collaborator         | =ASSIGNEE= property (resolved name)     |
+| Relative reminder    | DEADLINE warning days (=-2d=)            |
+| Absolute reminder    | Active timestamp in body               |
+| Location reminder    | =REMINDER-LOC= property                 |
+| Project comment      | Pre-heading text (before first =*=)      |
+| Child order          | =TODOIST-ORDER= property                 |
+| File attachment       | =org-attach= file + =ATTACH= tag             |
+
+** Body Spacing
+
+=orgist--normalize-body-spacing= enforces these rules after every element
+update:
+
+- Exactly one blank line between =:END:= (or planning lines) and body content.
+- Exactly one blank line between logbook entries and description text.
+- Exactly one blank line between body content and the next heading.
+- No runs of more than one consecutive blank line.
+- Elements with no body content have no trailing blank line.
+
+Example:
+
+#+begin_example
+  ,* TODO Task with description
+  :PROPERTIES:
+  :ID:  abc123
+  :END:
+
+  - State "TODO"  from  [2025-01-01 Wed 12:00]
+
+  Description paragraph here.
+
+  ,* TODO Task without description
+  :PROPERTIES:
+  :ID:  def456
+  :END:
+
+  - State "TODO"  from  [2025-01-01 Wed 12:00]
+
+  ,* TODO Another task
+#+end_example
+
+** Key Components
+
+- *API layer*: async HTTP via the =request= library to
+  =https://api.todoist.com/api/v1/sync=.  In interactive Emacs, large item
+  sets are offloaded to an =emacs --batch= subprocess so the UI stays
+  completely responsive (threshold controlled by =orgist-async-chunk-size=).
+  The subprocess runs the same sync code path as batch/test mode, writes
+  org files and snapshots to disk, then the main Emacs reverts its buffers.
+- *Buffer cache*: one Emacs buffer per org file, keyed by project ID in
+  =orgist-project-buffer-cache=.
+- *ID cache*: buffer-local hash table mapping element IDs to marker positions
+  for O(1) lookups.
+- *Snapshot system*: after each sync, records Todoist state to
+  =~/.emacs.d/orgist/snapshots.el= for write-back diff detection.
+- *Timezone handling*: user timezone is fetched from the Todoist =user=
+  resource and stored in =orgist-user-timezone=.  UTC timestamps from the
+  API are converted to local time via =orgist--convert-timezone=.
+- *Rate limiter*: all API calls detect HTTP 429 and retry with exponential
+  backoff using the =retry_after= header.
+
+** Sync Resources
+
+The sync request fetches these resource types in a single call:
+
+| Resource            | Usage                                    |
+|---------------------+------------------------------------------|
+| =projects=            | Root projects and subprojects            |
+| =sections=            | Section headings within projects         |
+| =items=               | Tasks (the main content)                 |
+| =labels=              | Label definitions (ID, name, color)      |
+| =reminders=           | Reminder objects grouped by item ID      |
+| =collaborators=       | User profiles for assignee resolution    |
+| =user=                | Current user (timezone, inbox project)   |
+| =user_plan_limits=    | API limits (max projects, collaborators) |
+
+** Write-Back System
+
+The diff engine compares snapshots against the current org buffer state and
+generates Todoist Sync API commands:
+
+- =item_update=, =section_update= — content, priority, labels, dates, duration
+- =item_delete=, =section_delete=
+- =item_complete=, =item_uncomplete= — via checked state
+- =item_move= — reparent tasks between sections/projects
+- =item_add= — new tasks created locally
+- =item_reorder=, =section_reorder= — order changes
+- =label_add= — create labels for new tags not yet in Todoist
+- =note_add= — push new logbook Notes as Todoist comments
+- =attachment_upload= / =attachment_delete= — file attachment sync via REST API
+
+Safety controls:
+
+- *Dry-run mode*: =orgist-write-back-dry-run= (default =t=) logs commands
+  without sending them.
+- *Three-mode write-back*: =orgist-enable-write-back= controls behavior:
+  - =nil= — write-back disabled entirely.
+  - =t= — write back without confirmation.
+  - ='ask= (default) — show a confirmation buffer before writing.
+
+*** Confirmation Buffer
+
+When =orgist-enable-write-back= is ='ask=, running =M-x orgist= or
+=M-x orgist-write-back= displays the =*orgist-confirm*= buffer with a
+two-level collapsible tree of pending changes:
+
+#+begin_example
+Orgist Write-Back — 5 change(s)
+══════════════════════════════════
+
+▶ Orgtest  2 modified, 1 deleted
+▶ Family   1 modified, 1 new
+
+C-c C-c  Confirm    C-c C-k  Cancel    TAB  Toggle section
+#+end_example
+
+- =TAB= on a project line expands the task list.
+- =TAB= on a task line expands field-level details (old → new values).
+- =n= / =p= navigate between visible headings.
+- =C-c C-c= confirms — executes the write-back then continues the sync.
+- =C-c C-k= / =q= cancels — aborts the sync cycle; local changes are
+  preserved for the next run.
+
+Implementation lives in =orgist-confirm.el= (=orgist-confirm-mode=, derived
+from =special-mode=).
+
+** Labels
+
+Label definitions are fetched from the sync API and stored in =orgist-labels=
+(hash table: ID \to name/color/order).  On pull, org tag faces are applied based
+on each label's Todoist color using =orgist-todoist-color-map= (20 named
+colors).  On write-back, adding a tag that doesn't correspond to any existing
+label generates a =label_add= command to create it in Todoist.
+
+** Reminders
+
+Todoist reminders are grouped by item ID in =orgist-reminders= and applied
+during element update:
+
+| Reminder type | Org representation                                 |
+|---------------+----------------------------------------------------|
+| Relative      | Warning days on DEADLINE: =DEADLINE: <... -2d>=      |
+| Absolute      | Active timestamp in body: =<2026-02-28 Fri 09:00>=   |
+| Location      | Property: =REMINDER-LOC: "Office" (37.77, -122.42)= |
+
+** Collaborators
+
+Shared project members are stored in =orgist-collaborators= (hash table:
+UID \to name/email).  When a task has a =responsible_uid=, the collaborator's
+name is written to the =ASSIGNEE= property.  On write-back, the name is
+resolved back to a UID.
+
+** Attachments
+
+File attachments are synced bidirectionally between Todoist comments and
+=org-attach= directories.  Requires =orgist-sync-attachments= to be non-nil.
+
+| Todoist                     | Org-Mode                                |
+|-----------------------------+-----------------------------------------|
+| Comment with =file_attachment= | File in =org-attach= dir + =ATTACH= tag      |
+
+Pull: files from Todoist comment attachments are downloaded into the
+heading's =org-attach= directory.  The =ATTACH= tag is added automatically.
+Deleted comments remove the corresponding local file.
+
+Push: new files in the =org-attach= directory generate upload + comment
+commands.  Removed files generate comment-delete commands.
+
+The =ATTACH= tag is excluded from label sync — it is never sent to Todoist
+as a label and never overwritten by label updates.
+
+Attachments on non-TODO child headings (e.g. a =Notes= heading under a
+task) are associated with the parent TODO task.
+
+** Project Comments
+
+Todoist project-level comments are fetched via the REST API and inserted as
+text in the pre-heading area of the org file (between =#+TITLE:= and the
+first =*= heading).  Changes to this text on write-back generate =note_add=
+commands with a =project_id= target.
+
+* Configuration
+
+elpaca config:
+#+begin_src elisp
+  (use-package orgist
+    :ensure t
+    ;; Set auth token
+    :custom
+    (orgist-bearer-token "token or function")
+    ;; Auto write-back on save (C-x C-s pushes local changes)
+    (orgist-sync-on-save t)
+    ;; Auto-pull every 5 min and on buffer switch (default)
+    (orgist-auto-pull-interval 300)
+    ;; Pull comments and activity into logbook
+    (orgist-sync-comments t)
+    ;; Add files to agenda
+    :config (when (and orgist-base-dir
+                       (not (member orgist-base-dir org-agenda-files)))
+              (setq org-agenda-files (cons orgist-base-dir org-agenda-files)))
+    ;; Enable automatically
+    :hook (org-mode . maybe-enable-orgist))
+#+end_src
+
+All settings live in the =orgist= customize group.
+
+| Variable                        | Default                      | Purpose                                       |
+|---------------------------------+------------------------------+-----------------------------------------------|
+| =orgist-bearer-token=             | =nil=                          | Todoist API key (required)                    |
+| =orgist-base-dir=                 | =~/.emacs.d/orgist/=           | Directory for org files and state             |
+| =orgist-log-level=                | =info=                         | Console log level (=debug=, =info=, =warn=)         |
+| =orgist-log-file=                 | =orgist-base-dir/orgist.log=   | Log file path (=nil= to disable)                |
+| =orgist-sync-project-filter=      | =nil=                          | Restrict sync to one project by name          |
+| =orgist-enable-write-back=        | ='ask=                         | Write-back mode: =nil=, =t=, or ='ask=              |
+| =orgist-write-back-dry-run=       | =t=                            | Log write-back commands without API calls     |
+| =orgist-treat-priority-4-as-none= | =t=                            | Map Todoist p4 to no org priority             |
+| =orgist-sync-on-save=             | =t=                            | Write-back on =C-x C-s= (after-save hook)      |
+| =orgist-auto-pull-interval=       | =300=                          | Auto-pull every N seconds (=nil= to disable)    |
+| =orgist-sync-comments=            | =nil=                          | Pull comments and activity into logbook       |
+| =orgist-sync-attachments=         | =nil=                          | Sync file attachments via =org-attach=          |
+| =orgist-async-chunk-size=         | =30=                           | Item count threshold for subprocess sync      |
+| =orgist-snapshot-file=            | =orgist-base-dir/snapshots.el= | Persisted snapshot store                      |
+| =orgist-tag=                      | ="todoist"=                    | File tag for orgist-managed files             |
+
+* Interactive Commands
+
+| Command                   | Purpose                                               |
+|---------------------------+-------------------------------------------------------|
+| =M-x orgist=               | Write-back + sync (shows confirm buffer in ='ask= mode) |
+| =M-x orgist-mode=          | Toggle orgist minor mode in current buffer            |
+| =M-x orgist-reset=         | Delete all orgist data and caches                     |
+| =M-x orgist-write-back=    | Detect local changes and push to Todoist (dry-run)    |
+| =M-x orgist-pull-comments= | Manually pull comments and activity for all tasks     |
+| =M-x orgist-quick-add=     | Add a task via Todoist's natural language quick-add    |
+
+* File Structure
+
+| File              | Purpose                                              |
+|-------------------+------------------------------------------------------|
+| =orgist.el=         | Main source — all functionality in one file          |
+| =orgist-confirm.el= | Write-back confirmation buffer (=orgist-confirm-mode=) |
+| =orgist.org=        | This file — project documentation                    |
+| =CLAUDE.md=         | Claude Code (AI assistant) instructions              |
+| =test-harness.el=   | Offline test infrastructure (request mock, runner)   |
+| =test-run.sh=       | Shell wrapper for test-harness and live tests        |
+| =test-sync.el=      | Live API sync test script                            |
+| =test-attachments-live.el= | Live attachment CRUD test (needs token)        |
+| =test-data/=        | Shared cached API responses (committed)              |
+
+* Testing
+
+** Test Suites
+
+| Mode              | Command                         | Tests | Description                          |
+|-------------------+---------------------------------+-------+--------------------------------------|
+| Lifecycle (all)   | =./test-run.sh=                   |   ~15 | Full + incremental sync per project  |
+| Lifecycle (one)   | =./test-run.sh Orgtest=           |     9 | Single project lifecycle             |
+| Formatting        | =./test-run.sh format=            |    68 | Spacing, write-back, new/delete/move |
+| Comments          | =./test-run.sh comments=          |    16 | Comment pull, dedup, note push       |
+| Subprocess        | =./test-run.sh subprocess=        |    12 | Full + incremental subprocess sync   |
+| Cross-project     | =./test-run.sh move=              |     9 | Cross-project task moves             |
+| New features      | =./test-run.sh features=          |    61 | Timezone, duration, labels, etc.     |
+| Attachments       | =./test-run.sh attachments=       |    35 | ATTACH tag, pull/push, diff, confirm |
+| Live attachments  | =./test-run.sh live-attachments=  |    19 | Real API attachment CRUD (needs token) |
+
+** Offline Replay (no API token needed)
+
+The primary test path. Uses cached JSON responses with an =advice-add :around=
+mock on =request=, running synchronously in batch mode.
+
+#+begin_src bash
+./test-run.sh                  # All projects (~15 lifecycle tests)
+./test-run.sh Orgtest          # Single project
+#+end_src
+
+Each replay runs a 3-phase lifecycle:
+1. Full sync — creates org files from cached =full-sync.json=.
+2. Incremental sync — re-syncs using the saved sync token.
+3. Diff check — asserts zero spurious diffs after a clean sync.
+
+Runtime artifacts (org files, tokens, snapshots, logs) go to
+=/tmp/orgist-test/<Project>/=, outside the repo.
+
+** Recording API Responses
+
+Captures real Todoist API responses and saves them to =test-data/=.
+The shared JSON contains all projects; per-project subdirectories are created
+only during recording.
+
+#+begin_src bash
+./test-run.sh record Orgtest   # Needs TODOIST_API_TOKEN or `pass`
+#+end_src
+
+** Live API Tests
+
+Runs a real sync against the Todoist API without caching.
+
+#+begin_src bash
+./test-run.sh live             # All projects (needs token)
+./test-run.sh live Orgtest     # Single project (needs token)
+#+end_src
+
+** Token Resolution
+
+All modes that need an API token check =TODOIST_API_TOKEN= first, then fall
+back to =pass show todoist/api-token=.
+
+* TODO items
+
+- [X] Hook save to sync (auto-push on =C-x C-s=) — =orgist-sync-on-save=
+- [X] Auto-pull on timer or buffer switch — =orgist-auto-pull-interval=
+- [X] Timezone-aware date conversion
+- [X] Duration write-back (time ranges)
+- [X] Order sync (=item_reorder=, =section_reorder=)
+- [X] Expanded sync resources (labels, reminders, collaborators, user)
+- [X] Collaborator name resolution (=ASSIGNEE= property)
+- [X] Reminders (relative, absolute, location)
+- [X] Labels as first-class objects (color faces, =label_add=)
+- [X] Quick-add via natural language
+- [X] Project-level comments
+- [X] Rate limit handling (HTTP 429 + retry-after)
+- [X] =note_count= optimization (skip comment fetch when 0)
+- [X] File attachment sync (=org-attach= \leftrightarrow Todoist comment attachments)
+- [ ] Disable =orgist-write-back-dry-run= (enable real write-back — confirmation buffer ready)
+- [ ] Conflict resolution for concurrent edits
+
+* Dependencies
+
+- =request= — Emacs HTTP library
+- =org= — Org-Mode
+- =subr-x= — threading macros (=thread-last=), built-in since Emacs 25
+- =pandoc= — optional, for markdown \to org description conversion

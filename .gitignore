@@ -1,0 +1,20 @@
+# Byte-compiled
+*.elc
+
+# macOS AppleDouble metadata (NAS share)
+._*
+.DS_Store
+
+# Test runtime artifacts
+test-run.log
+cap-*.txt
+
+# Real Todoist account dumps — kept on disk for local replay only, never
+# committed (privacy). Regenerate with `./test-run.sh record`. The offline
+# all/format/features/comments/... modes read these from disk locally.
+# (The synthetic test-data-move/ fixture IS tracked.)
+test-data/full-sync.json
+test-data/Orgtest/full-sync.json
+
+# Agent/editor scratch state
+.agent-shell/
