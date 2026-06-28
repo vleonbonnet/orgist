@@ -1698,7 +1698,12 @@ heading levels."
              (section-order (alist-get 'section_order element))
              (element-name (or (alist-get 'content element) (alist-get 'name element)))
              (label (orgist--id-label element-id element-name))
-             (project-buffer (orgist-get-project-buffer project-id)))
+             (is-deleted (eq (alist-get 'is_deleted element) t))
+             ;; Deleted elements come back with their project_id stripped
+             ;; to a placeholder, so the owning buffer can't be resolved;
+             ;; don't bother looking it up.
+             (project-buffer (unless is-deleted
+                               (orgist-get-project-buffer project-id))))
         (when (= (% count 100) 0)
           (orgist-log 'debug "Progress: [%d/%d] %ss %s" count total (symbol-name element-type) label))
         (when (= count total)
@@ -1707,9 +1712,13 @@ heading levels."
                     count total (symbol-name element-type) label
                     parent-id section-id project-id
                     (or section-order child-order))
-        (if (not project-buffer)
-            (orgist-log 'warn "No buffer found for project %s, skipping element %s"
-                        project-id label)
+        (cond
+         (is-deleted
+          (orgist-delete-element element-id label))
+         ((not project-buffer)
+          (orgist-log 'warn "No buffer found for project %s, skipping element %s"
+                      project-id label))
+         (t
           ;; Remove element from other buffers (cross-project move).
           ;; Use `find-buffer-visiting' — these buffers were already
           ;; opened during project creation; avoids stale-file prompts.
@@ -1775,7 +1784,7 @@ heading levels."
                             (orgist--normalize-body-spacing)))
                         ;; Rebuild cache: org-move-subtree invalidates markers
                         (orgist-rebuild-subtree-cache)))
-                    (orgist--save-buffer)))))))))))
+                    (orgist--save-buffer))))))))))))
 
 (defun orgist-reparent-if-needed (element-id todoist-parent-id)
   "Move element at point to TODOIST-PARENT-ID if its org parent differs.
@@ -3166,6 +3175,38 @@ When `orgist--log-buffer' is non-nil, file writes are deferred."
     (setq end (point))
     (delete-region beg end)))
 
+(defun orgist-delete-element (element-id label)
+  "Delete the org subtree for ELEMENT-ID in response to a remote deletion.
+Todoist strips a deleted element's `project_id' to a placeholder, so the
+owning project buffer can't be resolved from the element itself; instead
+search every project file under `orgist-base-dir' for the heading that
+carries ELEMENT-ID and delete its subtree there.  LABEL is used only for
+logging.  Also drops the element's write-back snapshot so the now-removed
+heading is not later mistaken for a local deletion to push back."
+  (let ((deleted nil))
+    (catch 'done
+      (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
+        (when-let* ((buffer (or (find-buffer-visiting file)
+                                (find-file-noselect file))))
+          (with-current-buffer buffer
+            (save-excursion
+              (when-let* ((point (orgist-find-element-by-id element-id)))
+                (goto-char point)
+                (orgist-delete-subtree)
+                ;; Drop the now-stale cache entry; surviving markers track
+                ;; the deletion automatically and self-heal on next lookup.
+                (when orgist-id-cache
+                  (remhash element-id orgist-id-cache))
+                (orgist--save-buffer)
+                (setq deleted t)
+                (throw 'done nil)))))))
+    (when orgist-snapshots
+      (remhash element-id orgist-snapshots))
+    (if deleted
+        (orgist-log 'debug "Deleted element %s (remote deletion)" label)
+      (orgist-log 'debug "Element %s already absent locally, nothing to delete"
+                  label))))
+
 ;;; Write-back (local changes -> Todoist)
 
 (defun orgist-snapshot-element (element)
@@ -4318,13 +4359,20 @@ Returns a list of command alists with keys `type', `uuid', `args'."
                        (dolist (label new-val)
                          (unless (or (member label old-labels)
                                      (orgist-label-name-to-id label))
-                           ;; New label — generate label_add command
+                           ;; New label — generate label_add command, but deduplicate
+                           ;; across tasks in the same write-back batch to avoid
+                           ;; sending the same label_add twice (Todoist returns code 54).
                            (let ((todoist-name (orgist--tag-to-label label)))
-                             (push (list (cons 'type "label_add")
-                                         (cons 'uuid (org-id-uuid))
-                                         (cons 'temp_id (org-id-uuid))
-                                         (cons 'args (list (cons 'name todoist-name))))
-                                   commands)))))))
+                             (unless (cl-some (lambda (cmd)
+                                               (and (equal (alist-get 'type cmd) "label_add")
+                                                    (equal (alist-get 'name (alist-get 'args cmd))
+                                                           todoist-name)))
+                                             commands)
+                               (push (list (cons 'type "label_add")
+                                           (cons 'uuid (org-id-uuid))
+                                           (cons 'temp_id (org-id-uuid))
+                                           (cons 'args (list (cons 'name todoist-name))))
+                                     commands))))))))
                   (:due
                    ;; Use the stored Todoist due.string when the repeater
                    ;; is unchanged — this preserves day-of-week anchors
