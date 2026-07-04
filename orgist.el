@@ -4252,38 +4252,38 @@ Returns a list of command alists with keys `type', `uuid', `args'."
                                 (list (cons 'content (orgist-convert-content-to-markdown
                                                       (plist-get local :content)))
                                       (cons 'project_id project-id)))
-                               ;; Determine parent placement.
-                               ;; For sub-projects (no TODOIST-ORDER), set
-                               ;; project_id to the sub-project instead of
-                               ;; adding parent_id (API rejects parent_id
-                               ;; pointing to a project).
+                               ;; Determine parent placement from what the
+                               ;; parent heading actually is: SECTION
+                               ;; property → section, TODO keyword → task,
+                               ;; no TODO keyword → sub-project (API rejects
+                               ;; parent_id pointing to a project).
+                               ;; TODOIST-ORDER / snapshot :order presence
+                               ;; is not a reliable task-vs-project signal:
+                               ;; locally created tasks have neither until
+                               ;; the item round-trips through a pull.
                                (place-key (cond
+                                           ((or (null parent-id)
+                                                (equal parent-id project-id))
+                                            nil)
+                                           ;; Classify by the parent heading
+                                           ((save-excursion
+                                              (when-let* ((ppos (orgist-find-element-by-id parent-id)))
+                                                (goto-char ppos)
+                                                (cond
+                                                 ((org-entry-get (point) "SECTION")
+                                                  'section_id)
+                                                 ((org-get-todo-state)
+                                                  'parent_id)
+                                                 (t 'project_id)))))
+                                           ;; Heading not found — fall back
+                                           ;; to the snapshot.
                                            ((and parent-snap
                                                  (plist-get parent-snap :section-p))
                                             'section_id)
-                                           ;; Parent has a snapshot with an order →
-                                           ;; it's a task (not a project).
                                            ((and parent-snap
                                                  (plist-get parent-snap :order))
                                             'parent_id)
-                                           ;; Parent has snapshot but no order →
-                                           ;; it's a project.  Use project_id.
-                                           ((and parent-snap
-                                                 (not (plist-get parent-snap :section-p)))
-                                            'project_id)
-                                           ;; Not in snapshots: check org buffer
-                                           ((and parent-id
-                                                 (not (equal parent-id project-id)))
-                                            (save-excursion
-                                              (let ((ppos (orgist-find-element-by-id parent-id)))
-                                                (when ppos (goto-char ppos))
-                                                (cond
-                                                 ((and ppos (org-entry-get (point) "SECTION"))
-                                                  'section_id)
-                                                 ((and ppos (org-entry-get (point) "TODOIST-ORDER"))
-                                                  'parent_id)
-                                                 ;; Sub-project: override project_id
-                                                 (t 'project_id)))))
+                                           (parent-snap 'project_id)
                                            (t nil))))
                           (if (eq place-key 'project_id)
                               ;; Sub-project: replace the root project_id
@@ -4565,42 +4565,40 @@ Returns a list of command alists with keys `type', `uuid', `args'."
                      (new-parent (cddr move-diff))
                      (parent-snap (when new-parent
                                     (gethash new-parent orgist-snapshots)))
-                     ;; Determine the right item_move argument:
-                     ;; - section in snapshots -> section_id
-                     ;; - task in snapshots (has order) -> parent_id
-                     ;; - project in snapshots (no order) -> project_id
-                     ;; - not in snapshots     -> search org buffer
-                     (move-key (cond
-                                ((and parent-snap
-                                      (plist-get parent-snap :section-p))
-                                 'section_id)
-                                ((and parent-snap
-                                      (plist-get parent-snap :order))
-                                 'parent_id)
-                                ((and parent-snap
-                                      (not (plist-get parent-snap :section-p)))
-                                 'project_id)
-                                ;; Not in snapshots: find parent in org
-                                ;; buffers and check SECTION property.
-                                (t
-                                 (catch 'found-type
-                                   (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
-                                     (when-let* ((buf (find-buffer-visiting file)))
-                                       (with-current-buffer buf
-                                         (when-let* ((pos (orgist-find-element-by-id new-parent)))
-                                           (save-excursion
-                                             (goto-char pos)
-                                             (throw 'found-type
-                                                    (cond
-                                                     ;; File-level ID = root project
-                                                     ((= pos (point-min)) 'project_id)
-                                                     ((org-entry-get (point) "SECTION") 'section_id)
-                                                     ;; Has TODOIST-ORDER = item (task)
-                                                     ((org-entry-get (point) "TODOIST-ORDER") 'parent_id)
-                                                     ;; No TODOIST-ORDER = sub-project
-                                                     (t 'project_id))))))))
-                                   ;; Not found in any buffer — project-level move
-                                   'project_id)))))
+                     ;; Determine the right item_move argument from what
+                     ;; the parent heading actually is: SECTION property →
+                     ;; section_id, TODO keyword → parent_id (task), no
+                     ;; TODO keyword → project_id.  TODOIST-ORDER /
+                     ;; snapshot :order presence is not a reliable
+                     ;; task-vs-project signal: locally created tasks have
+                     ;; neither until the item round-trips through a pull.
+                     (move-key (or
+                                (catch 'found-type
+                                  (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
+                                    (when-let* ((buf (find-buffer-visiting file)))
+                                      (with-current-buffer buf
+                                        (when-let* ((pos (orgist-find-element-by-id new-parent)))
+                                          (save-excursion
+                                            (goto-char pos)
+                                            (throw 'found-type
+                                                   (cond
+                                                    ;; File-level ID = root project
+                                                    ((= pos (point-min)) 'project_id)
+                                                    ((org-entry-get (point) "SECTION") 'section_id)
+                                                    ((org-get-todo-state) 'parent_id)
+                                                    ;; No TODO keyword = sub-project
+                                                    (t 'project_id))))))))
+                                  nil)
+                                ;; Heading not found — fall back to the
+                                ;; snapshot, then to a project-level move.
+                                (cond
+                                 ((and parent-snap
+                                       (plist-get parent-snap :section-p))
+                                  'section_id)
+                                 ((and parent-snap
+                                       (plist-get parent-snap :order))
+                                  'parent_id)
+                                 (t 'project_id)))))
                 (push (list (cons 'type "item_move")
                             (cons 'uuid (org-id-uuid))
                             (cons 'args (list (cons 'id id)

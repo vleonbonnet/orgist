@@ -1716,6 +1716,97 @@ Creates synthetic Todoist data and verifies exact formatting of:
                        (not (assq 'section_id args))
                        "Root-move: item_move has no section_id"))))))
 
+            (message "")
+            (message "--- Test group: New task under locally created parent ---")
+            ;; Flush pending diffs from prior move tests via dry-run
+            (let* ((pending (orgist-diff-all-elements))
+                   (cmds (orgist-changes-to-commands pending)))
+              (when cmds (orgist-execute-write-back cmds)))
+            (orgist-save-snapshots)
+            (orgist-load-snapshots t)
+            (orgist-build-id-cache)
+            ;; Create a parent task locally and sync it.  Its snapshot is
+            ;; built from local state, so it has :order nil and the heading
+            ;; has no TODOIST-ORDER property (neither arrives until the item
+            ;; round-trips through a pull).  Regression: children added under
+            ;; such a parent were misclassified as project children and sent
+            ;; with project_id = the parent task's ID ("Project not found").
+            (goto-char (point-max))
+            (insert "\n* TODO Local parent task\n")
+            (let* ((changes (orgist-diff-all-elements))
+                   (new-changes (seq-filter
+                                 (lambda (c) (eq (cdr c) 'new))
+                                 changes))
+                   (parent-id (caar new-changes)))
+              (orgist-test-assert-equal
+               1 (length new-changes)
+               "Local-parent: parent detected as new task")
+              (orgist-execute-write-back (orgist-changes-to-commands changes))
+              (orgist-test-assert
+               (and parent-id
+                    (gethash parent-id orgist-snapshots)
+                    (null (plist-get (gethash parent-id orgist-snapshots)
+                                     :order)))
+               "Local-parent: snapshot from local state has no :order")
+              ;; Add a subtask under the locally created parent
+              (goto-char (orgist-find-element-by-id parent-id))
+              (org-end-of-subtree t t)
+              (insert "** TODO Subtask of local parent\n")
+              (let* ((changes (orgist-diff-all-elements))
+                     (commands (orgist-changes-to-commands changes))
+                     (add-cmds (seq-filter
+                                (lambda (c)
+                                  (equal (alist-get 'type c) "item_add"))
+                                commands)))
+                (orgist-test-assert-equal
+                 1 (length add-cmds)
+                 "Local-parent: subtask produces 1 item_add command")
+                (when add-cmds
+                  (let ((args (alist-get 'args (car add-cmds))))
+                    (orgist-test-assert-equal
+                     parent-id (alist-get 'parent_id args)
+                     "Local-parent: item_add has parent_id = parent task")
+                    (orgist-test-assert-equal
+                     "fmt-proj-1" (alist-get 'project_id args)
+                     "Local-parent: item_add keeps project_id = root project")
+                    (orgist-test-assert
+                     (not (assq 'section_id args))
+                     "Local-parent: item_add has no section_id")))
+                ;; Sync the subtask so the move test below starts clean
+                (orgist-execute-write-back commands))
+              (message "")
+              (message "--- Test group: Move task under locally created parent ---")
+              ;; Move fmt-task-1 (currently under the section) beneath the
+              ;; locally created parent; item_move must use parent_id.
+              (goto-char (orgist-find-element-by-id "fmt-task-1"))
+              (org-cut-subtree)
+              (goto-char (orgist-find-element-by-id parent-id))
+              (org-end-of-subtree t t)
+              (org-paste-subtree 2)
+              (orgist-build-id-cache)
+              (let* ((changes (orgist-diff-all-elements))
+                     (commands (orgist-changes-to-commands changes))
+                     (cmd (seq-find
+                           (lambda (c)
+                             (and (equal (alist-get 'type c) "item_move")
+                                  (equal (alist-get 'id (alist-get 'args c))
+                                         "fmt-task-1")))
+                           commands)))
+                (orgist-test-assert
+                 cmd
+                 "Local-parent-move: produces item_move for fmt-task-1")
+                (when cmd
+                  (let ((args (alist-get 'args cmd)))
+                    (orgist-test-assert-equal
+                     parent-id (alist-get 'parent_id args)
+                     "Local-parent-move: item_move uses parent_id")
+                    (orgist-test-assert
+                     (not (assq 'project_id args))
+                     "Local-parent-move: item_move has no project_id")
+                    (orgist-test-assert
+                     (not (assq 'section_id args))
+                     "Local-parent-move: item_move has no section_id")))))
+
             ;; ==========================================================
             ;; Deletion detection tests
             ;; ==========================================================
