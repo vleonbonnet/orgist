@@ -1719,21 +1719,37 @@ heading levels."
           (orgist-log 'warn "No buffer found for project %s, skipping element %s"
                       project-id label))
          (t
-          ;; Remove element from other buffers (cross-project move).
+          ;; Cross-project move: when the element already lives in
+          ;; another project buffer, transplant its subtree into the
+          ;; target buffer so logbook history, CLOSED stamps and local
+          ;; children survive instead of being recreated from Todoist
+          ;; data.  Copies still present once the element exists in the
+          ;; target buffer are stale duplicates and are deleted.
           ;; Use `find-buffer-visiting' — these buffers were already
           ;; opened during project creation; avoids stale-file prompts.
-          (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
-            (when-let* ((buf (find-buffer-visiting file)))
-              (unless (eq buf project-buffer)
-                (with-current-buffer buf
-                  (save-excursion
-                    (when-let* ((old-point (orgist-find-element-by-id element-id)))
-                      (orgist-log 'debug "Removing moved %s %s from %s"
-                                  (symbol-name element-type) label (buffer-name buf))
-                      (goto-char old-point)
-                      (orgist-delete-subtree)
-                      (orgist-build-id-cache)
-                      (orgist--save-buffer)))))))
+          (let ((transplanted nil)
+                (in-target (with-current-buffer project-buffer
+                             (orgist-find-element-by-id element-id))))
+            (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
+              (when-let* ((buf (find-buffer-visiting file)))
+                (unless (eq buf project-buffer)
+                  (with-current-buffer buf
+                    (save-excursion
+                      (when-let* ((old-point (orgist-find-element-by-id element-id)))
+                        (goto-char old-point)
+                        (if in-target
+                            (progn
+                              (orgist-log 'debug "Removing duplicate %s %s from %s"
+                                          (symbol-name element-type) label (buffer-name buf))
+                              (orgist-delete-subtree))
+                          (orgist-log 'debug "Transplanting moved %s %s from %s to %s"
+                                      (symbol-name element-type) label
+                                      (buffer-name buf) (buffer-name project-buffer))
+                          (orgist--transplant-subtree project-buffer)
+                          (setq in-target t
+                                transplanted t))
+                        (orgist-build-id-cache)
+                        (orgist--save-buffer)))))))
           ;; Process element
           (with-current-buffer project-buffer
             (save-excursion
@@ -1764,10 +1780,12 @@ heading levels."
                       (setq is-new t))
                     ;; 3. Update content/properties
                     (orgist-update-element element is-new)
-                    ;; 4. Reposition among siblings if new, reparented, or order changed
+                    ;; 4. Reposition among siblings if new, reparented,
+                    ;;    transplanted from another file, or order changed
                     (let* ((old-order (org-entry-get (point) "TODOIST-ORDER"))
                            (needs-position (or is-new
                                               was-reparented
+                                              transplanted
                                               (not (equal old-order
                                                          (number-to-string order))))))
                       (org-set-property "TODOIST-ORDER"
@@ -1784,7 +1802,7 @@ heading levels."
                             (orgist--normalize-body-spacing)))
                         ;; Rebuild cache: org-move-subtree invalidates markers
                         (orgist-rebuild-subtree-cache)))
-                    (orgist--save-buffer))))))))))))
+                    (orgist--save-buffer)))))))))))))
 
 (defun orgist-reparent-if-needed (element-id todoist-parent-id)
   "Move element at point to TODOIST-PARENT-ID if its org parent differs.
@@ -1859,39 +1877,36 @@ that have no body to clear)."
          (added-at (alist-get 'added_at element))
          (level (or (orgist-calculate-heading-level (or parent-id section-id project-id))
                     (org-current-level)
-                    1)))
+                    1))
+         ;; Pre-update state, for synthesizing reopen/repeat log entries.
+         (old-state (org-get-todo-state))
+         (old-scheduled (org-entry-get (point) "SCHEDULED"))
+         (new-state (when content
+                      (if (eq (alist-get 'checked element) t) "DONE" "TODO"))))
     (orgist-log 'debug "Updating element %s at point %d"
                 (orgist--id-label id (or content name)) (point))
     ;; Set heading text (convert markdown formatting to org)
     (org-edit-headline (orgist-convert-content (or content name "")))
     ;; Set TODO state for tasks, mark sections.
-    ;; Suppress org's automatic logging (org-log-done, org-log-repeat)
-    ;; because orgist manages logbook entries from Todoist timestamps.
-    (let ((org-log-done nil)
-          (org-log-repeat nil))
-      (if content
-          (progn
-            (org-todo (if (eq (alist-get 'checked element) t) "DONE" "TODO"))
-            ;; org-todo's per-keyword log notes (`!' markers) are queued
-            ;; on `post-command-hook' by `org-add-log-setup'.  In our
-            ;; context the save runs in the same command, so the hook
-            ;; would fire after save and leave the entry unsaved.  In
-            ;; batch mode the hook never fires.  Flush synchronously.
-            ;; `org-log-setup' is the canonical "pending" flag (the
-            ;; hook itself is on the global value of `post-command-hook',
-            ;; which a buffer-local binding here would mask).  Bind
-            ;; `org-log-note-this-command' to bypass the in-command
-            ;; safety guard, and `save-window-excursion' to absorb the
-            ;; pop-to-buffer dance inside `org-add-log-note'.
-            (when (bound-and-true-p org-log-setup)
-              (let ((org-log-note-this-command this-command))
-                (save-window-excursion
-                  (org-add-log-note))))
-            (when-let* ((priority (alist-get 'priority element))
-                        (org-priority (orgist-todoist-priority-to-org priority)))
-              (org-priority org-priority)))
-        ;; Section
-        (org-set-property "SECTION" "")))
+    ;; The keyword is applied silently: sync replays *past* remote
+    ;; events, so a note logged by `org-todo' would stamp the sync time
+    ;; instead of the event time, and re-applying an unchanged state
+    ;; (e.g. a catch-up sync after weeks offline) would mint a bogus
+    ;; DONE->DONE entry.  State log entries are instead synthesized
+    ;; below from Todoist's own timestamps, which also makes replayed
+    ;; syncs idempotent: identical entries dedupe, new ones only appear
+    ;; when the state or the recurrence date actually changed.
+    (if content
+        (progn
+          (let ((org-inhibit-logging t)
+                (org-log-done nil)
+                (org-log-repeat nil))
+            (org-todo new-state))
+          (when-let* ((priority (alist-get 'priority element))
+                      (org-priority (orgist-todoist-priority-to-org priority)))
+            (org-priority org-priority)))
+      ;; Section
+      (org-set-property "SECTION" ""))
     (let* ((is-archived (and name (eq (alist-get 'is_archived element) t)))
            (label-tags (when labels
                          (mapcar #'orgist--label-to-tag (append labels nil))))
@@ -1955,13 +1970,48 @@ that have no body to clear)."
       (unless (org-element-property :closed (org-element-at-point))
         (org-back-to-heading t)
         (org-add-planning-info 'closed completed-timestamp)))
+    ;; Synthesized entries for state changes org-todo applied silently
+    ;; above.  Completions with a completed_at are covered by the branch
+    ;; just before; the payload carries no timestamp for the remaining
+    ;; cases, so their entries carry the sync time.
+    ;; - Remote completion without a completed_at timestamp.
+    (when (and new-state
+               (member new-state org-done-keywords)
+               (not (member old-state org-done-keywords))
+               (not (alist-get 'completed_at element))
+               (not (orgist-has-logbook-p "DONE")))
+      (orgist-insert-log-entry new-state (or old-state "TODO")
+                               (format-time-string
+                                (org-time-stamp-format 'long 'inactive))))
+    ;; - Remote reopen (DONE -> TODO).
+    (when (and new-state old-state
+               (member old-state org-done-keywords)
+               (not (member new-state org-done-keywords)))
+      (orgist-insert-log-entry new-state old-state
+                               (format-time-string
+                                (org-time-stamp-format 'long 'inactive))))
+    ;; - Recurring occurrence completed remotely: Todoist advances the
+    ;;   due date while the task stays TODO on both sides.  Record the
+    ;;   repeat as TODO -> TODO, matching the entries org itself logs
+    ;;   for locally-completed repeaters.
+    (when (and new-state due
+               (eq (alist-get 'is_recurring due) t)
+               (equal old-state new-state)
+               (not (member new-state org-done-keywords))
+               old-scheduled
+               (not (equal old-scheduled (org-entry-get (point) "SCHEDULED"))))
+      (orgist-insert-log-entry new-state old-state
+                               (format-time-string
+                                (org-time-stamp-format 'long 'inactive))))
     ;; Active tasks: clear any stale CLOSED left over from a previous
     ;; completion cycle (e.g. recurring task that just advanced).
+    ;; A nil TIME makes `org-add-planning-info' prompt for a date;
+    ;; removal goes through the REMOVE-LIST argument instead.
     (when (and (not (eq (alist-get 'checked element) t))
                (not (alist-get 'completed_at element))
                (org-element-property :closed (org-element-at-point)))
       (org-back-to-heading t)
-      (org-add-planning-info 'closed nil))
+      (org-add-planning-info nil nil 'closed))
     ;; Insert description AFTER logbook entries.  `org-end-of-meta-data'
     ;; with argument t skips past property drawers, planning, clocks,
     ;; and bare logbook lines.  Blank-line spacing is fixed by
@@ -3174,6 +3224,29 @@ When `orgist--log-buffer' is non-nil, file writes are deferred."
       (end-of-line))
     (setq end (point))
     (delete-region beg end)))
+
+(defun orgist--transplant-subtree (target-buffer)
+  "Move the subtree at point into TARGET-BUFFER, preserving its text.
+Used for cross-project moves so logbook history, CLOSED stamps and
+local children survive instead of being recreated from Todoist data.
+The subtree is deleted from the current buffer and appended to
+TARGET-BUFFER as a top-level heading; the caller's reparent and
+reposition steps then place it correctly.  Point must be on the
+heading."
+  (org-back-to-heading t)
+  (let* ((beg (point))
+         (end (save-excursion (org-end-of-subtree t t) (point)))
+         (subtree (buffer-substring-no-properties beg end)))
+    (delete-region beg end)
+    (with-current-buffer target-buffer
+      (save-excursion
+        (goto-char (point-max))
+        (unless (bolp) (insert "\n"))
+        (let ((paste-pos (point)))
+          (org-paste-subtree 1 subtree)
+          (goto-char paste-pos)
+          (org-back-to-heading t)
+          (orgist-rebuild-subtree-cache))))))
 
 (defun orgist-delete-element (element-id label)
   "Delete the org subtree for ELEMENT-ID in response to a remote deletion.

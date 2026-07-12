@@ -587,6 +587,15 @@ cross-file move (Hub->Child), verifying the old copy is deleted each time."
     (orgist-test-assert (not (eq source-buf work-buf))
                         "Task is NOT in Hub before move")
 
+    ;; Seed a logbook entry to prove history survives the move.  Use a
+    ;; :LOGBOOK: drawer — bare body entries are cleared on update.
+    (with-current-buffer source-buf
+      (save-excursion
+        (goto-char (orgist-find-element-by-id moved-id))
+        (let ((org-log-into-drawer t))
+          (orgist-insert-log-entry "TODO" "" "[2026-01-05 Mon 09:00]"))
+        (save-buffer)))
+
     ;; Simulate move via incremental sync
     (let ((moved-item `((id . ,moved-id)
                         (content . "Move test task A")
@@ -617,7 +626,11 @@ cross-file move (Hub->Child), verifying the old copy is deleted each time."
       (orgist-test-assert in-work "Task found in Hub after move")
       (orgist-test-assert (not in-source)
                           (format "Task removed from %s after move"
-                                  (when source-buf (buffer-name source-buf))))))
+                                  (when source-buf (buffer-name source-buf))))
+      (orgist-test-assert
+       (seq-find (lambda (line) (string-match-p "2026-01-05" line))
+                 (orgist-test--logbook-entries work-buf moved-id))
+       "Logbook history survived the move")))
 
   ;; --- Test B: Move from root project to sub-project (different file) ---
   ;; Move "Move test task B" from Hub (root project) to Child (a sub-project
@@ -678,6 +691,203 @@ cross-file move (Hub->Child), verifying the old copy is deleted each time."
   (message "")
   (message "========================================")
   (message "=== Results: CrossMove ===")
+  (message "=== Passed: %d  Failed: %d ==="
+           orgist-test--passes orgist-test--failures)
+  (message "========================================")
+  (message "")
+  orgist-test--failures)
+
+;;; ============================================================
+;;; D2. State-change logging test
+;;; ============================================================
+
+(defun orgist-test--logbook-entries (buf id)
+  "Return the logbook state-change entry lines for element ID in BUF.
+Handles both the default org format (State \"DONE\" from ...) and
+custom From/to `org-log-note-headings' formats, inside or outside
+a :LOGBOOK: drawer."
+  (with-current-buffer buf
+    (save-excursion
+      (goto-char (orgist-find-element-by-id id))
+      (org-back-to-heading t)
+      (let ((end (save-excursion (org-end-of-subtree t t) (point)))
+            (entries '()))
+        (while (re-search-forward
+                "^[ \t]*- \\(?:State\\|\\[.*?\\] From\\) .*$" end t)
+          (push (string-trim (match-string 0)) entries))
+        (nreverse entries)))))
+
+(defun orgist-test--count-state-entries (buf id to-state &optional from-state)
+  "Count logbook entries for ID in BUF recording a change to TO-STATE.
+When FROM-STATE is non-nil, only count entries leaving that state."
+  (seq-count
+   (lambda (line)
+     (and (string-match-p (format "\\(?:State\\|to\\) \"%s\"" to-state) line)
+          (or (null from-state)
+              (string-match-p (format "\\(?:from\\|From\\) \"%s\"" from-state)
+                              line))))
+   (orgist-test--logbook-entries buf id)))
+
+(defun orgist-test-run-state-log ()
+  "Test sync-side state-change logging semantics.
+Regression for the catch-up-sync incident: applying a remote state
+must never log through `org-todo' (whose notes carry the sync time
+and re-mint on every replay), only synthesize entries from Todoist
+timestamps.  Covers: completion stamped with completed_at, replay
+idempotency (no DONE->DONE), reopen, and recurring repeats."
+  (setq orgist-test--failures 0)
+  (setq orgist-test--passes 0)
+  (message "")
+  (message "========================================")
+  (message "=== State-change logging test ===")
+  (message "========================================")
+
+  ;; Phase 1: Full sync of the synthetic move fixture.
+  (message "")
+  (message "--- Phase 1: Full sync (synthetic fixture) ---")
+  (let* ((script-dir (file-name-directory (or load-file-name buffer-file-name)))
+         (test-data-dir (expand-file-name "test-data-move/" script-dir))
+         (runtime-dir (expand-file-name
+                       (concat "orgist-test/StateLog/")
+                       temporary-file-directory)))
+    (when (file-directory-p runtime-dir)
+      (delete-directory runtime-dir t))
+    (make-directory runtime-dir t)
+    (setq orgist-test-cache-dir test-data-dir)
+    (setq orgist-base-dir runtime-dir)
+    (setq orgist-sync-token-filename (expand-file-name "sync_token" runtime-dir))
+    (setq orgist-snapshot-file (expand-file-name "snapshots.el" runtime-dir))
+    (setq orgist-log-file (expand-file-name "orgist.log" runtime-dir))
+    (dolist (buf (buffer-list))
+      (when (and (buffer-file-name buf)
+                 (string-match-p "\\.org$" (buffer-file-name buf)))
+        (kill-buffer buf)))
+    (setq orgist-project-buffer-cache nil)
+    (setq orgist-snapshots nil)
+    (setq orgist-sync-mutex nil)
+    (setq orgist-sync-project-filter nil)
+    (setq revert-without-query '(".*"))
+    (setq org-priority-highest 1
+          org-priority-lowest 5
+          org-priority-default 5)
+    (setq orgist-enable-write-back t)
+    (setq orgist-write-back-dry-run t)
+    (setq orgist-log-level 'info)
+    (setq orgist-test-record-mode 'replay)
+    ;; Regression bait: every keyword logs state changes (`!'), like a
+    ;; user config.  If sync ever applies states through org-todo with
+    ;; logging enabled again, sync-time entries appear and the counts
+    ;; below fail.
+    (setq-default org-todo-keywords
+                  '((sequence "TODO(t!/!)" "|" "DONE(d!/!)")))
+    (setq org-log-into-drawer t)
+    (setq org-log-states-order-reversed nil))
+
+  (orgist)
+  (let ((completed (orgist-test--wait-for-sync 120)))
+    (orgist-test-assert completed "Full sync completed")
+    (unless completed (kill-emacs 1)))
+
+  (let* ((task-id "MoveTestTaskA01")
+         (project-id "MoveTestSrcAa01")
+         (buf (orgist-get-project-buffer project-id))
+         (deliver
+          (lambda (&rest extra)
+            (let ((item `((id . ,task-id)
+                          (content . "Move test task A")
+                          (project_id . ,project-id)
+                          (section_id . nil)
+                          (parent_id . nil)
+                          (child_order . 1)
+                          (priority . 1)
+                          (description . "")
+                          ,@extra))
+                  (inhibit-redisplay t)
+                  (orgist--batch-save-pending (make-hash-table :test 'eq)))
+              (orgist-update-elements (vector item) 'item)
+              (orgist--flush-pending-saves)))))
+
+    ;; --- Test 1: remote completion is stamped with completed_at ---
+    (message "")
+    (message "--- Test 1: remote completion ---")
+    (funcall deliver '(checked . t) '(completed_at . "2026-06-24T14:59:49Z")
+             '(due . nil))
+    (orgist-test-assert-equal
+     1 (orgist-test--count-state-entries buf task-id "DONE" "TODO")
+     "Remote completion logged exactly one TODO->DONE entry")
+    (orgist-test-assert
+     (seq-find (lambda (line) (string-match-p "2026-06-24" line))
+               (orgist-test--logbook-entries buf task-id))
+     "Completion entry carries completed_at, not the sync time")
+    (with-current-buffer buf
+      (save-excursion
+        (goto-char (orgist-find-element-by-id task-id))
+        (orgist-test-assert
+         (string-match-p "2026-06-24"
+                         (or (org-entry-get (point) "CLOSED") ""))
+         "CLOSED planning stamp carries completed_at")))
+
+    ;; --- Test 2: replaying a completed item is a no-op ---
+    ;; (the DONE->DONE incident: a catch-up sync after weeks offline
+    ;; re-delivers already-completed items)
+    (message "")
+    (message "--- Test 2: replay of completed item ---")
+    (let ((before (length (orgist-test--logbook-entries buf task-id))))
+      (funcall deliver '(checked . t) '(completed_at . "2026-06-24T14:59:49Z")
+               '(due . nil))
+      (orgist-test-assert-equal
+       before (length (orgist-test--logbook-entries buf task-id))
+       "Replay of completed item adds no DONE->DONE entry"))
+
+    ;; --- Test 3: remote reopen ---
+    (message "")
+    (message "--- Test 3: remote reopen ---")
+    (funcall deliver '(checked . :json-false) '(due . nil))
+    (orgist-test-assert-equal
+     1 (orgist-test--count-state-entries buf task-id "TODO" "DONE")
+     "Remote reopen logged exactly one DONE->TODO entry")
+    (with-current-buffer buf
+      (save-excursion
+        (goto-char (orgist-find-element-by-id task-id))
+        (orgist-test-assert (equal (org-get-todo-state) "TODO")
+                            "Reopened task is TODO")
+        (orgist-test-assert (null (org-entry-get (point) "CLOSED"))
+                            "Reopened task has no CLOSED stamp")))
+    (let ((before (length (orgist-test--logbook-entries buf task-id))))
+      (funcall deliver '(checked . :json-false) '(due . nil))
+      (orgist-test-assert-equal
+       before (length (orgist-test--logbook-entries buf task-id))
+       "Replay of open item adds no entry"))
+
+    ;; --- Test 4: recurring occurrence advance logs a repeat ---
+    (message "")
+    (message "--- Test 4: recurring occurrence ---")
+    (funcall deliver '(checked . :json-false)
+             '(due . ((date . "2026-07-20")
+                      (is_recurring . t)
+                      (string . "every week"))))
+    (orgist-test-assert-equal
+     0 (orgist-test--count-state-entries buf task-id "TODO" "TODO")
+     "First recurring date logs no repeat entry")
+    (funcall deliver '(checked . :json-false)
+             '(due . ((date . "2026-07-27")
+                      (is_recurring . t)
+                      (string . "every week"))))
+    (orgist-test-assert-equal
+     1 (orgist-test--count-state-entries buf task-id "TODO" "TODO")
+     "Recurring date advance logs one TODO->TODO repeat entry")
+    (funcall deliver '(checked . :json-false)
+             '(due . ((date . "2026-07-27")
+                      (is_recurring . t)
+                      (string . "every week"))))
+    (orgist-test-assert-equal
+     1 (orgist-test--count-state-entries buf task-id "TODO" "TODO")
+     "Replay of unchanged recurring item adds no repeat entry"))
+
+  ;; Results
+  (message "")
+  (message "========================================")
+  (message "=== Results: StateLog ===")
   (message "=== Passed: %d  Failed: %d ==="
            orgist-test--passes orgist-test--failures)
   (message "========================================")
@@ -5489,6 +5699,9 @@ CLOSED: [2026-03-17 Tue 12:43]
                                    (orgist-test-run-lifecycle proj)))))))
     ("move"
      (setq total-failures (orgist-test-run-cross-project-move)))
+    ("state-log"
+     (setq orgist-test-record-mode 'replay)
+     (setq total-failures (orgist-test-run-state-log)))
     ("subprocess"
      (setq orgist-test-record-mode 'replay)
      (setq total-failures (+ (orgist-test-run-subprocess)

@@ -98,6 +98,8 @@ main() {
         run_live "$2"
     elif [ "$1" = "move" ]; then
         run_harness move
+    elif [ "$1" = "state-log" ]; then
+        run_harness state-log
     elif [ "$1" = "subprocess" ]; then
         run_harness subprocess
     elif [ "$1" = "format" ]; then
