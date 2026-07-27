@@ -1232,6 +1232,37 @@ Persists the updated table to `orgist-labels-file' so it survives restarts."
     (orgist-log 'debug "Loaded %d labels from %s"
                 (hash-table-count orgist-labels) orgist-labels-file)))
 
+(defun orgist--refresh-labels-from-api ()
+  "Fetch the complete label list from the Todoist API into `orgist-labels'.
+Incremental syncs only return labels that changed since the last
+sync token, so the cache can be missing labels that were never
+touched while orgist was watching.  Called lazily from write-back
+before an unknown label triggers a label_add, so that label_add is
+only sent for labels that genuinely don't exist — a code 54
+\"already exists\" failure then remains a real error signal.
+Returns non-nil on success, nil on request failure."
+  (let ((fetched nil))
+    (orgist--request-with-retry
+      "https://api.todoist.com/api/v1/sync"
+      :headers `(("Authorization" . ,(format "Bearer %s" orgist-bearer-token)))
+      :data '(("sync_token" . "*")
+              ("resource_types" . "[\"labels\"]"))
+      :parser 'json-read
+      :sync t
+      :timeout orgist-write-back-timeout
+      :error (cl-function
+              (lambda (&key data error-thrown &allow-other-keys)
+                (orgist-log 'warn "Label refresh API error: %S (err=%S)"
+                            data error-thrown)))
+      :success (cl-function
+                (lambda (&key data &allow-other-keys)
+                  (orgist-store-labels data)
+                  (setq fetched t))))
+    (when fetched
+      (orgist-log 'info "Refreshed label cache: %d label(s)"
+                  (if orgist-labels (hash-table-count orgist-labels) 0)))
+    fetched))
+
 (defun orgist-store-reminders (data)
   "Extract and store reminders from sync DATA, grouped by item ID.
 Only processes non-empty arrays (incremental sync returns [] for unchanged).
@@ -4270,7 +4301,9 @@ Only diffs elements in org files modified since the last snapshot save."
   "Convert CHANGES to Todoist Sync API command objects.
 CHANGES is a list of (ELEMENT-ID . DIFF) pairs.
 Returns a list of command alists with keys `type', `uuid', `args'."
-  (let ((commands '()))
+  (let ((commands '())
+        ;; Label cache refreshed at most once per batch (see :labels).
+        (labels-refreshed nil))
     (dolist (change changes)
       (let ((id (car change))
             (diff (cdr change)))
@@ -4423,6 +4456,19 @@ Returns a list of command alists with keys `type', `uuid', `args'."
                    (push (cons 'priority new-val) update-args)
                    (setq needs-update t))
                   (:labels
+                   ;; The label cache can be stale (incremental syncs
+                   ;; only return changed labels).  A stale cache both
+                   ;; mis-converts org tags back to label names and
+                   ;; emits label_add for labels that already exist
+                   ;; remotely (API code 54).  Refresh once per batch
+                   ;; before converting, so a later code 54 failure
+                   ;; means something is genuinely wrong.
+                   (when (and (not labels-refreshed)
+                              (seq-some
+                               (lambda (l) (not (orgist-label-name-to-id l)))
+                               new-val))
+                     (orgist--refresh-labels-from-api)
+                     (setq labels-refreshed t))
                    ;; Convert org tags back to Todoist label names
                    (let ((todoist-labels (mapcar #'orgist--tag-to-label new-val)))
                      (push (cons 'labels (vconcat todoist-labels)) update-args)
@@ -4518,8 +4564,8 @@ Returns a list of command alists with keys `type', `uuid', `args'."
                    (setq needs-move t))
                   (:order
                    ;; Order changes generate item_reorder/section_reorder
-                   ;; commands via the sibling batch below.
-                   (setq needs-update nil) ; handled by reorder, not update
+                   ;; commands below; must not reset `needs-update' set
+                   ;; by other fields in the same diff.
                    nil)
                   (:last-repeat
                    ;; LAST_REPEAT newly set or updated → one instance of
@@ -5089,6 +5135,40 @@ mapping temp UUIDs to real Todoist IDs from the API response."
                     (setcdr (assq 'temp_id cmd) real-id)
                     (throw 'done nil)))))))))))
 
+(defun orgist--command-snapshot-keys (cmd-type args)
+  "Return the snapshot keys that CMD-TYPE with ARGS actually synced.
+Only these keys may be advanced to local state after the command
+succeeds — advancing anything more would record unsent local edits
+as synced and create silent, undetectable drift (the snapshot is a
+mirror of the remote, not of local intent).
+Returns the symbol `all' for commands that create the element
+remotely (item_add / section_add), where the full local state is
+the correct baseline."
+  (pcase cmd-type
+    ((or "item_update" "section_update")
+     (let (keys)
+       (dolist (pair args)
+         (pcase (car pair)
+           ((or 'content 'name) (push :content keys))
+           ('priority (push :priority keys))
+           ('labels (push :labels keys))
+           ;; A due change also refreshes TODOIST_DUE_STRING in the
+           ;; buffer before this merge runs, so both keys are synced.
+           ('due (setq keys (append '(:due :due-string) keys)))
+           ('deadline (push :deadline keys))
+           ('duration (push :duration keys))
+           ('description (push :description keys))))
+       keys))
+    ("item_move" '(:parent-id))
+    ((or "item_reorder" "section_reorder") '(:order))
+    ((or "item_complete" "item_uncomplete") '(:checked))
+    ;; item_close completes a recurring instance; the buffer date is
+    ;; refreshed from Todoist before this merge runs.
+    ("item_close" '(:checked :due :due-string :duration :last-repeat))
+    ((or "section_archive" "section_unarchive") '(:archived-p))
+    ((or "item_add" "section_add") 'all)
+    (_ nil)))
+
 (defun orgist-update-snapshots-from-local (commands &optional temp-id-mapping)
   "Update `orgist-snapshots' to match current local state for each
 element referenced in COMMANDS.  This prevents the same changes
@@ -5130,6 +5210,25 @@ for note_add commands instead of a content fingerprint."
                 (plist-put updated :comment-ids
                            (cons stored-id ids))
                 (puthash item-id updated orgist-snapshots)))))
+         ;; label_add — record the created label in `orgist-labels' so
+         ;; later batches and tag→label conversion know it.  The real
+         ;; ID comes from temp_id_mapping; in dry-run there is none and
+         ;; nothing was created, so skip.
+         ((string= cmd-type "label_add")
+          (let* ((cmd-temp-id (alist-get 'temp_id cmd))
+                 ;; Real API: alist with symbol keys; test mock: hash table.
+                 (real-id (when (and temp-id-mapping cmd-temp-id)
+                            (if (hash-table-p temp-id-mapping)
+                                (gethash cmd-temp-id temp-id-mapping)
+                              (alist-get (intern cmd-temp-id) temp-id-mapping))))
+                 (name (alist-get 'name args)))
+            (when (and real-id name)
+              (unless orgist-labels
+                (setq orgist-labels (make-hash-table :test 'equal)))
+              (puthash real-id
+                       (list (cons 'id real-id) (cons 'name name))
+                       orgist-labels)
+              (orgist-save-labels))))
          ;; Attachment commands — snapshot already handled by
          ;; orgist-execute-attachment-commands.
          ((member cmd-type '("attachment_upload" "attachment_delete"))
@@ -5162,19 +5261,21 @@ for note_add commands instead of a content fingerprint."
                              ((null due)
                               (org-entry-delete (point) "TODOIST_DUE_STRING")))))
                         (let ((local (orgist-element-local-state))
-                              (old (gethash id orgist-snapshots)))
-                          (if old
-                              ;; Existing snapshot — merge local state
-                              ;; Preserve :comment-ids and :activity-ids
-                              ;; (only set by comment/activity pull).
+                              (old (gethash id orgist-snapshots))
+                              (keys (orgist--command-snapshot-keys
+                                     cmd-type args)))
+                          (if (and old (not (eq keys 'all)))
+                              ;; Existing snapshot — advance ONLY the
+                              ;; fields this command carried.  Local
+                              ;; edits that were not sent must keep
+                              ;; diffing on the next cycle.  Preserves
+                              ;; :comment-ids / :activity-ids (only set
+                              ;; by comment/activity pull).
                               (let ((updated (copy-sequence old)))
-                                (dolist (key '(:content :checked :priority :labels
-                                               :due :due-string :deadline :duration :description
-                                               :parent-id :order :section-p :archived-p
-                                               :last-repeat))
+                                (dolist (key keys)
                                   (plist-put updated key (plist-get local key)))
                                 (puthash id updated orgist-snapshots))
-                            ;; New task — create fresh snapshot from local state
+                            ;; New element — full local state is the baseline
                             (puthash id local orgist-snapshots))
                           ))
                       (throw 'found nil))))))))))))

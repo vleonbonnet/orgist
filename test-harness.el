@@ -5641,7 +5641,85 @@ CLOSED: [2026-03-17 Tue 12:43]
                   commands)
          "Archive: produces section_archive command"))))
 
-  ;; Phase 5: Fetch archived sections function
+  ;; Phase 5: Combined edit + reorder on the same task.
+  ;; Regression: the :order branch in `orgist-changes-to-commands' used
+  ;; to reset `needs-update', silently dropping the item_update whenever
+  ;; the same save also moved/reordered the task.  And
+  ;; `orgist-update-snapshots-from-local' used to advance the FULL local
+  ;; state for move/reorder commands, baking the dropped edits into the
+  ;; snapshot as undetectable drift.
+  (message "")
+  (message "--- Phase 5: Combined edit + reorder ---")
+  (let ((task-id
+         (catch 'found
+           (maphash (lambda (id snap)
+                      (when (and (not (plist-get snap :section-p))
+                                 (not (plist-get snap :archived-p))
+                                 (orgist-find-element-by-id id)
+                                 (null (orgist-diff-element id)))
+                        (throw 'found id)))
+                    orgist-snapshots)
+           nil)))
+    (orgist-test-assert (not (null task-id))
+                        "Combined: found a clean task to edit")
+    (when task-id
+      (let* ((old-snap (gethash task-id orgist-snapshots))
+             (old-content (plist-get old-snap :content)))
+        ;; Rename the heading in the buffer.
+        (save-excursion
+          (goto-char (orgist-find-element-by-id task-id))
+          (org-edit-headline "Combined edit and reorder"))
+        ;; Force an :order diff by skewing the snapshot's stored order.
+        (let ((skewed (copy-sequence old-snap)))
+          (plist-put skewed :order (+ 100 (or (plist-get skewed :order) 0)))
+          (puthash task-id skewed orgist-snapshots))
+        (let* ((changes (orgist-diff-all-elements))
+               (diff (cdr (assoc task-id changes))))
+          (orgist-test-assert (assq :content diff)
+                              "Combined: :content in diff")
+          (orgist-test-assert (assq :order diff)
+                              "Combined: :order in diff")
+          (let* ((commands (orgist-changes-to-commands changes))
+                 (update (cl-find-if
+                          (lambda (c)
+                            (and (equal (alist-get 'type c) "item_update")
+                                 (equal (alist-get 'id (alist-get 'args c))
+                                        task-id)))
+                          commands))
+                 (reorder (cl-find-if
+                           (lambda (c)
+                             (and (equal (alist-get 'type c) "item_reorder")
+                                  (equal (alist-get
+                                          'id
+                                          (aref (alist-get 'items (alist-get 'args c)) 0))
+                                         task-id)))
+                           commands)))
+            (orgist-test-assert (not (null update))
+                                "Combined: item_update emitted despite reorder")
+            (orgist-test-assert (not (null reorder))
+                                "Combined: item_reorder emitted")
+            (orgist-test-assert
+             (and update (alist-get 'content (alist-get 'args update)))
+             "Combined: item_update carries the new content")
+            ;; Advance snapshots from ONLY the reorder command (as if the
+            ;; item_update was dropped or failed): the unsent content edit
+            ;; must remain detectable, while :order advances.
+            (when reorder
+              (orgist-update-snapshots-from-local (list reorder))
+              (let ((diff2 (orgist-diff-element task-id)))
+                (orgist-test-assert
+                 (assq :content diff2)
+                 "Combined: partial advance keeps unsent :content detectable")
+                (orgist-test-assert
+                 (not (assq :order diff2))
+                 "Combined: partial advance settles :order"))
+              ;; Restore original content and snapshot for later phases.
+              (save-excursion
+                (goto-char (orgist-find-element-by-id task-id))
+                (org-edit-headline old-content))
+              (puthash task-id old-snap orgist-snapshots)))))))
+
+  ;; Phase 6: Fetch archived sections function
   (message "")
   (message "--- Phase 6: Fetch archived sections ---")
   (let ((sections (orgist-fetch-archived-sections)))
