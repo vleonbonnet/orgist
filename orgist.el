@@ -1072,13 +1072,19 @@ buffers and reloads snapshots when the subprocess finishes."
 (defun orgist--revert-buffers-from-disk ()
   "Revert all orgist-managed buffers from their files on disk.
 Skips buffers with unsaved modifications to avoid destroying
-the user's in-progress edits.  Suppresses confirmation prompts,
-rebuilds ID caches, and re-folds drawers."
+the user's in-progress edits, and buffers whose file is unchanged
+on disk — reverting wipes the org-element cache and forces a full
+re-parse, which blocks Emacs when run from a process sentinel.
+Suppresses confirmation prompts, rebuilds ID caches, and re-folds
+drawers."
   (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
     (when-let* ((buf (find-buffer-visiting file)))
-      (if (buffer-modified-p buf)
-          (orgist-log 'debug "Skipping revert of %s (unsaved changes)"
-                      (file-name-nondirectory file))
+      (cond
+       ((buffer-modified-p buf)
+        (orgist-log 'debug "Skipping revert of %s (unsaved changes)"
+                    (file-name-nondirectory file)))
+       ((verify-visited-file-modtime buf))
+       (t
         (condition-case err
             (with-current-buffer buf
               (let ((revert-without-query '(".*")))
@@ -1090,7 +1096,7 @@ rebuilds ID caches, and re-folds drawers."
           (error
            (orgist-log 'warn "Error reverting %s: %s"
                        (file-name-nondirectory file)
-                       (error-message-string err))))))))
+                       (error-message-string err)))))))))
 
 (defun orgist--finish-pull ()
   "Finalize a pull: save snapshots, clear mutex, flush logs.
