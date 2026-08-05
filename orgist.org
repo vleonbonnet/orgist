@@ -6,8 +6,7 @@ Orgist is an Emacs Lisp package for bidirectional synchronization between the
 [[https://developer.todoist.com/sync/v9/][Todoist Sync API v1]] and Org-Mode files.
 
 - *Read path* (Todoist \to Org): fully implemented, incremental via sync tokens.
-- *Write path* (Org \to Todoist): diff engine and command generation complete;
-  runs in dry-run mode by default.
+- *Write path* (Org \to Todoist): diff engine and command generation fully complete; runs in dry-run mode by default.
 
 Feature summary:
 
@@ -248,12 +247,16 @@ elpaca config:
     ;; Set auth token
     :custom
     (orgist-bearer-token "token or function")
-    ;; Auto write-back on save (C-x C-s pushes local changes)
-    (orgist-sync-on-save t)
-    ;; Auto-pull every 5 min and on buffer switch (default)
-    (orgist-auto-pull-interval 300)
-    ;; Pull comments and activity into logbook
+    ;; Sync comments
     (orgist-sync-comments t)
+    ;; Sync attachements
+    (orgist-sync-attachments t)
+    ;; Sync completed tasks
+    (orgist-sync-completed-tasks t)
+    ;; Sync non-Todoist properties and drawers
+    (orgist-sync-metadata t)
+    ;; Look for past 10 years
+    (orgist-completed-tasks-since-days 3650)
     ;; Add files to agenda
     :config (when (and orgist-base-dir
                        (not (member orgist-base-dir org-agenda-files)))
@@ -382,7 +385,7 @@ back to =pass show todoist/api-token=.
 - [X] Rate limit handling (HTTP 429 + retry-after)
 - [X] =note_count= optimization (skip comment fetch when 0)
 - [X] File attachment sync (=org-attach= \leftrightarrow Todoist comment attachments)
-- [ ] Disable =orgist-write-back-dry-run= (enable real write-back — confirmation buffer ready)
+- [X] Disable =orgist-write-back-dry-run= (enable real write-back — confirmation buffer ready)
 - [ ] Conflict resolution for concurrent edits
 
 * Dependencies
