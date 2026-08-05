@@ -138,8 +138,10 @@ comments instead of skipping due to note_count=0 optimization."
              (string-match-p "\\.org$" (buffer-file-name buf)))
     (kill-buffer buf)))
 
-;; Use the "Barz" task for testing
-(defvar att-test-task-id "fixture-comment-task")
+;; Use an explicitly selected disposable task for testing.
+(defvar att-test-task-id
+  (or (getenv "ORGIST_TEST_TASK_ID")
+      (error "Set ORGIST_TEST_TASK_ID to a disposable Todoist task ID")))
 
 (message "")
 (message "========================================")

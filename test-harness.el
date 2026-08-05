@@ -23,11 +23,79 @@
 (defvar orgist-test-cache-dir nil
   "Directory for cached API responses (test-data/<Project>/).")
 
+(defvar orgist-test-comment-task-id nil
+  "Runtime task ID used by the comment and activity fixture tests.")
+
+(defconst orgist-test-comment-fixture-task-id "fixture-comment-task"
+  "Sanitized task ID used by the comment and activity fixtures.")
+
 (defun orgist-test--cache-filename (sync-token)
   "Return cache filename based on SYNC-TOKEN."
   (expand-file-name
    (if (string= sync-token "*") "full-sync.json" "incremental-sync.json")
    orgist-test-cache-dir))
+
+(defun orgist-test--fixture-task-id (task-id)
+  "Map the runtime comment TASK-ID to its sanitized fixture ID."
+  (if (and orgist-test-comment-task-id
+           (equal task-id orgist-test-comment-task-id))
+      orgist-test-comment-fixture-task-id
+    task-id))
+
+(defun orgist-test--task-cache-file (kind task-id)
+  "Return the replay or recording cache path for KIND and TASK-ID."
+  (expand-file-name
+   (format "%s/%s.json"
+           kind
+           (if (eq orgist-test-record-mode 'record)
+               task-id
+             (orgist-test--fixture-task-id task-id)))
+   orgist-test-cache-dir))
+
+(defun orgist-test--runtime-project-id ()
+  "Return a project ID from the isolated test buffers."
+  (or (caar orgist-project-buffer-cache)
+      (catch 'found
+        (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
+          (with-current-buffer (find-file-noselect file)
+            (when-let ((id (org-entry-get (point-min) "ID" t)))
+              (throw 'found id))))
+        nil)))
+
+(defun orgist-test--runtime-section-id ()
+  "Return a section ID from the isolated test buffers or snapshots."
+  (or (when (hash-table-p orgist-snapshots)
+        (catch 'found
+          (maphash (lambda (id snapshot)
+                     (when (and (plist-get snapshot :section-p)
+                                (not (plist-get snapshot :archived-p)))
+                       (throw 'found id)))
+                   orgist-snapshots)
+          nil))
+      (catch 'found
+        (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
+          (with-current-buffer (find-file-noselect file)
+            (org-map-entries
+             (lambda ()
+               (when-let ((id (and (org-entry-get nil "SECTION")
+                                   (org-entry-get nil "ID"))))
+                 (throw 'found id)))
+             nil 'file)))
+        nil)))
+
+(defun orgist-test--find-comment-task-id ()
+  "Return a task ID from the current test snapshots."
+  (when (hash-table-p orgist-snapshots)
+    (let ((fallback nil))
+      (catch 'found
+        (maphash (lambda (id snapshot)
+                   (when (and (not (plist-get snapshot :section-p))
+                              (plist-get snapshot :content))
+                     (if (> (or (plist-get snapshot :note-count) 0) 0)
+                         (throw 'found id)
+                       (setq fallback id))))
+                 orgist-snapshots)
+        fallback))))
 
 (defun orgist-test--extract-sync-token (args)
   "Extract sync_token from the :data plist in ARGS."
@@ -65,13 +133,10 @@ ORIG-FN is the original `request', URL is the endpoint, ARGS are kwargs."
 
      ;; Comments API: GET /api/v1/comments?task_id=ID
      ((string-match-p "/comments" url)
-      (let* ((task-id (when (string-match "task_id=\\([^&]+\\)" url)
-                        (match-string 1 url)))
-             (script-dir (file-name-directory (or load-file-name buffer-file-name)))
-             (cache-file (expand-file-name
-                          (format "test-data/comments/%s.json" task-id)
-                          script-dir))
-             (success-fn (plist-get args :success)))
+       (let* ((task-id (when (string-match "task_id=\\([^&]+\\)" url)
+                         (match-string 1 url)))
+              (cache-file (orgist-test--task-cache-file "comments" task-id))
+              (success-fn (plist-get args :success)))
         (if (eq orgist-test-record-mode 'record)
             (let* ((orig-success success-fn)
                    (wrapped-success
@@ -112,14 +177,11 @@ ORIG-FN is the original `request', URL is the endpoint, ARGS are kwargs."
 
      ;; Activity API: GET /api/v1/activities
      ((string-match-p "/activities" url)
-      (let* ((params (plist-get args :params))
-             (task-id (or (cdr (assoc "objectId" params))
-                          (cdr (assoc "object_id" params))))
-             (script-dir (file-name-directory (or load-file-name buffer-file-name)))
-             (cache-file (expand-file-name
-                          (format "test-data/activity/%s.json" task-id)
-                          script-dir))
-             (success-fn (plist-get args :success)))
+       (let* ((params (plist-get args :params))
+              (task-id (or (cdr (assoc "objectId" params))
+                           (cdr (assoc "object_id" params))))
+              (cache-file (orgist-test--task-cache-file "activity" task-id))
+              (success-fn (plist-get args :success)))
         (if (eq orgist-test-record-mode 'record)
             (let* ((orig-success success-fn)
                    (wrapped-success
@@ -139,22 +201,28 @@ ORIG-FN is the original `request', URL is the endpoint, ARGS are kwargs."
                      (json-array-type 'vector)
                      (json-key-type 'symbol)
                      (data (json-read-file cache-file)))
+                (seq-doseq (event (or (alist-get 'results data) []))
+                  (setf (alist-get 'objectId event) task-id))
                 (when success-fn (funcall success-fn :data data)))
             (when success-fn
               (funcall success-fn :data '((results . []) (nextCursor . nil))))))))
 
-     ;; Archived sections API: GET /api/v1/sections/archived
-     ((string-match-p "/sections/archived" url)
-      (let* ((script-dir (file-name-directory (or load-file-name buffer-file-name)))
-             (cache-file (expand-file-name "test-data/archived-sections.json"
-                                           script-dir))
-             (success-fn (plist-get args :success)))
+      ;; Archived sections API: GET /api/v1/sections/archived
+      ((string-match-p "/sections/archived" url)
+       (let* ((params (plist-get args :params))
+              (project-id (cdr (assoc "project_id" params)))
+              (script-dir (file-name-directory (or load-file-name buffer-file-name)))
+              (cache-file (expand-file-name "test-data/archived-sections.json"
+                                            script-dir))
+              (success-fn (plist-get args :success)))
         (message "[test-harness] REPLAY archived sections")
         (if (file-exists-p cache-file)
             (let* ((json-object-type 'alist)
                    (json-array-type 'vector)
                    (json-key-type 'symbol)
                    (data (json-read-file cache-file)))
+              (seq-doseq (section (or (alist-get 'sections data) []))
+                (setf (alist-get 'project_id section) project-id))
               (when success-fn (funcall success-fn :data data)))
           (when success-fn
             (funcall success-fn
@@ -179,14 +247,21 @@ ORIG-FN is the original `request', URL is the endpoint, ARGS are kwargs."
                        (when orig-success (funcall orig-success :data data))))))
               (setq args (plist-put args :success wrapped-success))
               (apply orig-fn url args))
-          ;; Replay mode
-          (message "[test-harness] REPLAY completed tasks")
-          (if (file-exists-p cache-file)
-              (let* ((json-object-type 'alist)
-                     (json-array-type 'vector)
-                     (json-key-type 'symbol)
-                     (data (json-read-file cache-file)))
-                (when success-fn (funcall success-fn :data data)))
+           ;; Replay mode
+           (message "[test-harness] REPLAY completed tasks")
+           (if (file-exists-p cache-file)
+               (let* ((json-object-type 'alist)
+                      (json-array-type 'vector)
+                      (json-key-type 'symbol)
+                      (data (json-read-file cache-file))
+                      (project-id (orgist-test--runtime-project-id))
+                      (section-id (orgist-test--runtime-section-id)))
+                 (seq-doseq (task (or (alist-get 'items data) []))
+                   (when project-id
+                     (setf (alist-get 'project_id task) project-id))
+                   (when (and section-id (alist-get 'section_id task))
+                     (setf (alist-get 'section_id task) section-id)))
+                 (when success-fn (funcall success-fn :data data)))
             (when success-fn
               (funcall success-fn :data '((results . []) (next_cursor . nil))))))))
 
@@ -333,6 +408,7 @@ Runtime artifacts (org files, token, snapshots) go to /tmp/orgist-test/<Project>
     (setq orgist-project-buffer-cache nil)
     (setq orgist-snapshots nil)
     (setq orgist-sync-mutex nil)
+    (setq orgist-test-comment-task-id nil)
     (setq orgist-sync-project-filter project-name)
     ;; Suppress "file changed on disk" prompts in batch mode
     (setq revert-without-query '(".*"))
@@ -2400,15 +2476,22 @@ Phase 5: New Note detection and note_add command generation"
     (orgist-test-assert completed "Full sync completed")
     (unless completed (kill-emacs 1)))
 
-  ;; Phase 2: Pull comments for Barz task
+  ;; Phase 2: Pull comments for a task selected from the runtime fixture
   (message "")
-  (message "--- Phase 2: Pull comments/activity for Barz ---")
-  (let ((test-task-id "fixture-comment-task"))
+  (message "--- Phase 2: Pull comments/activity for fixture task ---")
+  (let ((test-task-id nil))
     ;; Open org files and build caches
     (dolist (file (directory-files orgist-base-dir t "\\.org$"))
       (find-file file)
       (org-mode)
       (orgist-build-id-cache))
+    (setq test-task-id (orgist-test--find-comment-task-id)
+          orgist-test-comment-task-id test-task-id)
+    (orgist-test-assert test-task-id "Comment fixture task found in snapshots")
+    (when test-task-id
+      (let ((snapshot (gethash test-task-id orgist-snapshots)))
+        (plist-put snapshot :note-count 99)
+        (puthash test-task-id snapshot orgist-snapshots)))
     ;; Pull comments
     (orgist-sync-task-comments-and-activity test-task-id)
 
@@ -2416,7 +2499,7 @@ Phase 5: New Note detection and note_add command generation"
     (message "")
     (message "--- Phase 3: Verify logbook entries ---")
     (let ((pos (orgist-find-element-by-id test-task-id)))
-      (orgist-test-assert pos "Barz task found in buffer")
+      (orgist-test-assert pos "Comment fixture task found in buffer")
       (when pos
         (save-excursion
           (goto-char pos)
@@ -5237,7 +5320,7 @@ Phase 5: Re-pull (no duplicates)"
                                (when (org-up-heading-safe)
                                  (org-entry-get (point) "ID")))))
               (orgist-test-assert
-               (equal parent-id "fixture-section")
+               (equal parent-id (orgist-test--runtime-section-id))
                (format "Section task is under Section (parent=%s)" parent-id))))))
 
       ;; Phase 5: Re-pull (no duplicates)
@@ -5270,7 +5353,7 @@ Phase 5: Re-pull (no duplicates)"
               `((id . "mock-completed-parent")
                 (content . "Completed parent task")
                 (description . "")
-                (project_id . "fixture-project")
+                (project_id . ,(orgist-test--runtime-project-id))
                 (section_id . nil)
                 (parent_id . nil)
                 (labels . [])
@@ -5286,7 +5369,7 @@ Phase 5: Re-pull (no duplicates)"
               `((id . "mock-completed-child")
                 (content . "Completed child task")
                 (description . "")
-                (project_id . "fixture-project")
+                (project_id . ,(orgist-test--runtime-project-id))
                 (section_id . nil)
                 (parent_id . "mock-completed-parent")
                 (labels . [])
@@ -5565,7 +5648,9 @@ CLOSED: [2026-03-17 Tue 12:43]
                         "Archived section has :ARCHIVE: tag"))
 
   ;; Check active sections do NOT have :ARCHIVE: tag
-  (let* ((active-pos (orgist-find-element-by-id "fixture-section"))
+  (let* ((active-section-id (orgist-test--runtime-section-id))
+         (active-pos (and active-section-id
+                          (orgist-find-element-by-id active-section-id)))
          (has-archive (when active-pos
                         (save-excursion
                           (goto-char active-pos)
@@ -5625,13 +5710,15 @@ CLOSED: [2026-03-17 Tue 12:43]
     (when-let* ((buf (find-buffer-visiting file)))
       (with-current-buffer buf (orgist-build-id-cache))))
   ;; Add :ARCHIVE: tag to an active section
-  (let ((active-pos (orgist-find-element-by-id "fixture-section")))
+  (let ((active-pos (when-let ((active-section-id
+                               (orgist-test--runtime-section-id)))
+                      (orgist-find-element-by-id active-section-id))))
     (when active-pos
       (save-excursion
         (goto-char active-pos)
         (org-set-tags '("ARCHIVE")))))
   (let* ((changes (orgist-diff-all-elements))
-         (active-diff (assoc "fixture-section" changes)))
+         (active-diff (assoc (orgist-test--runtime-section-id) changes)))
     (orgist-test-assert (not (null active-diff))
                         "Archive: diff detected for active section")
     (when changes

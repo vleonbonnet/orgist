@@ -7,6 +7,8 @@
 #   ./test-run.sh record Orgtest     # Record API responses (needs token)
 #   ./test-run.sh live               # Live API test, all projects (needs token)
 #   ./test-run.sh live Orgtest       # Live API test, one project (needs token)
+#   ORGIST_TEST_TASK_ID=<id> ./test-run.sh live-attachments
+#                                      # Live attachment CRUD (needs token)
 #
 # Output is saved to test-run.log alongside this script.
 #
@@ -120,6 +122,10 @@ main() {
         run_harness attachments
     elif [ "$1" = "live-attachments" ]; then
         require_token
+        if [ -z "${ORGIST_TEST_TASK_ID:-}" ]; then
+            echo "Error: ORGIST_TEST_TASK_ID must name a disposable Todoist task."
+            exit 1
+        fi
         local t="$PROJECT_TIMEOUT"
         TODOIST_API_TOKEN="$TODOIST_API_TOKEN" \
             HOME="${HOME:-/c/Users/$USER}" \

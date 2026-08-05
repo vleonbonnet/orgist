@@ -14,7 +14,12 @@ cap-*.txt
 # all/format/features/comments/... modes read these from disk locally.
 # (The synthetic test-data-move/ fixture IS tracked.)
 test-data/full-sync.json
-test-data/Orgtest/full-sync.json
+test-data/*/full-sync.json
+test-data/*/comments/
+test-data/*/activity/
 
 # Agent/editor scratch state
 .agent-shell/
+
+# NAS delete markers
+.smbdelete*

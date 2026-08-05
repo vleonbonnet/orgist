@@ -1,0 +1,31 @@
+{
+  "results": [
+    {
+      "id": 10001,
+      "objectType": "item",
+      "objectId": "fixture-comment-task",
+      "eventType": "added",
+      "eventDate": "2026-02-18T10:00:00.000000Z",
+      "extraData": {}
+    },
+    {
+      "id": 10002,
+      "objectType": "item",
+      "objectId": "fixture-comment-task",
+      "eventType": "completed",
+      "eventDate": "2026-02-19T14:54:00.000000Z",
+      "extraData": {}
+    },
+    {
+      "id": 10003,
+      "objectType": "item",
+      "objectId": "fixture-comment-task",
+      "eventType": "updated",
+      "eventDate": "2026-02-19T15:00:00.000000Z",
+      "extraData": {
+        "content": "Fixture task"
+      }
+    }
+  ],
+  "nextCursor": null
+}

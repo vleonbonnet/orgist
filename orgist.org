@@ -358,6 +358,7 @@ Runs a real sync against the Todoist API without caching.
 #+begin_src bash
 ./test-run.sh live             # All projects (needs token)
 ./test-run.sh live Orgtest     # Single project (needs token)
+ORGIST_TEST_TASK_ID=<id> ./test-run.sh live-attachments  # Needs token + disposable task
 #+end_src
 
 ** Token Resolution
