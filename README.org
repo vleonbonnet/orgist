@@ -27,6 +27,20 @@ Feature summary:
 - File attachments synced bidirectionally via =org-attach=.
 - Offline test suite with cached API responses (180+ tests).
 
+* Screenshots
+
+The following screenshots are real Todoist and Emacs captures using synthetic
+=Orgtest= data and contain no personal account information.
+
+#+CAPTION: An actual Org-Mode project buffer managed by Orgist
+[[file:screenshots/org-file.png]]
+
+#+CAPTION: The same synthetic project in the actual Todoist web UI
+[[file:screenshots/todoist-equivalent.png]]
+
+#+CAPTION: The actual Orgist write-back confirmation buffer with changes expanded
+[[file:screenshots/orgist-confirm.png]]
+
 * Architecture
 
 #+begin_example
@@ -302,13 +316,14 @@ All settings live in the =orgist= customize group.
 |-------------------+------------------------------------------------------|
 | =orgist.el=         | Main source — all functionality in one file          |
 | =orgist-confirm.el= | Write-back confirmation buffer (=orgist-confirm-mode=) |
-| =orgist.org=        | This file — project documentation                    |
+| =README.org=        | This file — project documentation                    |
 | =CLAUDE.md=         | Claude Code (AI assistant) instructions              |
 | =test-harness.el=   | Offline test infrastructure (request mock, runner)   |
 | =test-run.sh=       | Shell wrapper for test-harness and live tests        |
 | =test-sync.el=      | Live API sync test script                            |
 | =test-attachments-live.el= | Live attachment CRUD test (needs token)        |
 | =test-data/=        | Shared cached API responses (committed)              |
+| =screenshots/=      | Synthetic Org, Todoist, and confirmation views      |
 
 * Testing
 

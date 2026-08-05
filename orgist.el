@@ -2070,7 +2070,7 @@ that have no body to clear)."
 
 (defun orgist--normalize-body-spacing ()
   "Ensure consistent blank-line spacing in the current heading's body.
-Guarantees (see orgist.org § Body Spacing):
+Guarantees (see README.org § Body Spacing):
 - Exactly one blank line separates body content (logbook, description)
   from the next heading or end of subtree.
 - Exactly one blank line between logbook entries and description text.

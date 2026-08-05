@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Instructions for Claude Code when working in this repository. See `orgist.org` for full project documentation.
+Instructions for Claude Code when working in this repository. See `README.org` for full project documentation.
 
 ## Project Overview
 
@@ -25,7 +25,7 @@ Orgist is an Emacs Lisp package for bidirectional sync between Todoist and Org-M
 
 - `orgist.el` — Main source (all functionality)
 - `orgist-confirm.el` — Write-back confirmation buffer (`orgist-confirm-mode`)
-- `orgist.org` — Project documentation, architecture, configuration reference
+- `README.org` — Project documentation, architecture, configuration reference
 - `test-harness.el` — Offline test infrastructure (request mock, isolation, lifecycle runner)
 - `test-run.sh` — Shell wrapper for replay, record, and live test modes
 - `test-sync.el` — Live API sync test script
