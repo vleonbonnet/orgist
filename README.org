@@ -41,6 +41,64 @@ The following screenshots are real Todoist and Emacs captures using synthetic
 #+CAPTION: The actual Orgist write-back confirmation buffer with changes expanded
 [[file:screenshots/orgist-confirm.png]]
 
+* Configuration
+
+elpaca config:
+#+begin_src elisp
+  (use-package orgist
+    :ensure (:host github :repo "vleonbonnet/orgist")
+    ;; Set auth token
+    :custom
+    (orgist-bearer-token "token or function")
+    ;; Sync comments
+    (orgist-sync-comments t)
+    ;; Sync attachements
+    (orgist-sync-attachments t)
+    ;; Sync completed tasks
+    (orgist-sync-completed-tasks t)
+    ;; Sync non-Todoist properties and drawers
+    (orgist-sync-metadata t)
+    ;; Look for past 10 years
+    (orgist-completed-tasks-since-days 3650)
+    ;; Add files to agenda
+    :config (when (and orgist-base-dir
+                       (not (member orgist-base-dir org-agenda-files)))
+              (setq org-agenda-files (cons orgist-base-dir org-agenda-files)))
+    ;; Enable automatically
+    :hook (org-mode . maybe-enable-orgist))
+#+end_src
+
+All settings live in the =orgist= customize group.
+
+| Variable                        | Default                      | Purpose                                       |
+|---------------------------------+------------------------------+-----------------------------------------------|
+| =orgist-bearer-token=             | =nil=                          | Todoist API key (required)                    |
+| =orgist-base-dir=                 | =~/.emacs.d/orgist/=           | Directory for org files and state             |
+| =orgist-log-level=                | =info=                         | Console log level (=debug=, =info=, =warn=)         |
+| =orgist-log-file=                 | =orgist-base-dir/orgist.log=   | Log file path (=nil= to disable)                |
+| =orgist-sync-project-filter=      | =nil=                          | Restrict sync to one project by name          |
+| =orgist-enable-write-back=        | ='ask=                         | Write-back mode: =nil=, =t=, or ='ask=              |
+| =orgist-write-back-dry-run=       | =t=                            | Log write-back commands without API calls     |
+| =orgist-treat-priority-4-as-none= | =t=                            | Map Todoist p4 to no org priority             |
+| =orgist-sync-on-save=             | =t=                            | Write-back on =C-x C-s= (after-save hook)      |
+| =orgist-auto-pull-interval=       | =300=                          | Auto-pull every N seconds (=nil= to disable)    |
+| =orgist-sync-comments=            | =nil=                          | Pull comments and activity into logbook       |
+| =orgist-sync-attachments=         | =nil=                          | Sync file attachments via =org-attach=          |
+| =orgist-async-chunk-size=         | =30=                           | Item count threshold for subprocess sync      |
+| =orgist-snapshot-file=            | =orgist-base-dir/snapshots.el= | Persisted snapshot store                      |
+| =orgist-tag=                      | ="todoist"=                    | File tag for orgist-managed files             |
+
+* Interactive Commands
+
+| Command                   | Purpose                                               |
+|---------------------------+-------------------------------------------------------|
+| =M-x orgist=               | Write-back + sync (shows confirm buffer in ='ask= mode) |
+| =M-x orgist-mode=          | Toggle orgist minor mode in current buffer            |
+| =M-x orgist-reset=         | Delete all orgist data and caches                     |
+| =M-x orgist-write-back=    | Detect local changes and push to Todoist (dry-run)    |
+| =M-x orgist-pull-comments= | Manually pull comments and activity for all tasks     |
+| =M-x orgist-quick-add=     | Add a task via Todoist's natural language quick-add    |
+
 * Architecture
 
 #+begin_example
@@ -252,64 +310,6 @@ text in the pre-heading area of the org file (between =#+TITLE:= and the
 first =*= heading).  Changes to this text on write-back generate =note_add=
 commands with a =project_id= target.
 
-* Configuration
-
-elpaca config:
-#+begin_src elisp
-  (use-package orgist
-    :ensure t
-    ;; Set auth token
-    :custom
-    (orgist-bearer-token "token or function")
-    ;; Sync comments
-    (orgist-sync-comments t)
-    ;; Sync attachements
-    (orgist-sync-attachments t)
-    ;; Sync completed tasks
-    (orgist-sync-completed-tasks t)
-    ;; Sync non-Todoist properties and drawers
-    (orgist-sync-metadata t)
-    ;; Look for past 10 years
-    (orgist-completed-tasks-since-days 3650)
-    ;; Add files to agenda
-    :config (when (and orgist-base-dir
-                       (not (member orgist-base-dir org-agenda-files)))
-              (setq org-agenda-files (cons orgist-base-dir org-agenda-files)))
-    ;; Enable automatically
-    :hook (org-mode . maybe-enable-orgist))
-#+end_src
-
-All settings live in the =orgist= customize group.
-
-| Variable                        | Default                      | Purpose                                       |
-|---------------------------------+------------------------------+-----------------------------------------------|
-| =orgist-bearer-token=             | =nil=                          | Todoist API key (required)                    |
-| =orgist-base-dir=                 | =~/.emacs.d/orgist/=           | Directory for org files and state             |
-| =orgist-log-level=                | =info=                         | Console log level (=debug=, =info=, =warn=)         |
-| =orgist-log-file=                 | =orgist-base-dir/orgist.log=   | Log file path (=nil= to disable)                |
-| =orgist-sync-project-filter=      | =nil=                          | Restrict sync to one project by name          |
-| =orgist-enable-write-back=        | ='ask=                         | Write-back mode: =nil=, =t=, or ='ask=              |
-| =orgist-write-back-dry-run=       | =t=                            | Log write-back commands without API calls     |
-| =orgist-treat-priority-4-as-none= | =t=                            | Map Todoist p4 to no org priority             |
-| =orgist-sync-on-save=             | =t=                            | Write-back on =C-x C-s= (after-save hook)      |
-| =orgist-auto-pull-interval=       | =300=                          | Auto-pull every N seconds (=nil= to disable)    |
-| =orgist-sync-comments=            | =nil=                          | Pull comments and activity into logbook       |
-| =orgist-sync-attachments=         | =nil=                          | Sync file attachments via =org-attach=          |
-| =orgist-async-chunk-size=         | =30=                           | Item count threshold for subprocess sync      |
-| =orgist-snapshot-file=            | =orgist-base-dir/snapshots.el= | Persisted snapshot store                      |
-| =orgist-tag=                      | ="todoist"=                    | File tag for orgist-managed files             |
-
-* Interactive Commands
-
-| Command                   | Purpose                                               |
-|---------------------------+-------------------------------------------------------|
-| =M-x orgist=               | Write-back + sync (shows confirm buffer in ='ask= mode) |
-| =M-x orgist-mode=          | Toggle orgist minor mode in current buffer            |
-| =M-x orgist-reset=         | Delete all orgist data and caches                     |
-| =M-x orgist-write-back=    | Detect local changes and push to Todoist (dry-run)    |
-| =M-x orgist-pull-comments= | Manually pull comments and activity for all tasks     |
-| =M-x orgist-quick-add=     | Add a task via Todoist's natural language quick-add    |
-
 * File Structure
 
 | File              | Purpose                                              |
@@ -402,10 +402,3 @@ back to =pass show todoist/api-token=.
 - [X] File attachment sync (=org-attach= \leftrightarrow Todoist comment attachments)
 - [X] Disable =orgist-write-back-dry-run= (enable real write-back — confirmation buffer ready)
 - [ ] Conflict resolution for concurrent edits
-
-* Dependencies
-
-- =request= — Emacs HTTP library
-- =org= — Org-Mode
-- =subr-x= — threading macros (=thread-last=), built-in since Emacs 25
-- =pandoc= — optional, for markdown \to org description conversion
