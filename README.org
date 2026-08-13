@@ -229,6 +229,59 @@ Safety controls:
   - =t= — write back without confirmation.
   - ='ask= (default) — show a confirmation buffer before writing.
 
+*** Verification Stamps
+
+The diff scan skips files that have not changed since they were last
+verified.  "Verified" is tracked explicitly in =write-back-stamps.el=
+(next to =snapshots.el=): each entry maps a project file to the SHA-1
+content hash it had when a diff scan of that file last *ran to
+completion and its outcome was resolved* — nothing to push, or all
+commands confirmed =ok= by the API.  A file is scanned when its
+current hash differs from its stamp or its buffer has unsaved
+modifications.
+
+The stamp lifecycle is what makes failure handling automatic:
+
+- A scan that errors on an element, a failed API call, or a cancelled
+  confirmation buffer leaves the stamp behind — the file re-detects on
+  the next save, sync, or auto-pull, so pending changes are never
+  silently dropped.
+- Files with detected changes are held in =orgist--pending-stamps=
+  (with their *scan-time* hash) and committed only after every sync
+  command succeeds.  Edits made after the scan produce a different
+  hash, so committing scan-time values can never mask them.
+- Snapshots are deliberately not involved: any pull may re-persist
+  =snapshots.el=, and before stamps existed the mtime comparison
+  against it could mask pending local changes within seconds of a
+  failed write-back.
+
+One element failing to diff no longer aborts the batch: the error is
+logged at warn level, the element is conservatively treated as present
+(so the deletion pass cannot emit a spurious =item_delete=), and every
+other element and file still processes.
+
+*** Auto-Pull and Pending Changes
+
+Auto-pull (=orgist-auto-pull-interval=) never sends commands or shows
+UI, but pulling over unpushed local edits could overwrite them and
+refresh their snapshots — losing them permanently.  Before pulling,
+auto-pull therefore runs the diff scan (cheap when stamps are current)
+and *defers the pull* while local changes are pending, logging once at
+info level.  Pushing the changes (save the file, or =M-x orgist=) or
+cancelling them resumes pulls on the next tick.
+
+*** Element-Cache Skew Tolerance
+
+Org 9.7's =org-end-of-subtree= trusts the org-element cache for
+subtree boundaries; a stale cached boundary (async cache-sync
+corruption, observed 2026-08-12) previously crashed the diff scan with
+"Invalid search bound" and could feed wrong bounds to subtree surgery.
+All subtree-boundary lookups now go through =orgist--subtree-end=,
+which validates the returned position (end of buffer, or the start of
+a heading line after point) in O(1); on violation it resets the
+element cache, recomputes from the fresh parse, and logs a warning —
+turning silent corruption into logged self-repair.
+
 *** Confirmation Buffer
 
 When =orgist-enable-write-back= is ='ask=, running =M-x orgist= or

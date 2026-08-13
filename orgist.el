@@ -277,6 +277,31 @@ Each value is a plist with keys :content, :checked, :priority,
 (defvar orgist--auto-pull-timer nil
   "Timer for periodic auto-pull, or nil when not running.")
 
+(defvar orgist--auto-pull-deferred nil
+  "Non-nil while auto-pull is deferred by pending local changes.
+Used to log the deferral at info level once (then at debug on
+repeats) and to log when pulls resume.")
+
+(defvar orgist--write-back-stamps nil
+  "Hash table mapping project file names to verified content hashes.
+See `orgist--stamps-path'.  Loaded lazily by `orgist--load-stamps'.")
+
+(defvar orgist--write-back-stamps-path nil
+  "Path `orgist--write-back-stamps' was last loaded from.
+When `orgist--stamps-path' returns a different location (e.g. the
+test harness switched runtime directories), the table is reloaded
+so stamps never leak across data directories.")
+
+(defvar orgist--pending-stamps nil
+  "Alist of (FILE . HASH) captured by the last diff scan.
+Holds the scan-time hash of files whose detected changes are
+awaiting execution or confirmation.  Committed to
+`orgist--write-back-stamps' by `orgist--commit-pending-stamps'
+after all commands succeed; simply dropped on failure or cancel so
+the files stay due for scanning.  Hashes are captured at scan time
+on purpose: edits made after the scan produce a different hash, so
+committing the scan-time value can never mask them.")
+
 (defvar orgist--last-pull-time nil
   "Time of the last successful pull (from `current-time').
 Used by auto-pull to avoid pulling more often than `orgist-auto-pull-interval'.")
@@ -349,21 +374,54 @@ Created lazily by `orgist--pandoc-lua-filter'.")
                   (buffer-local-value 'orgist-mode b)))
            (buffer-list)))
 
+(defun orgist--pending-local-changes ()
+  "Return pending local write-back changes, or nil.
+Runs the write-back diff scan without generating commands or
+showing any UI.  As a side effect the scan advances verification
+stamps for files that prove clean, so repeated calls are cheap
+when nothing changed.  Returns nil when write-back is disabled or
+no snapshots exist yet (first sync)."
+  (when orgist-enable-write-back
+    (orgist-load-snapshots)
+    (when (> (hash-table-count orgist-snapshots) 0)
+      (orgist-diff-all-elements))))
+
 (defun orgist--auto-pull ()
   "Pull from Todoist if not already syncing.
-Sets `orgist-sync-mutex' and calls `orgist-pull' directly
-\(no write-back)."
+Sets `orgist-sync-mutex' and calls `orgist-pull' directly — no
+write-back commands are sent and no confirmation UI is shown.
+When the diff scan finds pending local changes the pull is
+skipped instead: applying remote updates over unpushed local
+edits could overwrite them and refresh their snapshots, losing
+the changes permanently.  The user pushes them via a save or
+\\[orgist]; pulls resume once clean."
   (when (and orgist-bearer-token
              (not orgist-sync-mutex)
              orgist-auto-pull-interval)
-    (setq orgist--last-pull-time (current-time))
-    (setq orgist-sync-mutex (current-time))
-    (let ((orgist--log-buffer '()))
-      (unwind-protect
-          (progn
-            (orgist-log 'debug "Auto-pull triggered")
-            (orgist-pull))
-        (orgist--flush-log-buffer)))))
+    (let ((pending (condition-case err
+                       (orgist--pending-local-changes)
+                     (error
+                      (orgist-log 'warn "Auto-pull change detection failed: %s"
+                                  (error-message-string err))
+                      ;; Fail safe: treat as pending so we don't pull
+                      ;; over changes we could not inspect.
+                      'error))))
+      (if pending
+          (if orgist--auto-pull-deferred
+              (orgist-log 'debug "Auto-pull still deferred: local changes pending write-back")
+            (setq orgist--auto-pull-deferred t)
+            (orgist-log 'info "Auto-pull deferred: local changes pending write-back — save the file or M-x orgist to push them"))
+        (when orgist--auto-pull-deferred
+          (setq orgist--auto-pull-deferred nil)
+          (orgist-log 'debug "Auto-pull resumed: no more pending local changes"))
+        (setq orgist--last-pull-time (current-time))
+        (setq orgist-sync-mutex (current-time))
+        (let ((orgist--log-buffer '()))
+          (unwind-protect
+              (progn
+                (orgist-log 'debug "Auto-pull triggered")
+                (orgist-pull))
+            (orgist--flush-log-buffer)))))))
 
 (defun orgist--auto-pull-timer-fn ()
   "Timer callback for periodic auto-pull."
@@ -587,9 +645,16 @@ finish before orgist displays its output."
 (defun orgist--deferred-write-back ()
   "Run write-back unless a sync is in progress.
 Called from a zero-delay timer so it executes after the current
-command (and its messages) have completed."
+command (and its messages) have completed.  Errors are caught and
+logged loudly instead of dying as an opaque timer error: stamps
+only advance on a completed scan, so the failed files re-detect
+on the next save or sync automatically."
   (unless orgist-sync-mutex
-    (orgist-write-back)))
+    (condition-case err
+        (orgist-write-back)
+      (error
+       (orgist-log 'error "Write-back failed: %s — changes remain pending and retry on the next save or sync"
+                   (error-message-string err))))))
 
 (defun maybe-enable-orgist ()
   "Enable `orgist-mode' if the current Org file is orgist-managed.
@@ -1109,7 +1174,15 @@ pull in a subprocess."
         (orgist-log 'info "Syncing... done, no changes")
       (orgist-log 'info "Syncing... done: %d projects, %d sections, %d items"
                   (nth 0 counts) (nth 1 counts) (nth 2 counts))))
-  (when orgist-enable-write-back
+  ;; Persist snapshots only when the pull actually processed items.
+  ;; A no-change pull has nothing new to record; the old habit of
+  ;; saving unconditionally re-wrote a 4500-entry file every few
+  ;; minutes and bumped the mtime that the pre-stamp modified-file
+  ;; check compared against, masking pending local changes within
+  ;; seconds of a failed write-back (observed 2026-08-12).
+  (when (and orgist-enable-write-back
+             orgist--pull-counts
+             (not (equal orgist--pull-counts '(0 0 0))))
     (orgist-save-snapshots))
   (setq orgist--last-pull-time (current-time))
   (setq orgist-sync-mutex nil)
@@ -1165,6 +1238,10 @@ pull in a subprocess."
     (setq orgist-snapshots nil)
     (setq orgist-sync-mutex nil)
     (setq orgist--last-pull-time nil)
+    (setq orgist--write-back-stamps nil)
+    (setq orgist--write-back-stamps-path nil)
+    (setq orgist--pending-stamps nil)
+    (setq orgist--auto-pull-deferred nil)
     (orgist--stop-auto-pull)
     (when (file-directory-p orgist-base-dir)
       (condition-case err
@@ -1863,7 +1940,7 @@ Returns non-nil if reparenting occurred."
       ;; Go to new parent and paste as child
       (let ((parent-point (orgist-find-element-by-id todoist-parent-id)))
         (goto-char parent-point)
-        (org-end-of-subtree t t)
+        (goto-char (orgist--subtree-end))
         ;; Paste the subtree
         (org-paste-subtree (or target-level 1))
         ;; Point is now on the pasted heading
@@ -2068,6 +2145,36 @@ that have no body to clear)."
     (when orgist-enable-write-back
       (orgist-snapshot-element element))))
 
+(defun orgist--subtree-end ()
+  "Return the end of the subtree at point, validating the element cache.
+Point must be on a heading (or before the first heading, in which
+case `org-end-of-subtree' covers the whole file).  In Org 9.7,
+`org-end-of-subtree' returns the org-element cache's cached
+boundary; a stale cached boundary (seen 2026-08-12: an async
+cache-sync left an element's :end partially unshifted) points
+inside the entry instead of at the next heading.  Downstream that
+makes bounded searches signal \"Invalid search bound\", and worse,
+feeds wrong bounds to `delete-region' in subtree surgery.
+
+A correct end (TO-HEADING non-nil) is either end-of-buffer or the
+start of a heading line strictly after point, so that invariant is
+checked here in O(1).  On violation the element cache is reset —
+it rebuilds lazily — and the boundary recomputed from the fresh
+parse, turning silent corruption into a logged self-repair."
+  (let ((end (save-excursion (org-end-of-subtree t t) (point))))
+    (if (or (= (point) (point-max))     ; degenerate: empty tail
+            (and (> end (point))
+                 (or (= end (point-max))
+                     (save-excursion
+                       (goto-char end)
+                       (and (bolp) (looking-at-p org-outline-regexp))))))
+        end
+      (orgist-log 'warn
+                  "Stale org-element cache in %s: subtree at %d reports end %d (not a heading boundary); resetting cache"
+                  (buffer-name) (point) end)
+      (org-element-cache-reset)
+      (save-excursion (org-end-of-subtree t t) (point)))))
+
 (defun orgist--normalize-body-spacing ()
   "Ensure consistent blank-line spacing in the current heading's body.
 Guarantees (see README.org § Body Spacing):
@@ -2085,13 +2192,11 @@ Point must be on the heading."
     (org-end-of-meta-data)
     (let ((body-start (point))
           (body-end (save-excursion
-                      (if (re-search-forward org-outline-regexp-bol
-                                             (save-excursion
-                                               (org-end-of-subtree t t) (point))
-                                             t)
-                          (line-beginning-position)
-                        (org-end-of-subtree t t)
-                        (point)))))
+                      (let ((subtree-end (orgist--subtree-end)))
+                        (if (re-search-forward org-outline-regexp-bol
+                                               subtree-end t)
+                            (line-beginning-position)
+                          subtree-end)))))
       ;; Step 1: Collapse runs of 3+ consecutive newlines to 2.
       (when (< body-start body-end)
         (goto-char body-start)
@@ -2167,7 +2272,7 @@ headings from pandoc, and any non-ID child subtrees."
     (org-back-to-heading-or-point-min t)
     (org-end-of-meta-data t)
     (let ((pos (point))
-          (subtree-end (save-excursion (org-end-of-subtree t t) (point))))
+          (subtree-end (orgist--subtree-end)))
       ;; Walk through the region, deleting gaps between ID subtrees.
       (while (< pos subtree-end)
         (goto-char pos)
@@ -2188,10 +2293,10 @@ headings from pandoc, and any non-ID child subtrees."
                     (delete-region pos (point))
                     (setq subtree-end (- subtree-end gap))))
                 ;; Skip past this ID subtree (it's preserved).
-                (setq pos (save-excursion (org-end-of-subtree t t) (point))))
+                (setq pos (orgist--subtree-end)))
             ;; Non-ID heading: delete its entire subtree.
             (let* ((heading-start (point))
-                   (heading-end (save-excursion (org-end-of-subtree t t) (point)))
+                   (heading-end (orgist--subtree-end))
                    ;; But first, delete the gap before it too.
                    (del-start (min pos heading-start))
                    (del-len (- heading-end del-start)))
@@ -2209,7 +2314,7 @@ log-note-headings formats (to \"TODO\"), including entries
 inside :LOGBOOK: drawers."
   (save-excursion
     (org-back-to-heading-or-point-min t)
-    (let* ((subtree-end (save-excursion (org-end-of-subtree t t) (point)))
+    (let* ((subtree-end (orgist--subtree-end))
            ;; Start search right after the heading line so we cover
            ;; :LOGBOOK: drawers (org-end-of-meta-data skips past them).
            (start (save-excursion (forward-line 1) (point)))
@@ -2235,7 +2340,7 @@ re-inserted by a pull after snapshot loss) are removed.
 Returns the number of removed duplicate Note entries."
   (save-excursion
     (org-back-to-heading-or-point-min t)
-    (let* ((subtree-end (save-excursion (org-end-of-subtree t t) (point)))
+    (let* ((subtree-end (orgist--subtree-end))
            (start (save-excursion (forward-line 1) (point)))
            (end (save-excursion
                   (org-end-of-meta-data t)
@@ -2295,7 +2400,7 @@ Handles multi-line entries (Note entries with body text).
 Only rewrites the logbook if the order actually changed."
   (save-excursion
     (org-back-to-heading-or-point-min t)
-    (let* ((subtree-end (save-excursion (org-end-of-subtree t t) (point)))
+    (let* ((subtree-end (orgist--subtree-end))
            (start (save-excursion (forward-line 1) (point)))
            (end (save-excursion
                   (org-end-of-meta-data t)
@@ -2533,7 +2638,7 @@ subtree has moved."
   (when orgist-id-cache
     (save-excursion
       (org-back-to-heading-or-point-min t)
-      (let ((subtree-end (save-excursion (org-end-of-subtree t t) (point))))
+      (let ((subtree-end (orgist--subtree-end)))
         (when-let* ((id (org-entry-get (point) "ID")))
           (puthash id (copy-marker (point) t) orgist-id-cache))
         (while (and (re-search-forward org-property-start-re subtree-end t)
@@ -3253,7 +3358,7 @@ When `orgist--log-buffer' is non-nil, file writes are deferred."
   (let (beg end)
     (org-back-to-heading t)
     (setq beg (point))
-    (org-end-of-subtree t t)
+    (goto-char (orgist--subtree-end))
     ;; Include the end of an inlinetask
     (when (and (featurep 'org-inlinetask)
                (looking-at-p (concat (org-inlinetask-outline-regexp)
@@ -3272,7 +3377,7 @@ reposition steps then place it correctly.  Point must be on the
 heading."
   (org-back-to-heading t)
   (let* ((beg (point))
-         (end (save-excursion (org-end-of-subtree t t) (point)))
+         (end (orgist--subtree-end))
          (subtree (buffer-substring-no-properties beg end)))
     (delete-region beg end)
     (with-current-buffer target-buffer
@@ -3514,6 +3619,95 @@ Also loads `orgist-labels' from `orgist-labels-file' when not already set."
       ;; No file — reset the on-disk count so the save guard
       ;; doesn't compare against a stale value.
       (setq orgist--snapshot-count-on-disk nil))))
+
+;;; Write-back verification stamps
+;;
+;; Stamps decouple "this file's local changes were diffed and
+;; dispatched" from "snapshots were persisted".  The previous design
+;; compared file mtimes against the snapshot file's mtime, but any
+;; pull re-saves snapshots, so a pull landing after a failed
+;; write-back would permanently hide the pending local changes
+;; (observed 2026-08-12: the mask engaged one second after a save).
+;; A stamp only advances when a scan of that file completed without
+;; element errors AND its result was resolved — nothing to push,
+;; commands executed successfully, or a dry run that advanced
+;; snapshots.  A failed scan, a failed API call, or a cancelled
+;; confirmation leaves the stamp behind, so the next save or sync
+;; automatically retries.
+
+(defun orgist--stamps-path ()
+  "Return the write-back stamps file path.
+Each stamp records the content hash a project file had when a
+write-back diff scan of that file last ran to completion and its
+outcome was resolved (commands executed, or nothing to push).
+The file is co-located with `orgist-snapshot-file' so that any
+sandboxing that redirects snapshots (tests, alternate data dirs)
+redirects stamps with it — but it is a separate file on purpose:
+snapshots may be re-persisted by any pull, and that must never
+hide local changes from the diff scan."
+  (expand-file-name "write-back-stamps.el"
+                    (file-name-directory
+                     (expand-file-name orgist-snapshot-file))))
+
+(defun orgist--file-content-hash (file)
+  "Return the SHA-1 of FILE's bytes on disk, or nil if unreadable."
+  (when (file-readable-p file)
+    (with-temp-buffer
+      (set-buffer-multibyte nil)
+      (insert-file-contents-literally file)
+      (secure-hash 'sha1 (current-buffer)))))
+
+(defun orgist--load-stamps (&optional force)
+  "Load `orgist--write-back-stamps' from `orgist--stamps-path'.
+Skips loading if stamps are already in memory for the current
+path, unless FORCE is non-nil.  A missing file yields an empty
+table, which marks every project file as due for scanning
+\(correct for a first run)."
+  (let ((path (orgist--stamps-path)))
+    (when (or force
+              (not orgist--write-back-stamps)
+              (not (equal path orgist--write-back-stamps-path)))
+      (setq orgist--write-back-stamps (make-hash-table :test 'equal))
+      (setq orgist--write-back-stamps-path path)
+      (when (file-exists-p path)
+        (with-temp-buffer
+          (insert-file-contents path)
+          (goto-char (point-min))
+          (forward-line 1)              ; skip comment line
+          (dolist (entry (ignore-errors (read (current-buffer))))
+            (puthash (car entry) (cdr entry) orgist--write-back-stamps)))))))
+
+(defun orgist--save-stamps ()
+  "Persist `orgist--write-back-stamps' to `orgist--stamps-path'."
+  (when orgist--write-back-stamps
+    (let* ((path (orgist--stamps-path))
+           (dir (file-name-directory path)))
+      (unless (file-directory-p dir)
+        (make-directory dir t))
+      (with-temp-file path
+        (insert ";; orgist write-back stamps -- do not edit\n")
+        (let ((entries '())
+              (print-length nil)
+              (print-level nil))
+          (maphash (lambda (file hash) (push (cons file hash) entries))
+                   orgist--write-back-stamps)
+          (prin1 entries (current-buffer))
+          (insert "\n"))))))
+
+(defun orgist--stamp-file (file hash)
+  "Record HASH as FILE's verified content hash."
+  (orgist--load-stamps)
+  (puthash file hash orgist--write-back-stamps))
+
+(defun orgist--commit-pending-stamps ()
+  "Commit `orgist--pending-stamps' and persist the stamp table.
+Called after write-back commands were all executed successfully
+\(or advanced snapshots in dry-run mode)."
+  (when orgist--pending-stamps
+    (dolist (entry orgist--pending-stamps)
+      (orgist--stamp-file (car entry) (cdr entry)))
+    (setq orgist--pending-stamps nil)
+    (orgist--save-stamps)))
 
 (defun orgist-rebuild-snapshots ()
   "Rebuild snapshots from current org buffer content.
@@ -3871,7 +4065,7 @@ Point should be on the parent heading.  Returns a list of
 \(ID ORDER IS-SECTION POINT) in buffer order for children
 that have both ID and TODOIST-ORDER properties."
   (let ((child-level (1+ parent-level))
-        (subtree-end (save-excursion (org-end-of-subtree t t) (point)))
+        (subtree-end (orgist--subtree-end))
         (children '()))
     (save-excursion
       (forward-line 1)
@@ -4002,7 +4196,7 @@ ID) are included so they can be pushed to the parent task."
         (setq files (org-attach-file-list dir))))
     ;; Files on non-TODO child headings (no Todoist ID of their own)
     (save-excursion
-      (let ((subtree-end (save-excursion (org-end-of-subtree t t) (point)))
+      (let ((subtree-end (orgist--subtree-end))
             (level (org-current-level)))
         (while (and (outline-next-heading)
                     (< (point) subtree-end))
@@ -4058,8 +4252,7 @@ and end of the body)."
     (org-end-of-meta-data t)
     (let ((start (point))
           (end (save-excursion
-                 (let ((subtree-end (save-excursion
-                                      (org-end-of-subtree t t) (point))))
+                 (let ((subtree-end (orgist--subtree-end)))
                    (if (re-search-forward org-outline-regexp-bol subtree-end t)
                        (line-beginning-position)
                      subtree-end)))))
@@ -4182,63 +4375,89 @@ of (FIELD . (OLD . NEW)) for each changed field."
               (when diffs (nreverse diffs)))))))))
 
 (defun orgist--modified-org-files ()
-  "Return list of org files in `orgist-base-dir' modified since last snapshot save.
-Compares each file's modification time against `orgist-snapshot-file'.
-Also includes files whose visiting buffer has unsaved modifications.
-If the snapshot file doesn't exist, returns all org files (first run)."
-  (let* ((all-files (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
-         (snap-mtime (when (file-exists-p orgist-snapshot-file)
-                       (file-attribute-modification-time
-                        (file-attributes orgist-snapshot-file)))))
-    (if (not snap-mtime)
-        all-files
-      (seq-filter
-       (lambda (f)
-         (or (time-less-p snap-mtime
-                          (file-attribute-modification-time
-                           (file-attributes f)))
-             ;; Also check if the visiting buffer has unsaved changes
-             (when-let* ((buf (find-buffer-visiting f)))
-               (buffer-modified-p buf))))
-       all-files))))
+  "Return the org files in `orgist-base-dir' due for a write-back scan.
+A file is due when its on-disk content hash differs from its
+verification stamp (see `orgist--stamps-path'), or when its
+visiting buffer has unsaved modifications.  Files without a stamp
+\(first run, or a scan that never completed) are always due.
+Returns an alist of (FILE . HASH) so the scan can stamp the exact
+content it verified; HASH is nil when only the buffer is modified."
+  (orgist--load-stamps)
+  (let ((due '()))
+    (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
+      (let* ((buf (find-buffer-visiting file))
+             (buffer-dirty (and buf (buffer-modified-p buf)))
+             (hash (unless buffer-dirty (orgist--file-content-hash file))))
+        (when (or buffer-dirty
+                  (not (equal hash (gethash file orgist--write-back-stamps))))
+          (push (cons file (and (not buffer-dirty) hash)) due))))
+    (nreverse due)))
 
-(defun orgist-diff-all-elements ()
+(cl-defun orgist-diff-all-elements ()
   "Diff all known elements across all project buffers.
 Returns a list of (ELEMENT-ID . DIFF) pairs where DIFF is the
 result of `orgist-diff-element'.
-Only diffs elements in org files modified since the last snapshot save."
+
+Only diffs elements in files due for scanning (see
+`orgist--modified-org-files').  Files that scan cleanly with no
+changes are stamped as verified immediately; files with changes
+are recorded in `orgist--pending-stamps' and stamped only when
+their commands go through (`orgist--commit-pending-stamps').
+A single element error never aborts the batch: the error is
+logged, the file is left unstamped so the next scan retries it,
+and every other element and file is still processed."
   (unless orgist-snapshots
     (orgist-load-snapshots))
-  (let* ((modified-files (orgist--modified-org-files))
+  (setq orgist--pending-stamps nil)
+  (let* ((due-files (orgist--modified-org-files))
          (all-org-files (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
          (all-count (length all-org-files))
-         (mod-count (length modified-files))
+         (mod-count (length due-files))
          (skipped (- all-count mod-count))
          (changes '())
+         (stamped nil)
          ;; Track which snapshot IDs exist in any buffer, so we
          ;; can detect deletions (IDs in snapshots but no buffer).
          (found-ids (make-hash-table :test 'equal)))
     (when (> skipped 0)
       (orgist-log 'debug "Write-back: skipping %d unmodified file(s), checking %d"
                   skipped mod-count))
+    ;; Nothing changed since the last verified scan: no local edits,
+    ;; hence no deletions possible either.  Skip the presence pass —
+    ;; it touches every snapshot ID in every file, and the auto-pull
+    ;; guard runs this scan every few minutes.
+    (when (null due-files)
+      (cl-return-from orgist-diff-all-elements nil))
     ;; Scan unmodified files to record which snapshot IDs still exist.
     ;; Only build id-cache and check presence — no diffing needed.
     ;; Use find-file-noselect (not find-buffer-visiting) so files
     ;; are opened even if no buffer currently visits them (e.g. after
     ;; subprocess sync creates files the main process hasn't opened).
     (dolist (file all-org-files)
-      (unless (member file modified-files)
+      (unless (assoc file due-files)
         (let ((buf (find-file-noselect file)))
           (with-current-buffer buf
             (unless orgist-id-cache (orgist-build-id-cache))
             (maphash
              (lambda (id _snapshot)
-               (when (orgist-find-element-by-id id)
-                 (puthash id t found-ids)))
+               (condition-case err
+                   (when (orgist-find-element-by-id id)
+                     (puthash id t found-ids))
+                 (error
+                  ;; Treat as present rather than risking a spurious
+                  ;; item_delete from the deletion pass below.
+                  (puthash id t found-ids)
+                  (orgist-log 'warn "Presence check failed for %s in %s: %s"
+                              id (file-name-nondirectory file)
+                              (error-message-string err)))))
              orgist-snapshots)))))
-    ;; Diff modified files: detect changes and new headings.
-    (dolist (file modified-files)
-      (let ((buf (find-file-noselect file)))
+    ;; Diff due files: detect changes and new headings.
+    (dolist (entry due-files)
+      (let* ((file (car entry))
+             (scan-hash (cdr entry))
+             (file-changes '())
+             (file-errors 0)
+             (buf (find-file-noselect file)))
         (with-current-buffer buf
           ;; Rebuild ID cache for modified files so that stale markers
           ;; (from user edits like refile/cut-paste between files) are
@@ -4246,11 +4465,21 @@ Only diffs elements in org files modified since the last snapshot save."
           (orgist-build-id-cache)
           (maphash
            (lambda (id _snapshot)
-             (when (orgist-find-element-by-id id)
-               (puthash id t found-ids)
-               (let ((diff (orgist-diff-element id)))
-                 (when diff
-                   (push (cons id diff) changes)))))
+             (condition-case err
+                 (when (orgist-find-element-by-id id)
+                   (puthash id t found-ids)
+                   (let ((diff (orgist-diff-element id)))
+                     (when diff
+                       (push (cons id diff) file-changes))))
+               (error
+                (cl-incf file-errors)
+                ;; Conservatively treat the element as present so the
+                ;; deletion pass below can't emit an item_delete for an
+                ;; element we merely failed to inspect.
+                (puthash id t found-ids)
+                (orgist-log 'warn "Diff failed for %s in %s: %s (will retry next scan)"
+                            id (file-name-nondirectory file)
+                            (error-message-string err)))))
            orgist-snapshots)
           ;; Detect new headings.
           ;; - TODO/DONE heading with no :ID: and no SECTION → new task.
@@ -4259,42 +4488,62 @@ Only diffs elements in org files modified since the last snapshot save."
           ;;   :TODOIST-ORDER: so that subsequent diff/sibling-rank logic
           ;;   treats it like any other section; Todoist assigns the real
           ;;   section_order on creation, which round-trips on next pull.
-          (save-excursion
-            (goto-char (point-min))
-            (while (re-search-forward org-heading-regexp nil t)
-              (org-back-to-heading t)
-              (cond
-               ((and (org-get-todo-state)
-                     (not (org-entry-get (point) "ID"))
-                     (not (org-entry-get (point) "SECTION")))
-                (let ((temp-id (org-id-uuid)))
-                  (org-entry-put (point) "ID" temp-id)
-                  (orgist-id-cache-put temp-id)
-                  (push (cons temp-id 'new) changes)))
-               ((and (= (org-current-level) 1)
-                     (not (org-get-todo-state))
-                     (not (org-entry-get (point) "ID"))
-                     (not (org-entry-get (point) "SECTION")))
-                (let ((temp-id (org-id-uuid)))
-                  (org-entry-put (point) "ID" temp-id)
-                  (org-entry-put (point) "SECTION" "t")
-                  (org-entry-put (point) "TODOIST-ORDER" "0")
-                  (orgist-id-cache-put temp-id)
-                  (push (cons temp-id 'new-section) changes)))
-               ;; Pending section: heading has SECTION=t and an ID, but
-               ;; the ID is not in snapshots — a prior detection marked
-               ;; the heading but the section_add never reached Todoist
-               ;; (e.g. a follow-up save replaced the confirm buffer
-               ;; before the user accepted, or the API call failed).
-               ;; Re-emit so the section actually gets created and any
-               ;; child item_move referencing it can resolve.
-               ((let ((id (org-entry-get (point) "ID")))
-                  (and id
-                       (org-entry-get (point) "SECTION")
-                       (not (gethash id orgist-snapshots))))
-                (push (cons (org-entry-get (point) "ID") 'new-section)
-                      changes)))
-              (end-of-line))))))
+          (condition-case err
+              (save-excursion
+                (goto-char (point-min))
+                (while (re-search-forward org-heading-regexp nil t)
+                  (org-back-to-heading t)
+                  (cond
+                   ((and (org-get-todo-state)
+                         (not (org-entry-get (point) "ID"))
+                         (not (org-entry-get (point) "SECTION")))
+                    (let ((temp-id (org-id-uuid)))
+                      (org-entry-put (point) "ID" temp-id)
+                      (orgist-id-cache-put temp-id)
+                      (push (cons temp-id 'new) file-changes)))
+                   ((and (= (org-current-level) 1)
+                         (not (org-get-todo-state))
+                         (not (org-entry-get (point) "ID"))
+                         (not (org-entry-get (point) "SECTION")))
+                    (let ((temp-id (org-id-uuid)))
+                      (org-entry-put (point) "ID" temp-id)
+                      (org-entry-put (point) "SECTION" "t")
+                      (org-entry-put (point) "TODOIST-ORDER" "0")
+                      (orgist-id-cache-put temp-id)
+                      (push (cons temp-id 'new-section) file-changes)))
+                   ;; Pending section: heading has SECTION=t and an ID, but
+                   ;; the ID is not in snapshots — a prior detection marked
+                   ;; the heading but the section_add never reached Todoist
+                   ;; (e.g. a follow-up save replaced the confirm buffer
+                   ;; before the user accepted, or the API call failed).
+                   ;; Re-emit so the section actually gets created and any
+                   ;; child item_move referencing it can resolve.
+                   ((let ((id (org-entry-get (point) "ID")))
+                      (and id
+                           (org-entry-get (point) "SECTION")
+                           (not (gethash id orgist-snapshots))))
+                    (push (cons (org-entry-get (point) "ID") 'new-section)
+                          file-changes)))
+                  (end-of-line)))
+            (error
+             (cl-incf file-errors)
+             (orgist-log 'warn "New-heading scan failed in %s: %s (will retry next scan)"
+                         (file-name-nondirectory file)
+                         (error-message-string err)))))
+        (setq changes (nconc file-changes changes))
+        ;; Stamp bookkeeping.  SCAN-HASH is nil when the visiting
+        ;; buffer had unsaved modifications — the on-disk content was
+        ;; not what we scanned, so the file cannot be certified and
+        ;; stays due.  Files that erred stay due as well.
+        (cond
+         ((or (null scan-hash) (> file-errors 0)) nil)
+         (file-changes
+          (push (cons file scan-hash) orgist--pending-stamps))
+         (t
+          (orgist--stamp-file file scan-hash)
+          (setq stamped t)))))
+    (when stamped
+      (orgist--save-stamps))
     ;; Detect deletions: snapshot IDs not found in any buffer.
     (maphash
      (lambda (id _snapshot)
@@ -4966,7 +5215,10 @@ detected again on the next write-back cycle."
         (progn
           (orgist-log-commands commands "[DRY-RUN]")
           (orgist-update-snapshots-from-local commands)
-          (orgist-save-snapshots))
+          (orgist-save-snapshots)
+          ;; Snapshots advanced, so these changes won't re-detect;
+          ;; stamp the scanned files as verified.
+          (orgist--commit-pending-stamps))
       ;; Execute attachment commands first (REST API)
       (when attach-commands
         (orgist-log-commands attach-commands "[ATTACH]")
@@ -5022,18 +5274,33 @@ detected again on the next write-back cycle."
           ;; Sync metadata comments (non-Todoist properties).
           ;; Pass temp-id-mapping so new tasks (with temp IDs in commands
           ;; but real IDs in the buffer after remap) can be found.
-          (orgist-sync-metadata-comments applied orgist--last-temp-id-mapping)))
-      ;; Persist any buffer modifications made during this write-back
-      ;; (temp-id → real-id remap, recurring date refresh) so the user
-      ;; doesn't end up with unsaved buffers.  Inhibit `after-save' to
-      ;; avoid re-triggering the orgist write-back cycle on these saves.
-      (let ((orgist--inhibit-after-save t))
-        (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
-          (when-let* ((buf (find-buffer-visiting file)))
-            (with-current-buffer buf
-              (when (and orgist-mode (buffer-modified-p))
-                (save-buffer))))))
-      (orgist-save-snapshots))))
+          (orgist-sync-metadata-comments applied orgist--last-temp-id-mapping))
+        ;; Persist any buffer modifications made during this write-back
+        ;; (temp-id → real-id remap, recurring date refresh) so the user
+        ;; doesn't end up with unsaved buffers.  Inhibit `after-save' to
+        ;; avoid re-triggering the orgist write-back cycle on these saves.
+        (let ((orgist--inhibit-after-save t))
+          (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
+            (when-let* ((buf (find-buffer-visiting file)))
+              (with-current-buffer buf
+                (when (and orgist-mode (buffer-modified-p))
+                  (save-buffer))))))
+        (orgist-save-snapshots)
+        ;; Advance write-back stamps only when every sync command was
+        ;; confirmed "ok".  On any failure the scanned files keep their
+        ;; old stamps, so the next save or sync re-detects and retries
+        ;; the remaining changes (succeeded commands advanced their
+        ;; snapshots above and won't re-emit).  Note: files whose
+        ;; buffers were edited during execution (temp-id remap, date
+        ;; refresh) were stamped with their scan-time hash, so they
+        ;; stay due and the follow-up scan re-verifies them clean.
+        (if (= (length succeeded-sync-commands) (length sync-commands))
+            (orgist--commit-pending-stamps)
+          (setq orgist--pending-stamps nil)
+          (orgist-log 'debug
+                      "Write-back stamps not advanced: %d of %d command(s) failed"
+                      (- (length sync-commands) (length succeeded-sync-commands))
+                      (length sync-commands)))))))
 
 (defun orgist-execute-attachment-commands (commands)
   "Execute attachment upload/delete COMMANDS via REST API.
@@ -5060,8 +5327,7 @@ Updates snapshots with the new attachment-files entries."
                                      (when (file-exists-p fp)
                                        (throw 'found fp))))
                                  ;; Check non-TODO child headings
-                                 (let ((subtree-end (save-excursion
-                                                      (org-end-of-subtree t t) (point)))
+                                 (let ((subtree-end (orgist--subtree-end))
                                        (level (org-current-level)))
                                    (while (and (outline-next-heading)
                                                (< (point) subtree-end))
@@ -5497,7 +5763,12 @@ synchronously and the caller is responsible for continuing."
             (orgist-log 'debug "No local changes detected")
           (orgist-log 'debug "Detected %d local change(s)" (length changes))
           (let ((commands (orgist-changes-to-commands changes)))
-            (when commands
+            (if (not commands)
+                ;; Changes that generate no commands (suppressed
+                ;; fields, already-known notes) would re-detect on
+                ;; every scan; certify the scanned files so they
+                ;; don't stay due forever.
+                (orgist--commit-pending-stamps)
               (if (or (eq orgist-enable-write-back t) noninteractive)
                   (orgist-execute-write-back commands)
                 ;; 'ask mode — show confirmation buffer, return 'pending
@@ -6360,7 +6631,7 @@ no non-Todoist metadata exists.  Point must be on the heading."
     ;; 2. Custom drawers (not PROPERTIES or LOGBOOK)
     (save-excursion
       (org-back-to-heading t)
-      (let* ((subtree-end (save-excursion (org-end-of-subtree t t) (point)))
+      (let* ((subtree-end (orgist--subtree-end))
              (search-start (progn (forward-line 1) (point)))
              (search-end (save-excursion
                            (goto-char search-start)
@@ -6417,8 +6688,7 @@ Point must be on the heading."
               ;; Only insert if the drawer doesn't already exist
               (save-excursion
                 (org-back-to-heading t)
-                (let ((subtree-end (save-excursion
-                                     (org-end-of-subtree t t) (point))))
+                (let ((subtree-end (orgist--subtree-end)))
                   (unless (re-search-forward
                            (format "^[ \t]*:%s:[ \t]*$"
                                    (regexp-quote drawer-name))
@@ -6981,7 +7251,7 @@ Matches three logbook entry types, all of which may carry user-written text:
 Only entries whose content is non-empty are included."
   (save-excursion
     (org-back-to-heading-or-point-min t)
-    (let* ((subtree-end (save-excursion (org-end-of-subtree t t) (point)))
+    (let* ((subtree-end (orgist--subtree-end))
            (start (save-excursion (forward-line 1) (point)))
            (end (save-excursion
                   (org-end-of-meta-data t)
