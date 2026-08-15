@@ -4523,6 +4523,24 @@ and every other element and file is still processed."
                            (org-entry-get (point) "SECTION")
                            (not (gethash id orgist-snapshots))))
                     (push (cons (org-entry-get (point) "ID") 'new-section)
+                          file-changes))
+                   ;; Pending task: the same failure as the section case
+                   ;; above, plus the commoner one — an org-id UUID stamped
+                   ;; on the heading (org-store-link, org-capture,
+                   ;; org-linker) before the first scan saw it, which
+                   ;; permanently disqualifies it from the no-ID branch.
+                   ;; Either way it has an ID but no snapshot, so neither
+                   ;; the snapshot-keyed diff loop nor the branches above
+                   ;; can ever see it.  Only dashed UUIDs qualify: a
+                   ;; dash-free ID is a real Todoist ID whose snapshot went
+                   ;; missing, and re-adding it would duplicate the task.
+                   ((let ((id (org-entry-get (point) "ID")))
+                      (and id
+                           (string-match-p "-" id)
+                           (org-get-todo-state)
+                           (not (org-entry-get (point) "SECTION"))
+                           (not (gethash id orgist-snapshots))))
+                    (push (cons (org-entry-get (point) "ID") 'new)
                           file-changes)))
                   (end-of-line)))
             (error
