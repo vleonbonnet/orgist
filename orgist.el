@@ -1981,6 +1981,10 @@ that have no body to clear)."
          ;; in the active region; a user selection at pull time must never
          ;; smear this element's state and dates across other headings.
          (org-loop-over-headlines-in-active-region nil)
+         ;; Todoist state is authoritative on pull: org blocking rules
+         ;; (e.g. `org-enforce-todo-dependencies') must not silently veto
+         ;; DONE on a parent whose Todoist subtasks are still open.
+         (org-blocker-hook nil)
          (content (alist-get 'content element))
          (name (alist-get 'name element))
          (description (alist-get 'description element))
