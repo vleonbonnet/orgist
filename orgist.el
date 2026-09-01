@@ -1977,7 +1977,11 @@ the heading before making changes.  When SKIP-CLEAR-BODY is non-nil,
 skip the `orgist-clear-body' call (useful for newly created elements
 that have no body to clear)."
   (org-back-to-heading-or-point-min t)
-  (let* ((content (alist-get 'content element))
+  (let* (;; `org-todo'/`org-schedule'/`org-deadline' loop over all headlines
+         ;; in the active region; a user selection at pull time must never
+         ;; smear this element's state and dates across other headings.
+         (org-loop-over-headlines-in-active-region nil)
+         (content (alist-get 'content element))
          (name (alist-get 'name element))
          (description (alist-get 'description element))
          (labels (alist-get 'labels element))
@@ -5192,27 +5196,30 @@ Todoist's authoritative next occurrence."
                 (when buf
                   (with-current-buffer buf
                     (when-let* ((pos (orgist-find-element-by-id id)))
-                      (save-excursion
-                        (goto-char pos)
-                        ;; Apply Todoist's authoritative next date
-                        (if due
-                            (let ((org-ts (orgist-parse-todoist-date-with-duration due duration))
-                                  (due-string (alist-get 'string due)))
-                              (when org-ts
-                                (org-schedule nil org-ts))
-                              (if due-string
-                                  (org-entry-put (point) "TODOIST_DUE_STRING" due-string)
-                                (org-entry-delete (point) "TODOIST_DUE_STRING")))
-                          ;; No due date returned — clear schedule
-                          (org-schedule '(4))
-                          (org-entry-delete (point) "TODOIST_DUE_STRING"))
-                        ;; Reset TODO state (org set it to DONE on completion)
-                        (let ((org-inhibit-logging t))
-                          (org-todo "TODO"))
-                        ;; Clear LAST_REPEAT so write-back doesn't re-detect
-                        (org-entry-delete (point) "LAST_REPEAT")
-                        (orgist-log 'debug "Refreshed recurring date for %s from Todoist"
-                                    id))
+                      ;; Keep `org-schedule'/`org-todo' from looping over an
+                      ;; active user region.
+                      (let ((org-loop-over-headlines-in-active-region nil))
+                        (save-excursion
+                          (goto-char pos)
+                          ;; Apply Todoist's authoritative next date
+                          (if due
+                              (let ((org-ts (orgist-parse-todoist-date-with-duration due duration))
+                                    (due-string (alist-get 'string due)))
+                                (when org-ts
+                                  (org-schedule nil org-ts))
+                                (if due-string
+                                    (org-entry-put (point) "TODOIST_DUE_STRING" due-string)
+                                  (org-entry-delete (point) "TODOIST_DUE_STRING")))
+                            ;; No due date returned — clear schedule
+                            (org-schedule '(4))
+                            (org-entry-delete (point) "TODOIST_DUE_STRING"))
+                          ;; Reset TODO state (org set it to DONE on completion)
+                          (let ((org-inhibit-logging t))
+                            (org-todo "TODO"))
+                          ;; Clear LAST_REPEAT so write-back doesn't re-detect
+                          (org-entry-delete (point) "LAST_REPEAT")
+                          (orgist-log 'debug "Refreshed recurring date for %s from Todoist"
+                                      id)))
                       (throw 'done nil))))))))))))
 
 (defun orgist-execute-write-back (commands)
