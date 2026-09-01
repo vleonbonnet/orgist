@@ -102,6 +102,14 @@
   :group 'orgist
   :type '(choice string (const nil)))
 
+(defcustom orgist-log-max-bytes (* 100 1024 1024)
+  "Rotate `orgist-log-file' when it exceeds this many bytes.
+On rotation the file is renamed to \"<name>.old\" (replacing any
+previous one), so up to two generations are kept.  Set to nil to
+never rotate."
+  :group 'orgist
+  :type '(choice integer (const :tag "Never rotate" nil)))
+
 (defcustom orgist-sync-project-filter nil
   "When non-nil, only sync this project (by name).
 Useful for debugging.  Set to a project name string to limit sync
@@ -114,8 +122,10 @@ to that project, or nil to sync all projects."
 nil     — Disable write-back entirely.
 t       — Write back without confirmation.
 `ask'   — Show a confirmation buffer before writing (default).
-Even when enabled, write-back operates in dry-run mode by default.
-Set `orgist-write-back-dry-run' to nil to actually send commands."
+The `ask' confirmation buffer (`orgist-confirm-mode') is the normal
+guard against unwanted sends; `orgist-write-back-dry-run' remains
+available as an additional safety net that logs commands without
+sending them."
   :group 'orgist
   :type '(choice (const :tag "Off" nil)
                  (const :tag "On (no confirmation)" t)
@@ -208,6 +218,14 @@ Requires a Todoist plan that supports completed tasks."
   "Days back to look for completed tasks on first pull.
 On subsequent pulls, only tasks completed since the last
 pull are fetched."
+  :group 'orgist
+  :type 'integer)
+
+(defcustom orgist-completed-retry-attempts 10
+  "How many pulls to retry a completed task that could not be placed.
+A completed task whose project buffer or parent cannot be resolved is
+persisted and retried on later pulls; after this many attempts it is
+dropped with a warning (tasks of archived projects are never placeable)."
   :group 'orgist
   :type 'integer)
 
@@ -348,9 +366,29 @@ Created lazily by `orgist--pandoc-lua-filter'.")
                      (save-buffer)))))
              orgist--batch-save-pending)))
 
+(defvar orgist--log-writes-since-rotate-check 0
+  "File-log writes since the last rotation size check.")
+
+(defun orgist--maybe-rotate-log ()
+  "Rename `orgist-log-file' to \"<name>.old\" when it exceeds
+`orgist-log-max-bytes'.  Throttled to one size check per 500 writes."
+  (when (and orgist-log-max-bytes orgist-log-file)
+    (setq orgist--log-writes-since-rotate-check
+          (1+ orgist--log-writes-since-rotate-check))
+    (when (>= orgist--log-writes-since-rotate-check 500)
+      (setq orgist--log-writes-since-rotate-check 0)
+      (when-let* ((attrs (file-attributes orgist-log-file))
+                  (size (file-attribute-size attrs)))
+        (when (> size orgist-log-max-bytes)
+          (let ((old (concat orgist-log-file ".old")))
+            (when (file-exists-p old) (delete-file old))
+            (rename-file orgist-log-file old)
+            (orgist-log 'info "Rotated log to %s (%d bytes)" old size)))))))
+
 (defun orgist--flush-log-buffer ()
   "Flush accumulated log messages to `orgist-log-file'."
   (when (and orgist--log-buffer orgist-log-file)
+    (orgist--maybe-rotate-log)
     (let ((log-dir (file-name-directory orgist-log-file))
           (coding-system-for-write 'utf-8-unix))
       (unless (file-directory-p log-dir)
@@ -2003,8 +2041,13 @@ that have no body to clear)."
          ;; Pre-update state, for synthesizing reopen/repeat log entries.
          (old-state (org-get-todo-state))
          (old-scheduled (org-entry-get (point) "SCHEDULED"))
+         ;; A done-type keyword the user chose (e.g. CANCELED) is kept:
+         ;; Todoist only knows checked/unchecked, so any done keyword
+         ;; already satisfies checked=t.
          (new-state (when content
-                      (if (eq (alist-get 'checked element) t) "DONE" "TODO"))))
+                      (if (eq (alist-get 'checked element) t)
+                          (if (member old-state org-done-keywords) old-state "DONE")
+                        "TODO"))))
     (orgist-log 'debug "Updating element %s at point %d"
                 (orgist--id-label id (or content name)) (point))
     ;; Set heading text (convert markdown formatting to org)
@@ -2020,10 +2063,13 @@ that have no body to clear)."
     ;; when the state or the recurrence date actually changed.
     (if content
         (progn
-          (let ((org-inhibit-logging t)
-                (org-log-done nil)
-                (org-log-repeat nil))
-            (org-todo new-state))
+          ;; Skip no-op transitions: re-entering a done state would
+          ;; trigger org-auto-repeat on repeatered tasks.
+          (unless (equal old-state new-state)
+            (let ((org-inhibit-logging t)
+                  (org-log-done nil)
+                  (org-log-repeat nil))
+              (org-todo new-state)))
           (when-let* ((priority (alist-get 'priority element))
                       (org-priority (orgist-todoist-priority-to-org priority)))
             (org-priority org-priority)))
@@ -3342,6 +3388,7 @@ When `orgist--log-buffer' is non-nil, file writes are deferred."
     (when orgist-log-file
       (if orgist--log-buffer
           (push (concat file-msg "\n") orgist--log-buffer)
+        (orgist--maybe-rotate-log)
         (let ((log-dir (file-name-directory orgist-log-file))
               (coding-system-for-write 'utf-8-unix))
           (unless (file-directory-p log-dir)
@@ -6229,6 +6276,34 @@ Returns `inserted', `updated', or nil if the parent was not found."
           (orgist--save-buffer)
           result)))))
 
+(defun orgist--completed-retry-file ()
+  "Return path to the file storing completed tasks awaiting retry."
+  (expand-file-name "completed-retry.json" orgist-base-dir))
+
+(defun orgist--load-completed-retries ()
+  "Load completed tasks that could not be placed by earlier pulls."
+  (let ((file (orgist--completed-retry-file)))
+    (when (file-exists-p file)
+      (condition-case err
+          (let ((json-object-type 'alist)
+                (json-key-type 'symbol)
+                (json-array-type 'list))
+            (json-read-file file))
+        (error
+         (orgist-log 'warn "Completed: dropping unreadable retry file: %S" err)
+         nil)))))
+
+(defun orgist--save-completed-retries (tasks)
+  "Persist unplaced completed TASKS for the next pull; delete file when none."
+  (let ((file (orgist--completed-retry-file)))
+    (if tasks
+        (with-temp-file file
+          ;; vconcat forces a JSON array — a bare list of alists is
+          ;; ambiguous to `json-encode'.
+          (insert (json-encode (vconcat tasks))))
+      (when (file-exists-p file)
+        (delete-file file)))))
+
 (defun orgist-process-completed-tasks (tasks)
   "Insert or update completed TASKS into their project org buffers.
 Each task is normalized and then inserted/updated using the same
@@ -6236,14 +6311,28 @@ machinery as `orgist-update-elements'.  Tasks are sorted so parents
 are processed before children.  Tasks whose parent is not yet
 present are deferred and retried in subsequent passes, since
 inserting a parent in pass N makes its children resolvable in
-pass N+1."
-  (let* ((sorted (orgist--sort-completed-tasks-parents-first tasks))
+pass N+1.  Tasks that still cannot be placed (their project buffer
+or parent is unresolvable) are persisted and retried on later
+pulls, up to `orgist-completed-retry-attempts' times, so a
+transient resolution failure does not silently lose the completion."
+  (let* ((carried (seq-remove
+                   (lambda (retry)
+                     (let ((rid (alist-get 'id retry)))
+                       (seq-some (lambda (tk) (equal (alist-get 'id tk) rid))
+                                 tasks)))
+                   (orgist--load-completed-retries)))
+         (sorted (orgist--sort-completed-tasks-parents-first
+                  (append tasks carried)))
          (total (length sorted))
          (inserted 0)
          (updated 0)
          (skipped 0)
+         (unplaced '())
          (remaining sorted)
          (pass 0))
+    (when carried
+      (orgist-log 'debug "Completed tasks: retrying %d previously unplaced task(s)"
+                  (length carried)))
     (while remaining
       (setq pass (1+ pass))
       (let ((deferred '())
@@ -6260,7 +6349,8 @@ pass N+1."
                          (setq progress-made t))
               ('updated  (setq updated (1+ updated))
                          (setq progress-made t))
-              ('skipped  (setq skipped (1+ skipped)))
+              ('skipped  (setq skipped (1+ skipped))
+                         (push task unplaced))
               ('nil      (push task deferred)))))
         (if (and deferred (not progress-made))
             ;; No progress — give up on remaining tasks
@@ -6270,12 +6360,24 @@ pass N+1."
                       (pid (alist-get 'parent_id task)))
                   (orgist-log 'warn "Completed: parent %s not found for %s, skipping"
                               pid name))
-                (setq skipped (1+ skipped)))
+                (setq skipped (1+ skipped))
+                (push task unplaced))
               (setq remaining nil))
           (when deferred
             (orgist-log 'debug "Completed tasks: pass %d deferred %d tasks, retrying"
                         pass (length deferred)))
           (setq remaining (nreverse deferred)))))
+    ;; Persist unplaced tasks for the next pull; drop after too many
+    ;; attempts (e.g. tasks of archived projects are never placeable).
+    (orgist--save-completed-retries
+     (let (keep)
+       (dolist (task unplaced (nreverse keep))
+         (let ((attempts (1+ (or (alist-get 'orgist_retry task) 0))))
+           (if (> attempts orgist-completed-retry-attempts)
+               (orgist-log 'warn "Completed: giving up on %s after %d attempts"
+                           (alist-get 'content task) (1- attempts))
+             (setf (alist-get 'orgist_retry task) attempts)
+             (push task keep))))))
     (orgist-log (if (or (> inserted 0) (> updated 0)) 'info 'debug)
                 "Completed tasks: %d processed (%d inserted, %d updated, %d skipped)"
                 total inserted updated skipped)))
@@ -7185,7 +7287,9 @@ uses the full lookback window instead of last pull timestamp."
                     (let ((tasks (orgist-fetch-completed-tasks since until)))
                       (message "Orgist [DEBUG] Completed tasks: %d tasks fetched"
                                (length tasks))
-                      (when tasks
+                      ;; Run even with no new tasks when earlier pulls
+                      ;; left unplaced completions awaiting retry.
+                      (when (or tasks (file-exists-p (orgist--completed-retry-file)))
                         (orgist-process-completed-tasks tasks))
                       ;; Save buffers and snapshots
                       (dolist (buf (buffer-list))

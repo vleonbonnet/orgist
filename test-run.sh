@@ -84,10 +84,27 @@ require_token() {
     fi
 }
 
+run_ert() {
+    # Standalone ERT regression suites (exit code is the failure count)
+    local file rc=0
+    for file in test-due-string.el test-region-guard.el; do
+        echo "Running ERT suite $file..."
+        if ! timeout "$PROJECT_TIMEOUT" "$EMACS" --batch \
+             --chdir "$SCRIPT_DIR" -L "$SCRIPT_DIR" \
+             -l "$SCRIPT_DIR/test-capture.el" -l ert \
+             -l "$SCRIPT_DIR/$file" -f ert-run-tests-batch-and-exit; then
+            echo "ERT suite $file FAILED"
+            rc=1
+        fi
+    done
+    return "$rc"
+}
+
 main() {
     if [ $# -eq 0 ]; then
-        # No args: replay all cached projects
+        # No args: replay all cached projects, then the ERT suites
         run_harness all
+        run_ert
     elif [ "$1" = "record" ]; then
         if [ -z "$2" ]; then
             echo "Usage: $0 record <ProjectName>"
