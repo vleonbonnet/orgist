@@ -5663,7 +5663,12 @@ symbol is a key in MAPPING is replaced with the real ID."
 
 (defun orgist--send-command-chunk (commands)
   "Send a single chunk of COMMANDS to the Todoist Sync API.
-Returns a plist (:sync-status ALIST :temp-id-mapping ALIST :sync-token STRING)."
+Returns a plist (:sync-status ALIST :temp-id-mapping ALIST).
+
+The response also contains a sync token, but it is deliberately ignored:
+a commands-only request does not return resource changes.  Persisting its
+token would advance the read cursor past remote changes that Orgist has not
+downloaded or applied."
   (let* ((json-commands (json-encode (vconcat commands)))
          (response nil))
     (orgist--request-with-retry
@@ -5692,8 +5697,7 @@ Returns a plist (:sync-status ALIST :temp-id-mapping ALIST :sync-token STRING)."
     (unless response
       (orgist-log 'warn "Write-back: API returned empty response"))
     (list :sync-status (alist-get 'sync_status response)
-          :temp-id-mapping (alist-get 'temp_id_mapping response)
-          :sync-token (alist-get 'sync_token response))))
+          :temp-id-mapping (alist-get 'temp_id_mapping response))))
 
 (defun orgist-send-commands (commands)
   "Send COMMANDS to the Todoist Sync API.
@@ -5708,7 +5712,6 @@ merging results across all chunks."
          (total-chunks (max 1 (ceiling (/ (float total) batch-size))))
          (merged-status '())
          (merged-mapping '())
-         (last-sync-token nil)
          (remaining commands)
          (chunk-num 0))
     (orgist-log 'info "Sending %d command(s) to Todoist API in %d chunk(s)"
@@ -5733,13 +5736,8 @@ merging results across all chunks."
           (setq merged-status
                 (append merged-status (plist-get result :sync-status)))
           (when-let* ((m (plist-get result :temp-id-mapping)))
-            (setq merged-mapping (append merged-mapping m)))
-          (when-let* ((tok (plist-get result :sync-token)))
-            (setq last-sync-token tok)))
+            (setq merged-mapping (append merged-mapping m))))
         (setq remaining rest)))
-    ;; Save sync token from the final chunk's response.
-    (when (and last-sync-token (not orgist-sync-project-filter))
-      (orgist-save-sync-token last-sync-token))
     (orgist-log 'debug "Write-back sync_status: %S" merged-status)
     (when merged-mapping
       (orgist-log 'debug "Write-back temp_id_mapping: %S" merged-mapping))

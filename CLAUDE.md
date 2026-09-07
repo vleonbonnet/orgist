@@ -31,6 +31,7 @@ Orgist is an Emacs Lisp package for bidirectional sync between Todoist and Org-M
 - `test-sync.el` — Live API sync test script
 - `test-due-string.el` — ERT regression tests for hand-edited `TODOIST_DUE_STRING` write-back
 - `test-region-guard.el` — ERT regression tests for pull-side org command guards (active-region smear, todo-dependency blocking, done-keyword preservation)
+- `test-sync-token.el` — ERT regression tests ensuring command-only writes cannot advance the read sync cursor
 - `test-capture.el` — Batch-output capture shim (works around the Emacs 30.2 Windows `--batch` stderr bug; see `test-run.sh`)
 - `test-data/` — Shared cached API responses (`full-sync.json`, `incremental-sync.json`)
 - `test-data-move/` — Synthetic fixture for the cross-project `move` test (invented projects/tasks, no live data)
