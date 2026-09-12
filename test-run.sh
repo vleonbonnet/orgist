@@ -87,7 +87,8 @@ require_token() {
 run_ert() {
     # Standalone ERT regression suites (exit code is the failure count)
     local file rc=0
-    for file in test-due-string.el test-region-guard.el test-sync-token.el; do
+    for file in test-due-string.el test-region-guard.el test-sync-token.el \
+                test-id-cache.el test-body-spacing.el test-new-item-order.el; do
         echo "Running ERT suite $file..."
         if ! timeout "$PROJECT_TIMEOUT" "$EMACS" --batch \
              --chdir "$SCRIPT_DIR" -L "$SCRIPT_DIR" \

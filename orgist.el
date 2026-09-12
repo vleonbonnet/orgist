@@ -592,27 +592,77 @@ with buffer position, enabling write-back to detect reorders."
              (not orgist--inhibit-sibling-order-update)
              (org-at-heading-p)
              (org-entry-get (point) "TODOIST-ORDER"))
-    (let* ((is-section (not (null (org-entry-get (point) "SECTION"))))
-           (parent-level (save-excursion
-                           (if (org-up-heading-safe) (org-current-level) 0)))
-           (children (save-excursion
-                       (if (> parent-level 0)
-                           (progn (org-up-heading-safe)
-                                  (orgist--collect-direct-children parent-level))
-                         (goto-char (point-min))
-                         (orgist--collect-direct-children 0))))
-           ;; Filter to same type
-           (siblings (seq-filter
-                      (lambda (c) (eq (nth 2 c) is-section))
-                      children)))
-      ;; Assign sequential order values based on buffer position
-      (let ((idx 0))
-        (dolist (sib siblings)
-          (save-excursion
-            (goto-char (nth 3 sib))
-            (org-set-property "TODOIST-ORDER"
-                              (number-to-string idx)))
-          (setq idx (1+ idx)))))))
+    (orgist--renumber-siblings-at-point)))
+
+(defun orgist--renumber-siblings-at-point ()
+  "Number the same-type siblings of the heading at point 0..n by buffer position.
+Only siblings carrying both :ID: and :TODOIST-ORDER: take part
+\(see `orgist--collect-direct-children').  Returns an alist of
+\(ID . NEW-ORDER) for the siblings whose stored order changed, the
+heading at point excluded, so a caller that runs after the snapshot
+diff can re-diff exactly those."
+  (let* ((my-id (org-entry-get (point) "ID"))
+         (is-section (not (null (org-entry-get (point) "SECTION"))))
+         (parent-level (save-excursion
+                         (if (org-up-heading-safe) (org-current-level) 0)))
+         (children (save-excursion
+                     (if (> parent-level 0)
+                         (progn (org-up-heading-safe)
+                                (orgist--collect-direct-children parent-level))
+                       (goto-char (point-min))
+                       (orgist--collect-direct-children 0))))
+         ;; Filter to same type
+         (siblings (seq-filter
+                    (lambda (c) (eq (nth 2 c) is-section))
+                    children))
+         (changed '())
+         (idx 0)
+         (todo '()))
+    ;; Assign sequential order values based on buffer position.
+    (dolist (sib siblings)
+      (unless (= (nth 1 sib) idx)
+        (push (cons sib idx) todo)
+        (unless (equal (car sib) my-id)
+          (push (cons (car sib) idx) changed)))
+      (setq idx (1+ idx)))
+    ;; Write from the last sibling backwards: the positions were captured
+    ;; before any edit, and rewriting an earlier sibling's property value
+    ;; \(e.g. "9" -> "10") would shift every later position off its
+    ;; heading.  TODO was built by `push', so it is already in reverse
+    ;; buffer order.
+    (dolist (entry todo)
+      (save-excursion
+        (goto-char (nth 3 (car entry)))
+        (org-set-property "TODOIST-ORDER" (number-to-string (cdr entry)))))
+    (nreverse changed)))
+
+(defun orgist--assign-new-heading-order ()
+  "Give the new task heading at point a TODOIST-ORDER matching its position.
+Numbers it and its same-type siblings by buffer position so the
+item_add can carry a child_order: without one Todoist appends the
+task after its siblings and the next pull drags the heading to the
+bottom of its parent, undoing where the user wrote it.  Returns the
+\(ID . NEW-ORDER) alist of siblings whose order changed."
+  (org-entry-put (point) "TODOIST-ORDER" "0")
+  (orgist--renumber-siblings-at-point))
+
+(defun orgist--merge-sibling-order-changes (shifted file-changes)
+  "Re-diff the siblings in SHIFTED and merge the results into FILE-CHANGES.
+SHIFTED is the (ID . NEW-ORDER) alist from
+`orgist--renumber-siblings-at-point'.  The new-heading scan runs
+after the snapshot diff loop, so an order it changes on a known
+sibling would otherwise go unnoticed until that file is edited
+again.  Siblings without a snapshot (other new headings) need no
+entry: their item_add carries the order.  Returns the updated
+FILE-CHANGES alist."
+  (dolist (entry shifted)
+    (let ((sid (car entry)))
+      (when (gethash sid orgist-snapshots)
+        (let ((diff (save-excursion (orgist-diff-element sid))))
+          (setq file-changes (assoc-delete-all sid file-changes))
+          (when diff
+            (push (cons sid diff) file-changes))))))
+  file-changes)
 
 (defun orgist--after-move-subtree (&rest _)
   "Advice for `org-move-subtree-down'/`up' to update TODOIST-ORDER.
@@ -1947,8 +1997,10 @@ heading levels."
                                     label old-order order)
                         (orgist-position-element-by-order order element-type)
                         ;; org-move-subtree can eat blank lines between a
-                        ;; parent's body text and its first child heading.
-                        ;; Re-normalize the parent to restore the blank line.
+                        ;; parent's body text and its first child heading,
+                        ;; and the trailing blank line of the moved subtree
+                        ;; itself.  Re-normalize both.
+                        (orgist--normalize-body-spacing)
                         (save-excursion
                           (when (org-up-heading-safe)
                             (orgist--normalize-body-spacing)))
@@ -2298,6 +2350,19 @@ Point must be on the heading."
                  (not (looking-at "\n")))
             (insert "\n")
             (setq body-end (1+ body-end))))))
+      ;; Step 2c: Ensure one blank line between a LOGBOOK drawer and the
+      ;; description that follows it.  Step 2 only knows bare "- State"
+      ;; entries; with `org-log-into-drawer' the entries sit in a drawer
+      ;; and the description was inserted right after its :END: line.
+      (goto-char body-start)
+      (when (and (< body-start body-end)
+                 (looking-at "[ \t]*:LOGBOOK:[ \t]*$")
+                 (re-search-forward "^[ \t]*:END:[ \t]*\n" body-end t)
+                 (< (point) body-end)
+                 (not (looking-at "[ \t]*$"))
+                 (not (looking-at org-outline-regexp-bol)))
+        (insert "\n")
+        (setq body-end (1+ body-end)))
       ;; Step 3: Fix trailing boundary.
       (let ((has-body (and (< body-start body-end)
                            (not (string-blank-p
@@ -2710,25 +2775,74 @@ subtree has moved."
     (org-back-to-heading-or-point-min t)
     (puthash element-id (copy-marker (point) t) orgist-id-cache)))
 
+(defun orgist--scan-for-element-id (element-id)
+  "Find the heading carrying ELEMENT-ID by scanning the buffer.
+Returns the heading position (or `point-min' for the file-level
+drawer), or nil when no drawer sets :ID: to ELEMENT-ID.  Linear in
+the buffer size — only for the rare cache-repair path."
+  (save-excursion
+    (goto-char (point-min))
+    (let ((re (concat "^[ \t]*:ID:[ \t]+" (regexp-quote element-id) "[ \t]*$"))
+          (case-fold-search t)
+          (found nil))
+      (while (and (not found) (re-search-forward re nil t))
+        (let ((pos (save-excursion
+                     (org-back-to-heading-or-point-min t)
+                     (point))))
+          (when (equal (org-entry-get pos "ID") element-id)
+            (setq found pos))))
+      found)))
+
 (defun orgist-find-element-by-id (element-id)
   "Find an existing element with the given ID in the current buffer.
 Uses a buffer-local hash table cache for O(1) lookups.
 Returns the point of the element, or nil if not found.
 Validates that the heading at the cached position still carries
-the expected ID property, guarding against stale markers after
-the user manually moves or deletes headings."
+the expected ID property.  A stale marker (the heading was moved by
+a cut/paste or subtree surgery that collapsed its marker onto a
+neighbour) is repaired by rescanning the buffer, because the
+element is known to live here: returning nil instead makes the
+pull path insert a second copy of the heading (seen 2026-09-12).
+Only a stale entry triggers the scan — an ID absent from the cache
+is simply not in this buffer, and the presence check calls this for
+every snapshot ID in every file."
   (unless orgist-id-cache
     (orgist-build-id-cache))
   (when-let* ((marker (gethash element-id orgist-id-cache)))
-    (when-let* ((pos (marker-position marker)))
-      (save-excursion
-        (goto-char pos)
-        (org-back-to-heading-or-point-min t)
-        (if (equal (org-entry-get (point) "ID") element-id)
-            (point)
-          ;; Stale cache entry — heading was removed or moved away
-          (remhash element-id orgist-id-cache)
-          nil)))))
+    (let ((cached (when-let* ((pos (marker-position marker)))
+                    (save-excursion
+                      (goto-char pos)
+                      (org-back-to-heading-or-point-min t)
+                      (when (equal (org-entry-get (point) "ID") element-id)
+                        (point))))))
+      (or cached
+          ;; Stale cache entry — rescan before concluding it is gone.
+          (let ((pos (orgist--scan-for-element-id element-id)))
+            (if pos
+                (progn
+                  (orgist-log 'debug "Stale id-cache marker for %s repaired by rescan (%s -> %d)"
+                              element-id (marker-position marker) pos)
+                  (puthash element-id (copy-marker pos t) orgist-id-cache)
+                  pos)
+              (remhash element-id orgist-id-cache)
+              nil))))))
+
+(defun orgist--move-subtree (direction)
+  "Move the subtree at point one sibling in DIRECTION (`up' or `down').
+`org-move-subtree-up'/`down' take both subtree boundaries from the
+org-element cache; a stale cached end (see `orgist--subtree-end')
+makes them cut the wrong region, which splits or duplicates
+headings.  Validate the cache for this subtree and for the sibling
+it will jump over before moving."
+  (orgist--subtree-end)
+  (save-excursion
+    (when (if (eq direction 'down)
+              (org-get-next-sibling)
+            (org-get-previous-sibling))
+      (orgist--subtree-end)))
+  (if (eq direction 'down)
+      (org-move-subtree-down)
+    (org-move-subtree-up)))
 
 (defun orgist-position-element-by-order (child-order element-type)
   "Position the current subtree according to its TODOIST-ORDER.
@@ -2752,19 +2866,19 @@ come after all items."
         ;; among other sections.
         (progn
           (while (save-excursion (org-get-next-sibling))
-            (org-move-subtree-down))
+            (orgist--move-subtree 'down))
           (while (save-excursion
                    (and (org-get-previous-sibling)
                         (org-entry-get (point) "SECTION")
                         (let ((prev-order (string-to-number
                                            (or (org-entry-get (point) "TODOIST-ORDER") "0"))))
                           (> prev-order child-order))))
-            (org-move-subtree-up)))
+            (orgist--move-subtree 'up)))
       ;; Items: move all the way up to be the first sibling (items
       ;; always come before sections), then move down past items with
       ;; lower TODOIST-ORDER.  Stop before sections.
       (while (save-excursion (org-get-previous-sibling))
-        (org-move-subtree-up))
+        (orgist--move-subtree 'up))
       ;; Move down past items whose TODOIST-ORDER is lower.
       (while (save-excursion
                (and (org-get-next-sibling)
@@ -2772,7 +2886,7 @@ come after all items."
                     (let ((next-order (string-to-number
                                        (or (org-entry-get (point) "TODOIST-ORDER") "0"))))
                       (< next-order child-order))))
-        (org-move-subtree-down)))
+        (orgist--move-subtree 'down)))
     (when (/= start-pos (point))
       (orgist-log 'debug "Positioned '%s': %d -> %d" heading start-pos (point)))))
 
@@ -4555,7 +4669,10 @@ and every other element and file is still processed."
                     (let ((temp-id (org-id-uuid)))
                       (org-entry-put (point) "ID" temp-id)
                       (orgist-id-cache-put temp-id)
-                      (push (cons temp-id 'new) file-changes)))
+                      (push (cons temp-id 'new) file-changes)
+                      (setq file-changes
+                            (orgist--merge-sibling-order-changes
+                             (orgist--assign-new-heading-order) file-changes))))
                    ((and (= (org-current-level) 1)
                          (not (org-get-todo-state))
                          (not (org-entry-get (point) "ID"))
@@ -4596,7 +4713,11 @@ and every other element and file is still processed."
                            (not (org-entry-get (point) "SECTION"))
                            (not (gethash id orgist-snapshots))))
                     (push (cons (org-entry-get (point) "ID") 'new)
-                          file-changes)))
+                          file-changes)
+                    (unless (org-entry-get (point) "TODOIST-ORDER")
+                      (setq file-changes
+                            (orgist--merge-sibling-order-changes
+                             (orgist--assign-new-heading-order) file-changes)))))
                   (end-of-line)))
             (error
              (cl-incf file-errors)
@@ -4743,6 +4864,12 @@ Returns a list of command alists with keys `type', `uuid', `args'."
                               (push (cons 'description
                                           (orgist-convert-description-to-markdown desc))
                                     add-args)))
+                          ;; Place the task where the heading sits among
+                          ;; its siblings (assigned by
+                          ;; `orgist--assign-new-heading-order' during the
+                          ;; scan); Todoist would otherwise append it.
+                          (when-let* ((order (plist-get local :order)))
+                            (push (cons 'child_order order) add-args))
                           (push (list (cons 'type "item_add")
                                       (cons 'uuid (org-id-uuid))
                                       (cons 'temp_id id)
