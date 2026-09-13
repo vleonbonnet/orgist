@@ -3294,10 +3294,13 @@ Returns the appropriate priority character based on org-priority settings."
    (t (+ org-priority-highest (- 4 todoist-priority)))))
 
 (defun orgist--pandoc-lua-filter ()
-  "Return path to a Lua filter that preserves Unicode in pandoc org output.
+  "Return path to a Lua filter preserving Unicode and local Org links.
 Pandoc's org writer downgrades en-dash, em-dash, ellipsis, and
 right-quote to ASCII equivalents.  This filter emits the original
 Unicode characters as raw org inlines instead.
+Markdown readers URL-encode local paths, but Org opens those paths
+literally.  Decode local link targets once when importing Markdown;
+leave web URLs and other link protocols unchanged.
 The file is created once and reused for the session."
   (unless (and orgist--pandoc-lua-filter
                (file-exists-p orgist--pandoc-lua-filter))
@@ -3318,6 +3321,18 @@ The file is created once and reused for the session."
        "  s = s:gsub(\"\\u{2019}\", \"\\xe2\\x80\\x99\")\n"
        "  s = s:gsub(\"\\u{00AD}\", \"\\xc2\\xad\")\n"
        "  return pandoc.RawInline(\"org\", s)\n"
+       "end\n"
+       "function Link(el)\n"
+       "  local target = el.target\n"
+       "  local scheme = target:match(\"^([%a][%w+.-]*):\")\n"
+       "  if scheme == \"attachment\" or scheme == \"file\"\n"
+       "     or (not scheme and target:sub(1, 1) ~= \"#\"\n"
+       "         and target:sub(1, 2) ~= \"//\") then\n"
+       "    el.target = target:gsub(\"%%(%x%x)\", function(hex)\n"
+       "      return string.char(tonumber(hex, 16))\n"
+       "    end)\n"
+       "    return el\n"
+       "  end\n"
        "end\n")))
   orgist--pandoc-lua-filter)
 
