@@ -5890,7 +5890,9 @@ SUCCEEDED and FAILED are the respective command counts."
            for detail = (cl-loop for (k . v) in args
                                  unless (eq k 'id)
                                  collect (format "%s=%S" k v))
-           do (orgist-log 'info "%s   %d. %s %s %s"
+           ;; Full arguments (whole descriptions) only reach *Messages*
+           ;; at debug level; the file log receives every level.
+           do (orgist-log 'debug "%s   %d. %s %s %s"
                           tag i cmd-type (orgist--id-label id snap-name)
                           (string-join detail " "))))
 
