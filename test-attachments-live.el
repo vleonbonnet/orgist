@@ -7,6 +7,12 @@
 ;; Tests all 4 CRUD operations in both directions (push + pull).
 
 (add-to-list 'load-path (expand-file-name "~/.emacs.d/elpaca/builds/request"))
+;; org-sync-confirm is required by orgist-confirm; prefer the elpaca build,
+;; fall back to the source checkout on a fresh clone.
+(dolist (dir '("~/.emacs.d/elpaca/builds/org-sync-confirm"
+               "~/.emacs.d/elpaca/sources/org-sync-confirm"))
+  (when (file-directory-p (expand-file-name dir))
+    (add-to-list 'load-path (expand-file-name dir))))
 (add-to-list 'load-path default-directory)
 (let ((script-dir (file-name-directory (or load-file-name buffer-file-name))))
   (load (expand-file-name "orgist.el" script-dir) nil nil t))

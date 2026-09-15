@@ -14,6 +14,12 @@
 
 (add-to-list 'load-path
              (expand-file-name "~/.emacs.d/elpaca/builds/request"))
+;; org-sync-confirm is required by orgist-confirm; prefer the elpaca build,
+;; fall back to the source checkout on a fresh clone.
+(dolist (dir '("~/.emacs.d/elpaca/builds/org-sync-confirm"
+               "~/.emacs.d/elpaca/sources/org-sync-confirm"))
+  (when (file-directory-p (expand-file-name dir))
+    (add-to-list 'load-path (expand-file-name dir))))
 (add-to-list 'load-path default-directory)
 (require 'ert)
 (require 'orgist)

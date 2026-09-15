@@ -7,7 +7,7 @@
 ;; Version: 0.1
 ;; Keywords: productivity
 ;; URL: https://citadel.leon.click/
-;; Package-Requires: ((org) (request) (json))
+;; Package-Requires: ((org) (request) (json) (org-sync-confirm))
 
 ;; This file is not part of GNU Emacs.
 
@@ -122,7 +122,7 @@ to that project, or nil to sync all projects."
 nil     — Disable write-back entirely.
 t       — Write back without confirmation.
 `ask'   — Show a confirmation buffer before writing (default).
-The `ask' confirmation buffer (`orgist-confirm-mode') is the normal
+The `ask' confirmation buffer (`org-sync-confirm-mode') is the normal
 guard against unwanted sends; `orgist-write-back-dry-run' remains
 available as an additional safety net that logs commands without
 sending them."
@@ -980,6 +980,8 @@ PLIST is a property list with these keys:
          (orgist-el-dir orgist--directory)
          (confirm-dir (when-let* ((f (symbol-file 'orgist-confirm-show)))
                         (file-name-directory f)))
+         (review-dir (when-let* ((f (symbol-file 'org-sync-confirm-show)))
+                       (file-name-directory f)))
          (token (if (functionp orgist-bearer-token)
                     (funcall orgist-bearer-token)
                   orgist-bearer-token))
@@ -991,7 +993,7 @@ PLIST is a property list with these keys:
                      load-path))
          (all-paths (delete-dups
                      (delq nil
-                           (append (list orgist-el-dir confirm-dir)
+                           (append (list orgist-el-dir confirm-dir review-dir)
                                    dep-paths))))
          (program
           ;; print-length/print-level truncate lists with "..." which
@@ -5288,71 +5290,6 @@ Returns a list of command alists with keys `type', `uuid', `args'."
             (push cmd sections)
           (push cmd rest)))
       (append (nreverse sections) (nreverse rest)))))
-
-(defun orgist-group-changes-by-project (changes)
-  "Group CHANGES by project file.
-Returns alist of (PROJECT-NAME . ITEMS) where each ITEM is
-  (ELEMENT-ID TASK-NAME DIFF-TYPE DIFF).
-DIFF-TYPE is one of `modified', `deleted', or `new'."
-  (let ((project-map (make-hash-table :test 'equal)))
-    (dolist (change changes)
-      (let* ((id (car change))
-             (diff (cdr change))
-             (snapshot (gethash id orgist-snapshots))
-             (task-name (or (when snapshot (plist-get snapshot :content))
-                           ;; New tasks have no snapshot yet — read from buffer
-                           (catch 'name
-                             (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
-                               (when-let* ((buf (find-buffer-visiting file)))
-                                 (with-current-buffer buf
-                                   (when-let* ((pos (orgist-find-element-by-id id)))
-                                     (save-excursion
-                                       (goto-char pos)
-                                       (throw 'name
-                                              (car (orgist-extract-heading-and-tags))))))))
-                             "?")))
-             (diff-type (cond ((eq diff 'deleted) 'deleted)
-                              ;; Both 'new (task) and 'new-section
-                              ;; render the same way in the confirm UI.
-                              ((memq diff '(new new-section)) 'new)
-                              (t 'modified)))
-             (project-name nil))
-        ;; Find which project file this element belongs to
-        (catch 'found
-          (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
-            (let ((buf (find-buffer-visiting file)))
-              (when buf
-                (with-current-buffer buf
-                  (when (orgist-find-element-by-id id)
-                    (setq project-name (file-name-base file))
-                    (throw 'found nil)))))))
-        ;; Deleted tasks won't be in any buffer — resolve project
-        ;; by walking the snapshot's :parent-id up to a file-level ID.
-        (when (and (not project-name) snapshot)
-          (let ((parent (plist-get snapshot :parent-id)))
-            (catch 'found
-              (while parent
-                (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
-                  (when-let* ((buf (find-buffer-visiting file)))
-                    (with-current-buffer buf
-                      (when-let* ((pos (orgist-find-element-by-id parent)))
-                        (when (= pos (point-min))
-                          (setq project-name (file-name-base file))
-                          (throw 'found nil))))))
-                ;; Walk up: check if this parent has its own snapshot
-                (let ((parent-snap (gethash parent orgist-snapshots)))
-                  (setq parent (when parent-snap
-                                 (plist-get parent-snap :parent-id))))))))
-        (unless project-name
-          (setq project-name "(unknown)"))
-        (push (list id task-name diff-type diff)
-              (gethash project-name project-map nil))))
-    ;; Convert hash to alist, reverse items to preserve order
-    (let ((result '()))
-      (maphash (lambda (project items)
-                 (push (cons project (nreverse items)) result))
-               project-map)
-      (sort result (lambda (a b) (string< (car a) (car b)))))))
 
 (defun orgist--refresh-recurring-dates (item-ids)
   "Fetch Todoist's computed next dates for ITEM-IDS and apply them.

@@ -285,28 +285,43 @@ turning silent corruption into logged self-repair.
 *** Confirmation Buffer
 
 When =orgist-enable-write-back= is ='ask=, running =M-x orgist= or
-=M-x orgist-write-back= displays the =*orgist-confirm*= buffer with a
-two-level collapsible tree of pending changes:
+=M-x orgist-write-back= displays the =*orgist-confirm*= buffer, an
+[[https://github.com/vleonbonnet/org-sync-confirm][org-sync-confirm]] review of the pending changes grouped by project:
 
 #+begin_example
-Orgist Write-Back — 5 change(s)
-══════════════════════════════════
+Orgist Write-Back — 3 changes: 2 modified, 1 new
+═════════════════════════════════════════════════
 
-▶ Orgtest  2 modified, 1 deleted
-▶ Family   1 modified, 1 new
+▼ Family  2 modified, 1 new
+  ▼ [x] ✎ Renouveler mon passeport  description
+      ▶ description:  -1 +1 line, +288 chars
+      ▶ payload:      14 lines, sent as is
+  ▶ [x] + Book photographer  new
 
-C-c C-c  Confirm    C-c C-k  Cancel    TAB  Toggle section
+C-c C-c  Confirm    C-c C-k  Cancel    TAB  Toggle    S-TAB  Cycle all    RET  Checkbox    n/p  Move
 #+end_example
 
-- =TAB= on a project line expands the task list.
-- =TAB= on a task line expands field-level details (old → new values).
-- =n= / =p= navigate between visible headings.
+- Short fields show =old → new= inline with the differing words
+  highlighted; long fields expand (=TAB=) to a unified diff with
+  word-level refinement.  =S-TAB= cycles the whole buffer.
+- The old side of a modified task is its *live* Todoist state, fetched
+  when the buffer opens (up to =orgist-confirm-remote-fetch-limit=
+  tasks); when that state no longer matches the last sync, the task
+  line warns =changed in Todoist since last sync= because confirming
+  overwrites the remote edit.
+- =payload= shows the exact Sync API commands for the task.  Commands
+  that belong to no task (=label_add=) are listed under a =Batch=
+  container and always go with the batch.
+- =RET= on a task unticks it.  Unticked changes are not sent: the
+  commands are regenerated for the ticked changes only and the
+  verification stamps are dropped, so the file stays due and the rest
+  is offered again on the next save or sync.
 - =C-c C-c= confirms — executes the write-back then continues the sync.
 - =C-c C-k= / =q= cancels — aborts the sync cycle; local changes are
   preserved for the next run.
 
-Implementation lives in =orgist-confirm.el= (=orgist-confirm-mode=, derived
-from =special-mode=).
+=orgist-confirm.el= builds the review tree and executes the confirmed
+subset; the buffer itself is =org-sync-confirm-mode=.
 
 ** Labels
 
@@ -368,7 +383,7 @@ commands with a =project_id= target.
 | File              | Purpose                                              |
 |-------------------+------------------------------------------------------|
 | =orgist.el=         | Main source — all functionality in one file          |
-| =orgist-confirm.el= | Write-back confirmation buffer (=orgist-confirm-mode=) |
+| =orgist-confirm.el= | Write-back review adapter for =org-sync-confirm=      |
 | =README.org=        | This file — project documentation                    |
 | =CLAUDE.md=         | Claude Code (AI assistant) instructions              |
 | =test-harness.el=   | Offline test infrastructure (request mock, runner)   |

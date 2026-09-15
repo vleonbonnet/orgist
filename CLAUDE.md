@@ -24,7 +24,7 @@ Orgist is an Emacs Lisp package for bidirectional sync between Todoist and Org-M
 ## File Structure
 
 - `orgist.el` — Main source (all functionality)
-- `orgist-confirm.el` — Write-back confirmation buffer (`orgist-confirm-mode`)
+- `orgist-confirm.el` — Write-back review adapter: builds the `org-sync-confirm` tree, fetches live Todoist state, executes the confirmed subset
 - `README.org` — Project documentation, architecture, configuration reference
 - `test-harness.el` — Offline test infrastructure (request mock, isolation, lifecycle runner)
 - `test-run.sh` — Shell wrapper for replay, record, and live test modes
@@ -35,6 +35,7 @@ Orgist is an Emacs Lisp package for bidirectional sync between Todoist and Org-M
 - `test-id-cache.el` — ERT regression tests for stale ID-cache markers (rescan instead of duplicating the heading on pull)
 - `test-body-spacing.el` — ERT regression tests for body spacing normalization (blank line after a LOGBOOK drawer)
 - `test-new-item-order.el` — ERT regression tests for new-task ordering (item_add child_order, sibling reorder in the same batch)
+- `test-confirm.el` — ERT regression tests for the review adapter (tree building, live remote values, partial selection)
 - `test-capture.el` — Batch-output capture shim (works around the Emacs 30.2 Windows `--batch` stderr bug; see `test-run.sh`)
 - `test-data/` — Shared cached API responses (`full-sync.json`, `incremental-sync.json`)
 - `test-data-move/` — Synthetic fixture for the cross-project `move` test (invented projects/tasks, no live data)
@@ -42,5 +43,6 @@ Orgist is an Emacs Lisp package for bidirectional sync between Todoist and Org-M
 ## Dependencies
 
 - `request` (Emacs HTTP library)
+- `org-sync-confirm` (review buffer; `~/.emacs.d/elpaca/sources/org-sync-confirm`)
 - `org` (Org-Mode)
 - `pandoc` (optional, for markdown → org conversion)
