@@ -150,5 +150,146 @@ Description line.
       (should (looking-at "\nDescription line\\.\n\n\\* TODO Next"))
       (set-buffer-modified-p nil))))
 
+(ert-deftest orgist-body-spacing/description-subheading-gets-blank ()
+  "A description sub-heading is separated from its own content.
+Normalization used to stop at the first following heading, leaving
+pandoc-generated sub-headings glued to their paragraphs.  The blank
+before the next sibling task is the insertion flow's business, not
+the entry normalizer's."
+  (should (equal (orgist-test--normalize
+                  "* TODO Task
+:PROPERTIES:
+:ID:       T1
+:END:
+Description.
+** Detail
+Sub body.
+* TODO Next
+:PROPERTIES:
+:ID:       T2
+:END:
+")
+                 "* TODO Task
+:PROPERTIES:
+:ID:       T1
+:END:
+
+Description.
+
+** Detail
+
+Sub body.
+* TODO Next
+:PROPERTIES:
+:ID:       T2
+:END:
+")))
+
+(ert-deftest orgist-body-spacing/bullet-description-gets-blank ()
+  "A bullet-list description is content and gets its blank line.
+Any leading \"- \" used to be treated as a logbook entry, gluing
+the list to the metadata."
+  (should (equal (orgist-test--normalize
+                  "* TODO Task
+:PROPERTIES:
+:ID:       T1
+:END:
+- First item
+- Second item
+* TODO Next
+:PROPERTIES:
+:ID:       T2
+:END:
+")
+                 "* TODO Task
+:PROPERTIES:
+:ID:       T1
+:END:
+
+- First item
+- Second item
+
+* TODO Next
+:PROPERTIES:
+:ID:       T2
+:END:
+")))
+
+(ert-deftest orgist-body-spacing/block-contents-protected ()
+  "Blank lines inside literal blocks are data and are never collapsed."
+  (should (equal (orgist-test--normalize
+                  "* TODO Task
+:PROPERTIES:
+:ID:       T1
+:END:
+#+BEGIN_SRC python
+x = 1
+
+
+y = 2
+#+END_SRC
+* TODO Next
+:PROPERTIES:
+:ID:       T2
+:END:
+")
+                 "* TODO Task
+:PROPERTIES:
+:ID:       T1
+:END:
+
+#+BEGIN_SRC python
+x = 1
+
+
+y = 2
+#+END_SRC
+
+* TODO Next
+:PROPERTIES:
+:ID:       T2
+:END:
+")))
+
+(ert-deftest orgist-body-spacing/id-child-subtree-skipped ()
+  "ID-bearing child subtrees are left to their own updates.
+The parent's normalization stops at their heading and skips the whole
+subtree, so their spacing cannot be double-handled."
+  (should (equal (orgist-test--normalize
+                  "* TODO Task
+:PROPERTIES:
+:ID:       T1
+:END:
+Description.
+** TODO Child
+:PROPERTIES:
+:ID:       T2
+:END:
+Glued child body.
+
+* TODO Next
+:PROPERTIES:
+:ID:       T3
+:END:
+")
+                 "* TODO Task
+:PROPERTIES:
+:ID:       T1
+:END:
+
+Description.
+
+** TODO Child
+:PROPERTIES:
+:ID:       T2
+:END:
+Glued child body.
+
+* TODO Next
+:PROPERTIES:
+:ID:       T3
+:END:
+")))
+
 (provide 'test-body-spacing)
 ;;; test-body-spacing.el ends here

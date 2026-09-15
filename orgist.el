@@ -2289,8 +2289,12 @@ Guarantees (see README.org § Body Spacing):
 - Exactly one blank line separates body content (logbook, description)
   from the next heading or end of subtree.
 - Exactly one blank line between logbook entries and description text.
-- No runs of more than one consecutive blank line anywhere.
+- No runs of more than one consecutive blank line anywhere outside
+  literal blocks, whose contents keep their exact shape.
 - Tasks/sections with no body content have no trailing blank line.
+Description sub-headings get the same structural blank lines; child
+subtrees carrying an ID property are Todoist elements normalized by
+their own updates and are left alone.
 Point must be on the heading."
   (save-excursion
     (org-back-to-heading-or-point-min t)
@@ -2298,91 +2302,206 @@ Point must be on the heading."
     ;; property drawer and planning lines — the logbook and description
     ;; are part of the body we need to normalize.
     (org-end-of-meta-data)
-    (let ((body-start (point))
-          (body-end (save-excursion
-                      (let ((subtree-end (orgist--subtree-end)))
+    ;; `org-end-of-subtree' can report one past `point-max' when the
+    ;; buffer ends without a trailing newline; clamp so bounds stay
+    ;; inside the buffer.
+    (let ((subtree-end (min (point-max) (orgist--subtree-end))))
+      ;; The entry's own segment (up to the first following heading)
+      ;; gets the full policy.
+      (let ((body-end (save-excursion
                         (if (re-search-forward org-outline-regexp-bol
                                                subtree-end t)
                             (line-beginning-position)
-                          subtree-end)))))
-      ;; Step 1: Collapse runs of 3+ consecutive newlines to 2.
-      (when (< body-start body-end)
-        (goto-char body-start)
-        (while (re-search-forward "\n\\(\n\\)\\(\n+\\)" body-end t)
-          (let ((len (- (match-end 2) (match-beginning 2))))
-            (replace-match "" nil nil nil 2)
-            (setq body-end (- body-end len)))))
-      ;; Step 2: Ensure blank line between logbook entries and
-      ;; description text.  Logbook lines match "^- State ".
-      ;; Handle both orderings: logbook-then-desc and desc-then-logbook.
-      (goto-char body-start)
-      (while (re-search-forward
-              "^\\(- State .+\\)\n\\([^- \n*]\\)" body-end t)
-        (goto-char (match-end 1))
-        (insert "\n")
-        (setq body-end (1+ body-end)))
-      (goto-char body-start)
-      (while (re-search-forward
-              "^\\([^- \n*:].*\\)\n\\(- State \\)" body-end t)
-        (goto-char (match-beginning 2))
-        (insert "\n")
-        (setq body-end (1+ body-end)))
-      ;; Step 2b: Fix spacing at start of body.
-      ;; - Remove blank lines between :END:/planning and logbook content
-      ;;   (bare "- State ..." lines or :LOGBOOK: drawer).
-      ;; - Ensure one blank line before description (non-logbook) content.
-      (goto-char body-start)
-      (when (< body-start body-end)
-        (let ((first-nonblank
-               (save-excursion
-                 (skip-chars-forward "\n" body-end)
-                 (point))))
+                          subtree-end))))
+        (orgist--normalize-body-segment (point) body-end))
+      ;; Description sub-headings and their content get the structural
+      ;; blank lines the segment pass cannot reach.
+      (orgist--normalize-subheading-spacing (point) subtree-end))))
+
+(defun orgist--normalize-subheading-spacing (seg-start subtree-end)
+  "Ensure one blank line around description sub-headings in the subtree.
+Headings between SEG-START and SUBTREE-END that belong to the entry's
+description are separated from surrounding content by exactly one
+blank line.  Insert-only and processed bottom-up, so earlier
+insertions never shift the bounds of later headings.  Child subtrees
+carrying an ID property are Todoist elements: their spacing is their
+own updates' business and they are skipped whole, including their
+metadata-to-content boundary.  Literal block contents are never
+touched."
+  (let ((targets nil))
+    ;; The caller's SUBTREE-END was computed before the segment pass
+    ;; edited the buffer and can now sit past `point-max'; re-clamp so
+    ;; the scan cannot spin at end of buffer.
+    (setq subtree-end (min subtree-end (point-max)))
+    ;; Collect non-ID heading lines before any edit, tracking block
+    ;; depth so heading-looking lines inside literal blocks are ignored.
+    (save-excursion
+      (goto-char seg-start)
+      (let ((depth 0))
+        (while (< (point) subtree-end)
           (cond
-           ;; Body starts with logbook (bare entry or LOGBOOK drawer):
-           ;; remove any blank lines before it.
-           ((and (< first-nonblank body-end)
-                 (save-excursion
-                   (goto-char first-nonblank)
-                   (looking-at "[ \t]*\\(?:- \\|:LOGBOOK:\\)")))
-            (when (> first-nonblank body-start)
-              (delete-region body-start first-nonblank)
-              (setq body-end (- body-end (- first-nonblank body-start)))))
-           ;; Body starts with non-logbook content: ensure one blank line.
-           ((and (< first-nonblank body-end)
-                 (not (looking-at "\n")))
-            (insert "\n")
-            (setq body-end (1+ body-end))))))
-      ;; Step 2c: Ensure one blank line between a LOGBOOK drawer and the
-      ;; description that follows it.  Step 2 only knows bare "- State"
-      ;; entries; with `org-log-into-drawer' the entries sit in a drawer
-      ;; and the description was inserted right after its :END: line.
-      (goto-char body-start)
-      (when (and (< body-start body-end)
-                 (looking-at "[ \t]*:LOGBOOK:[ \t]*$")
-                 (re-search-forward "^[ \t]*:END:[ \t]*\n" body-end t)
-                 (< (point) body-end)
-                 (not (looking-at "[ \t]*$"))
-                 (not (looking-at org-outline-regexp-bol)))
-        (insert "\n")
-        (setq body-end (1+ body-end)))
-      ;; Step 3: Fix trailing boundary.
-      (let ((has-body (and (< body-start body-end)
-                           (not (string-blank-p
-                                 (buffer-substring-no-properties
-                                  body-start body-end))))))
-        (if has-body
-            ;; Ensure exactly one blank line before the next heading.
-            (progn
-              (goto-char body-end)
-              (skip-chars-backward "\n" body-start)
-              (forward-char 1)            ; keep one \n
-              (unless (= (point) body-end)
-                (delete-region (point) body-end)
-                (setq body-end (point)))
-              (insert "\n"))              ; add the blank line
-          ;; No body content — remove any trailing whitespace.
-          (when (< body-start body-end)
-            (delete-region body-start body-end)))))))
+           ((looking-at "^[ \t]*#\\+BEGIN_")
+            (cl-incf depth)
+            (forward-line 1))
+           ((looking-at "^[ \t]*#\\+END_")
+            (cl-decf depth)
+            (forward-line 1))
+           ((> depth 0)
+            (forward-line 1))
+           ((looking-at org-outline-regexp-bol)
+            (let* ((id (org-entry-get (point) "ID"))
+                   (id-end (and id (orgist--subtree-end))))
+              (cond
+               ;; Todoist child with a usable subtree end: record it as
+               ;; a before-only target (the blank between the parent's
+               ;; content and the child heading) and skip the subtree.
+               ((and id-end (> id-end (point)))
+                (push (cons (line-beginning-position) 'id) targets)
+                (setq depth 0)
+                (goto-char (min subtree-end id-end)))
+               ;; Subtree end unusable: stop scanning rather than loop.
+               (id
+                (push (cons (line-beginning-position) 'id) targets)
+                (setq depth 0)
+                (goto-char subtree-end))
+               ;; Description sub-heading: record and move on.
+               (t
+                (push (cons (line-beginning-position) 'desc) targets)
+                (forward-line 1)))))
+           (t (forward-line 1))))))
+    ;; `push' reversed the scan order, so targets run bottom-up.
+    (dolist (target targets)
+      (let ((bol (car target))
+            (id-p (eq (cdr target) 'id)))
+        (save-excursion
+          ;; After side: one blank between the heading and its content.
+          ;; ID children keep their property drawer glued to the
+          ;; heading, so only description sub-headings get this.
+          (unless id-p
+            (goto-char bol)
+            (forward-line 1)
+            (when (and (< (point) subtree-end)
+                       (not (looking-at "^[ \t]*$"))
+                       (not (looking-at org-outline-regexp-bol)))
+              (insert "\n")))
+          ;; Before side: one blank between preceding content and the
+          ;; heading.  Drawer/planning lines stay glued to what follows
+          ;; them, and a heading that opens the entry body (a
+          ;; description starting with a heading) keeps its position.
+          (when (> bol seg-start)
+            (let ((prev (save-excursion
+                          (goto-char bol)
+                          (forward-line -1)
+                          (buffer-substring-no-properties
+                           (point) (line-end-position)))))
+              (unless (or (string-blank-p prev)
+                          (string-match-p "^[ \t]*\\*" prev)
+                          (string-match-p "^[ \t]*:" prev)
+                          (string-match-p
+                           "^[ \t]*\\(CLOSED\\|DEADLINE\\|SCHEDULED\\|CLOCK\\):" prev))
+                (goto-char bol)
+                (insert "\n")))))))))
+
+(defun orgist--normalize-body-segment (body-start body-end)
+  "Normalize spacing of one body segment between BODY-START and BODY-END.
+A segment spans one heading's own content up to the next heading line
+or the end of the subtree; BODY-END is exclusive.  Implements the
+§ Body Spacing rules for the region."
+  (save-excursion
+    (goto-char body-start)
+    ;; Step 1: collapse runs of two or more blank lines to one, line
+    ;; based so literal block contents (where blank lines are data) are
+    ;; never touched.
+    (let ((depth 0))
+      (while (< (point) body-end)
+        (cond
+         ((looking-at "^[ \t]*#\\+BEGIN_")
+          (cl-incf depth)
+          (forward-line 1))
+         ((looking-at "^[ \t]*#\\+END_")
+          (cl-decf depth)
+          (forward-line 1))
+         ((and (zerop depth)
+               (looking-at "^[ \t]*$")
+               (save-excursion
+                 (forward-line 1)
+                 (and (< (point) body-end) (looking-at "^[ \t]*$"))))
+          (delete-region (point) (1+ (line-end-position)))
+          (cl-decf body-end))
+         (t (forward-line 1)))))
+    ;; Step 2: Ensure blank line between logbook entries and
+    ;; description text.  Logbook lines match "^- State ".
+    ;; Handle both orderings: logbook-then-desc and desc-then-logbook.
+    (goto-char body-start)
+    (while (re-search-forward
+            "^\\(- State .+\\)\n\\([^- \n*]\\)" body-end t)
+      (goto-char (match-end 1))
+      (insert "\n")
+      (setq body-end (1+ body-end)))
+    (goto-char body-start)
+    (while (re-search-forward
+            "^\\([^- \n*:].*\\)\n\\(- State \\)" body-end t)
+      (goto-char (match-beginning 2))
+      (insert "\n")
+      (setq body-end (1+ body-end)))
+    ;; Step 2b: Fix spacing at start of body.
+    ;; - Remove blank lines between :END:/planning and logbook content
+    ;;   (bare "- State ..." lines or :LOGBOOK: drawer).
+    ;; - Ensure one blank line before description (non-logbook) content.
+    ;;   A bullet description is content, not a logbook entry: only bare
+    ;;   "- State" lines count as logbook here.
+    (goto-char body-start)
+    (when (< body-start body-end)
+      (let ((first-nonblank
+             (save-excursion
+               (skip-chars-forward "\n" body-end)
+               (point))))
+        (cond
+         ;; Body starts with logbook (bare entry or LOGBOOK drawer):
+         ;; remove any blank lines before it.
+         ((and (< first-nonblank body-end)
+               (save-excursion
+                 (goto-char first-nonblank)
+                 (looking-at "[ \t]*\\(?:- State \\|:LOGBOOK:\\)")))
+          (when (> first-nonblank body-start)
+            (delete-region body-start first-nonblank)
+            (setq body-end (- body-end (- first-nonblank body-start)))))
+         ;; Body starts with non-logbook content: ensure one blank line.
+         ((and (< first-nonblank body-end)
+               (not (looking-at "\n")))
+          (insert "\n")
+          (setq body-end (1+ body-end))))))
+    ;; Step 2c: Ensure one blank line between a LOGBOOK drawer and the
+    ;; description that follows it.  Step 2 only knows bare "- State"
+    ;; entries; with `org-log-into-drawer' the entries sit in a drawer
+    ;; and the description was inserted right after its :END: line.
+    (goto-char body-start)
+    (when (and (< body-start body-end)
+               (looking-at "[ \t]*:LOGBOOK:[ \t]*$")
+               (re-search-forward "^[ \t]*:END:[ \t]*\n" body-end t)
+               (< (point) body-end)
+               (not (looking-at "[ \t]*$"))
+               (not (looking-at org-outline-regexp-bol)))
+      (insert "\n")
+      (setq body-end (1+ body-end)))
+    ;; Step 3: Fix trailing boundary.
+    (let ((has-body (and (< body-start body-end)
+                         (not (string-blank-p
+                               (buffer-substring-no-properties
+                                body-start body-end))))))
+      (if has-body
+          ;; Ensure exactly one blank line before the next heading.
+          (progn
+            (goto-char body-end)
+            (skip-chars-backward "\n" body-start)
+            (forward-char 1)            ; keep one \n
+            (unless (= (point) body-end)
+              (delete-region (point) body-end)
+              (setq body-end (point)))
+            (insert "\n"))              ; add the blank line
+        ;; No body content — remove any trailing whitespace.
+        (when (< body-start body-end)
+          (delete-region body-start body-end))))))
 
 (defun orgist-clear-body ()
   "Delete body text of the current heading.
@@ -3472,10 +3591,25 @@ Also removes property drawers added by pandoc."
              (new-stars (make-string new-level ?*)))
         (replace-match (concat new-stars (match-string 2)))))
 
-    ;; Clean up extra blank lines
+    ;; Clean up extra blank lines, but never inside literal blocks,
+    ;; where blank lines are data.
     (goto-char (point-min))
-    (while (re-search-forward "\n\n\n+" nil t)
-      (replace-match "\n\n"))
+    (let ((depth 0))
+      (while (not (eobp))
+        (cond
+         ((looking-at "^[ \t]*#\\+BEGIN_")
+          (cl-incf depth)
+          (forward-line 1))
+         ((looking-at "^[ \t]*#\\+END_")
+          (cl-decf depth)
+          (forward-line 1))
+         ((and (zerop depth)
+               (looking-at "^[ \t]*$")
+               (save-excursion
+                 (forward-line 1)
+                 (and (< (point) (point-max)) (looking-at "^[ \t]*$"))))
+          (delete-region (point) (1+ (line-end-position))))
+         (t (forward-line 1)))))
 
     (string-trim (buffer-string))))
 

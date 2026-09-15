@@ -145,8 +145,10 @@ update:
 - Exactly one blank line between =:END:= (or planning lines) and body content.
 - Exactly one blank line between logbook entries and description text.
 - Exactly one blank line between body content and the next heading.
-- No runs of more than one consecutive blank line.
+- No runs of more than one consecutive blank line outside literal (=#+BEGIN_SRC= etc.) blocks, whose blank lines are never touched.
 - Elements with no body content have no trailing blank line.
+- Description sub-headings and their content follow the same rules; child subtrees with an =ID= property (Todoist elements) are normalized by their own updates and skipped by the parent.
+- Logbook content means a =:LOGBOOK:= drawer or bare =- State= entries; a bullet-list description is body content and gets its blank line.
 
 Example:
 
@@ -415,8 +417,8 @@ The primary test path. Uses cached JSON responses with an =advice-add :around=
 mock on =request=, running synchronously in batch mode.
 
 #+begin_src bash
-./test-run.sh                  # All projects (~15 lifecycle tests)
-./test-run.sh Orgtest          # Single project
+  ./test-run.sh                  # All projects (~15 lifecycle tests)
+  ./test-run.sh Orgtest          # Single project
 #+end_src
 
 Each replay runs a 3-phase lifecycle:
@@ -434,7 +436,7 @@ The shared JSON contains all projects; per-project subdirectories are created
 only during recording.
 
 #+begin_src bash
-./test-run.sh record Orgtest   # Needs TODOIST_API_TOKEN or `pass`
+  ./test-run.sh record Orgtest   # Needs TODOIST_API_TOKEN or `pass`
 #+end_src
 
 ** Live API Tests
@@ -442,9 +444,9 @@ only during recording.
 Runs a real sync against the Todoist API without caching.
 
 #+begin_src bash
-./test-run.sh live             # All projects (needs token)
-./test-run.sh live Orgtest     # Single project (needs token)
-ORGIST_TEST_TASK_ID=<id> ./test-run.sh live-attachments  # Needs token + disposable task
+  ./test-run.sh live             # All projects (needs token)
+  ./test-run.sh live Orgtest     # Single project (needs token)
+  ORGIST_TEST_TASK_ID=<id> ./test-run.sh live-attachments  # Needs token + disposable task
 #+end_src
 
 ** Token Resolution
