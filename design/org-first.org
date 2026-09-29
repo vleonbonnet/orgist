@@ -6,7 +6,7 @@ Design exploration for collapsing Todoist-mirror files into ordinary notes files
 * Summary
 
 - *Phase 1 — mirror mode (today).*  Todoist is the source of truth.  Orgist owns one file per root project under =orgist-base-dir=, and everything in those files also exists in Todoist.  A reset can delete them and resync: Todoist is the backup.
-- *Phase 2 — overlay mode.*  The user's notes files are the source of truth. Todoist shows only the TODO headings inside them, arranged under the org category tree.  Notes, non-task headings and rich bodies never leave org.
+- *Phase 2 — overlay mode.*  The user's notes files are the source of truth. Todoist shows the TODO headings inside them, arranged under the org category tree.  Notes outside tasks never leave org; a task's own body keeps syncing as its description, as today.
 - The shift inverts ownership of /content/, not of /task fields/.  Both sides still edit titles, dates and completion; what changes is that Todoist can no longer destroy or restructure org content.
 - As soon as a file holds content Todoist lacks, the implicit backup is gone. The first milestone is therefore a safety net (file history, destruction journal, blast-radius guards, safe reset), shipped in mirror mode where it already protects today's files.
 - Mirror stays the default.  Overlay is opt-in per Todoist project, so both modes coexist during migration and for other users of the package.
@@ -22,7 +22,8 @@ Authority is split per aspect rather than per side:
 | Which headings are exposed                       | org                 | scope rules and tags decide                              |
 | Task fields (title, state, priority, dates, ...) | shared              | three-way merge on the snapshot; org wins true conflicts |
 | Comments                                         | shared, append-only | logbook notes \leftrightarrow comments, as today                       |
-| Body / description                               | org                 | not exported unless opted in                             |
+| Task body \leftrightarrow description                          | shared              | synced as today, same three-way merge                    |
+| Notes outside tasks                              | org                 | never exported                                           |
 
 * Todoist constraints
 
@@ -43,29 +44,35 @@ Sources: [[https://www.todoist.com/help/articles/usage-limits-in-todoist-e5rcSY]
 
 Each row is safe while Todoist owns the file, and destructive once the file holds notes.  Function names rather than line numbers, since the code moves.
 
-|  # | Assumption                                                                   | Where                                                              | Effect on a notes file                                                            |
-|----+------------------------------------------------------------------------------+--------------------------------------------------------------------+-----------------------------------------------------------------------------------|
-|  1 | Reset deletes the whole base directory                                       | =orgist-reset=                                                       | notes deleted if the base dir ever points at them                                 |
-|  2 | Remote project deletion or re-parenting deletes and rewrites files           | =orgist-delete-project=, =orgist-convert-root-to-subproject=           | notes file deleted or flattened into another file                                 |
-|  3 | Remote task deletion deletes the subtree                                     | =orgist-delete-element=                                              | notes under the task deleted                                                      |
-|  4 | Every inbound update clears the body and deletes child headings without =:ID:= | =orgist-clear-body= via =orgist-update-element=                        | any remote edit of a task wipes its notes children and body                       |
-|  5 | =:ID:= is the Todoist ID; a dash marks an org-id "not pushed yet"              | ~40 ="ID"= literals, new-heading scan                                | collides with org-id links; every org-id'd TODO becomes an =item_add=               |
-|  6 | Level-1 heading without ID = new section; TODO without ID = new task         | new-heading scan in =orgist-diff-all-elements=                       | every top-level notes heading becomes a Todoist section                           |
-|  7 | Items are positioned before sections by =TODOIST-ORDER=                        | =orgist-position-element-by-order=                                   | notes layout reshuffled                                                           |
-|  8 | Sync state lives in properties (=TODOIST-ORDER=, =TODOIST_DUE_STRING=, =SECTION=)  | =orgist-update-element=                                              | property noise throughout notes                                                   |
-|  9 | Files are discovered by listing =orgist-base-dir=                              | ~22 call sites                                                     | overlay files live elsewhere                                                      |
-| 10 | The subprocess writes to disk; the parent reverts but skips modified buffers | =orgist--subprocess-pull=, =orgist--revert-buffers-from-disk=          | an open, edited notes buffer later overwrites the pull; snapshots claim otherwise |
-| 11 | Description \leftrightarrow body through pandoc                                            | =orgist-convert-description=, =orgist-convert-description-to-markdown= | lossy for tables, drawers, src blocks and some links                              |
-| 12 | Every local tag is a label (except =ATTACH=, =ARCHIVE=)                          | =orgist-element-local-state=                                         | notes tags flood Todoist labels                                                   |
-| 13 | Completed tasks are pulled back N days as DONE headings                      | =orgist-process-completed-tasks=                                     | years of DONE headings injected into notes                                        |
-| 14 | Metadata comments carry org-only properties through Todoist                  | =orgist-sync-metadata=                                               | redundant with shared files; leaks properties to collaborators                    |
-| 15 | State is per machine (=snapshots.el=, stamps, =sync_token=)                      | =orgist-base-dir=                                                    | notes files are shared by several machines                                        |
+|  # | Assumption                                                                                                                                                               | Where                                                                                 | Effect on a notes file                                                                              |
+|----+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------+---------------------------------------------------------------------------------------+-----------------------------------------------------------------------------------------------------|
+|  1 | Reset deletes the whole base directory                                                                                                                                   | =orgist-reset=                                                                          | notes deleted if the base dir ever points at them                                                   |
+|  2 | Remote project deletion or re-parenting deletes and rewrites files                                                                                                       | =orgist-delete-project=, =orgist-convert-root-to-subproject=                              | notes file deleted or flattened into another file                                                   |
+|  3 | Remote task deletion deletes the subtree                                                                                                                                 | =orgist-delete-element=                                                                 | notes under the task deleted                                                                        |
+|  4 | Every inbound update clears the body and deletes child headings without =:ID:=                                                                                             | =orgist-clear-body= via =orgist-update-element=                                           | any remote edit of a task wipes its notes children and body                                         |
+|  5 | =:ID:= is the Todoist ID; a dash marks an org-id "not pushed yet"                                                                                                          | ~40 ="ID"= literals, new-heading scan                                                   | collides with org-id links; every org-id'd TODO becomes an =item_add=                                 |
+|  6 | Level-1 heading without ID = new section; TODO without ID = new task                                                                                                     | new-heading scan in =orgist-diff-all-elements=                                          | every top-level notes heading becomes a Todoist section                                             |
+|  7 | Items are positioned before sections by =TODOIST-ORDER=                                                                                                                    | =orgist-position-element-by-order=                                                      | notes layout reshuffled                                                                             |
+|  8 | Sync state lives in properties (=TODOIST-ORDER=, =TODOIST_DUE_STRING=, =SECTION=)                                                                                              | =orgist-update-element=                                                                 | property noise throughout notes                                                                     |
+|  9 | Files are discovered by listing =orgist-base-dir=                                                                                                                          | ~22 call sites                                                                        | overlay files live elsewhere                                                                        |
+| 10 | The subprocess writes to disk; the parent reverts but skips modified buffers                                                                                             | =orgist--subprocess-pull=, =orgist--revert-buffers-from-disk=                             | an open, edited notes buffer later overwrites the pull; snapshots claim otherwise                   |
+| 11 | Description \leftrightarrow body through pandoc                                                                                                                                        | =orgist-convert-description=, =orgist-convert-description-to-markdown=                    | lossy for tables, drawers, src blocks and some links                                                |
+| 12 | Every local tag is a label (except =ATTACH=, =ARCHIVE=)                                                                                                                      | =orgist-element-local-state=                                                            | notes tags flood Todoist labels                                                                     |
+| 13 | Completed tasks are pulled back N days as DONE headings                                                                                                                  | =orgist-process-completed-tasks=                                                        | years of DONE headings injected into notes                                                          |
+| 14 | Metadata comments carry org-only properties through Todoist                                                                                                              | =orgist-sync-metadata=                                                                  | redundant with shared files; leaks properties to collaborators                                      |
+| 15 | State is per machine (=snapshots.el=, stamps, =sync_token=)                                                                                                                  | =orgist-base-dir=                                                                       | notes files are shared by several machines                                                          |
+| 16 | An org-id already on a TODO heading is used as its temp id, then overwritten by the Todoist ID after =item_add=                                                            | =orgist-remap-temp-ids=                                                                 | every =[[id:…]]= link to the heading breaks; its ID-derived attachment folder moves                   |
+| 17 | Non-task child headings of a task (description sub-headings, added notes) are rebuilt from the description on every remote update, but excluded from the write-back diff | =orgist-extract-body-text= stops at the first child heading; =orgist-clear-body= rebuilds | edits below a task's first child heading never reach Todoist and are lost on the next remote update |
 
-Row 10 is latent in mirror mode too: a large pull landing while a mirror buffer has unsaved edits is later overwritten by the save, and the snapshot then describes remote state the file no longer has.
+Rows 10, 16 and 17 are live in mirror mode today.  Row 10: a large pull landing while a mirror buffer has unsaved edits is later overwritten by the save, and the snapshot then describes remote state the file no longer has.  Row 16: any task that got an org-id (=org-store-link=, capture, org-linker) before its first push loses it, and links to it dangle.  Row 17: the description sync is one-way below the first child heading.
 
 * M0 — Safety net, before any overlay code
 
 In mirror mode every managed file is recoverable from Todoist.  Overlay files hold notes that exist nowhere else.  Each past incident — drift baking (2026-07), element-cache skew (2026-08-12), region smear (2026-08-16), duplicate heading from a stale marker (2026-09-12) — was a sync pass mutating user-visible buffers in a way nobody noticed immediately.  Detection and reversibility must exist before the blast radius grows to include notes.
+
+** Close the live loss paths
+
+Rows 16 and 17 lose data in mirror mode today, so they are fixed first, each with a regression test: a heading keeps a pre-existing org-id (see Identity), and a task's non-task child headings are part of its description in both directions (see Inbound).
 
 ** Layer 1 — File history
 
@@ -108,7 +115,8 @@ Filesystem snapshots (e.g. ZFS on a NAS) are the last line of defence. Orgist ca
 ** Vocabulary
 
 - *Overlay file* — a notes file bound to one Todoist project.
-- *Linked heading* — a heading carrying =TODOIST_ID=.
+- *Linked heading* — a heading bound to a Todoist task, section or project through its ID (see Identity).
+- *Unlink* — orgist stops syncing a heading and leaves it, and everything under it, exactly where it is.  Its snapshot is dropped, the heading gets =TODOIST: unlinked= and a logbook note saying why, and from then on nothing is pushed or pulled for it: it is a plain org heading.  =orgist-relink= pushes it again as a new task.  Today's equivalent is deletion of the heading and its whole subtree.
 - *Exposed task* — a TODO heading in scope, linked or about to be.
 - *Container* — a non-task heading that is an ancestor of an exposed task.
 - *Landing zone* — where remotely created tasks without a bound parent land.
@@ -120,9 +128,15 @@ Filesystem snapshots (e.g. ZFS on a NAS) are the last line of defence. Orgist ca
 #+TITLE: Home
 #+TODOIST_PROJECT: 2203306141
 
+,* TODO Renew home insurance            ← top-level task: in the project, no section
+:PROPERTIES:
+:ID:       6X9bTt4KqWm2Lr7Z      ← Todoist ID, as today
+:END:
+
 ,* Garden
 :PROPERTIES:
-:ID:       0f8c2d8e-…            ← org-id, never read by orgist
+:ID:       0f8c2d8e-…            ← org-id other notes link to: kept
+:TODOIST_ID: 6c2Hq8RvPw3Xk9Fm    ← so the section ID goes here
 :END:
 Soil test results, plant list, supplier contacts…
 
@@ -131,10 +145,13 @@ Zone map and valve schedule…
 
 ,*** TODO Replace valve on zone 3                                 :errand:
 :PROPERTIES:
-:TODOIST_ID: 6X7fQ9mRw2cVp8Hh
+:ID:       6X7fQ9mRw2cVp8Hh
 :END:
+Buy the 1" anti-siphon model; the old one is in the shed.   ← description
 
-,*** Controller manual                  ← notes, never exposed
+,**** Parts list                        ← inside a task: part of its description
+
+,*** Controller manual                  ← notes outside tasks: never exposed
 
 ,* Kitchen
 ,** Appliances                          ← no tasks below: not projected
@@ -145,9 +162,10 @@ Projects to:
 
 #+begin_example
 Todoist project "Home"
+├─ ☐ Renew home insurance
 └─ Section "Garden"
    └─ * Irrigation                    (uncompletable header)
-      └─ ☐ Replace valve on zone 3    @errand
+      └─ ☐ Replace valve on zone 3    @errand   (description: text + "Parts list")
 #+end_example
 
 ** Registration and binding
@@ -160,19 +178,20 @@ Todoist project "Home"
 
 ** Identity
 
-- New property =TODOIST_ID=.  =:ID:= belongs to org-id and is never interpreted by overlay code.
-- Adopted tasks keep their existing =:ID:= value — the old Todoist ID string — as their org-id, so existing =[[id:…]]= links and ID-derived org-attach directories (=data/6X/…=) keep resolving.  New tasks get only =TODOIST_ID=, plus an org-id if the capture template creates one.
-- Global index =TODOIST_ID= \to marker across overlay files and their archive files, built from property drawers.
-- Copying a subtree duplicates its properties.  A =TODOIST_ID= found twice is quarantined: neither heading syncs until the user keeps one and unlinks the other.
+- *One ID by default.*  The Todoist ID stays in =:ID:=, as today.  Nothing to migrate for existing tasks, and =[[id:…]]= links and ID-derived org-attach folders (=data/6X/…=) keep working, because org-id resolves any =:ID:= value.
+- *Exception.*  A heading that already has an org-id keeps it, and its Todoist ID goes in =TODOIST_ID=.  This happens when an existing notes heading becomes a task or a container (other notes link to it, its attachment folder derives from it), or when a task got an org-id before its first push.  Overwriting the org-id breaks every link to it (row 16).  Rewriting all links across files is the alternative, but it cannot reach links outside org files.
+- *Lookup.*  =TODOIST_ID= if present, else a dash-free =:ID:=.  Todoist IDs never contain a dash; org-id UUIDs always do.
+- Global index Todoist ID \to marker across overlay files and their archive files, built from property drawers.
+- Copying a subtree duplicates its properties.  A Todoist ID found twice is quarantined: neither heading syncs until the user keeps one and unlinks the other.
 
 ** Minimal footprint
 
-Overlay writes one sync property per linked heading (=TODOIST_ID=), plus properties the user actually reads (=ASSIGNEE=).  Order, recurrence string, section flags and comment IDs live in the state store, keeping notes files readable.
+Overlay stores one ID per linked heading (=:ID:=, or =TODOIST_ID= for the exception), plus properties the user actually reads (=ASSIGNEE=).  Order, recurrence string, section flags and comment IDs live in the state store, keeping notes files readable.
 
 ** Scope — which headings are exposed
 
 - Candidate: a heading with a TODO keyword inside a bound file.
-- Excluded, with inheritance: tag =noTodoist= (configurable), =COMMENT= headings, =ARCHIVE=-tagged subtrees, property =TODOIST: ignore=.
+- Excluded, with inheritance: tag =noTodoist= (configurable), =COMMENT= headings, =ARCHIVE=-tagged subtrees, property =TODOIST= set to =ignore= or =unlinked=.
 - Unlinked DONE headings are never pushed; history stays local.  Only state transitions on linked tasks sync.
 - Keywords: todo-type \to unchecked, DONE \to completed, CANCELED \to configurable (complete with a label, or remove from Todoist and unlink). Non-default todo keywords (STARTED, WAITING) can surface as labels so the phone shows them.
 - Tags \leftrightarrow labels: only local (non-inherited) tags that are listed in =orgist-overlay-label-tags= or already exist as Todoist labels. =#+FILETAGS= and inherited tags never become labels.
@@ -180,15 +199,17 @@ Overlay writes one sync property per linked heading (=TODOIST_ID=), plus propert
 
 ** Projection — org tree to Todoist
 
-Only ancestors of exposed tasks are projected; a notes heading with no task below it never appears.  The category tree surfaces lazily.
+Every exposed task appears, wherever it sits, including tasks at the top level of the file.  Non-task headings appear only when a task sits below them; a notes heading with no task below it never appears.  The category tree surfaces lazily.
 
-| Org                                    | Todoist (default)                       |
-|----------------------------------------+-----------------------------------------|
-| bound file                             | project                                 |
-| level-1 container                      | section                                 |
-| deeper container                       | uncompletable header task (=* = prefix) |
-| task under task                        | sub-task                                |
-| non-task heading inside a task subtree | transparent (skipped)                   |
+| Org                            | Todoist (default)                       |
+|--------------------------------+-----------------------------------------|
+| bound file                     | project                                 |
+| top-level task                 | task in the project, no section         |
+| level-1 container              | section                                 |
+| deeper container               | uncompletable header task (=* = prefix) |
+| task under a container         | task under that container's projection  |
+| task under task                | sub-task                                |
+| non-task heading inside a task | part of the task's description          |
 
 - *Flatten alternative.*  Deep containers become section names ("Garden › Irrigation"): fewer header tasks, more sections, and the 20-section limit arrives sooner.  Chosen per file.
 - *Overrides.*  =TODOIST_AS= = =project= | =section= | =header= | =flatten= | =transparent=.  =TODOIST_PROJECT_ID= on a subtree routes it to another project, e.g. private tasks inside a file bound to a shared project.
@@ -200,14 +221,11 @@ Only ancestors of exposed tasks are projected; a notes heading with no task belo
 
 - *Field updates* on linked tasks: three-way merge per field, with the snapshot as base.  If only one side changed, take it.  If both changed differently, org wins; the remote value goes into a logbook note and the review buffer.
 - *Echo suppression* for lossy fields: the snapshot records both the org source and the rendered value last sent.  A remote value equal to the last rendered one is no change, so the org source stays.  This protects titles with org links or markup, and anything pandoc cannot round-trip.
-- *Description policy* (=orgist-overlay-description=):
-  - =none= (default) — not synced; the org body stays private.  A remote description edit becomes a logbook note.
-  - =drawer= — a =:TODOIST:= drawer holds the description; inbound edits replace only that drawer.
-  - =body= — mirror-like; allowed only on headings with no child headings and no org-only markup.
-  =orgist-clear-body= is never called on an overlay file.
+- *Description* — the task's body syncs both ways, as today.  The body is everything in the task's subtree except its child tasks: text plus any non-task child headings, which is also what a Todoist description with markdown headings becomes on pull.  Today's rule stops at the first child heading (row 17); overlay, and the M0 fix for mirror, extend it to the whole subtree.  Inbound edits use the same three-way merge and echo suppression, so org markup that pandoc cannot round-trip is not replaced by its rendered form.  A body over Todoist's 16 383-character limit is not pushed, and review explains why.  =orgist-clear-body= gives way to a merge that only touches the description region, never child tasks.
+- *Private bodies, per project* — =orgist-overlay-description= set to =none= keeps bodies local, e.g. for a shared project whose collaborators should see tasks but not the notes inside them.
 - *New remote task* — inserted under the heading bound to its parent or section.  With no binding it goes to the file's landing zone (default =* Inbox=, created on demand).  Todoist Inbox tasks go to =orgist-overlay-inbox-file=.
 - *Remote move* — within the project, refile under the bound heading; across projects, refile across files.  Both are journaled and reviewed by default.
-- *Remote deletion* — unlink: remove =TODOIST_ID=, log "Deleted in Todoist", optionally set CANCELED.  Heading and content stay.
+- *Remote deletion* — unlink (see Vocabulary): the heading and everything under it stay, and the logbook records "Deleted in Todoist".  Open: also set CANCELED, and whether a heading holding nothing beyond what Todoist had (created on the phone, never enriched in org) may simply be deleted, as today.
 - *Remote reorder* — applied only within runs of adjacent task siblings; a task never moves across a notes heading.  Container order is org-owned.
 - *Remote rename of a section or project* — the container is org-owned, so it goes to review: accept renames the heading, reject pushes the org name back.
 - *Review* — inbound structural changes (move, unlink, rename, field conflict) go through org-sync-confirm in =ask= mode.  Today it reviews only outbound changes.
@@ -219,13 +237,13 @@ Only ancestors of exposed tasks are projected; a notes heading with no task belo
 - *Absence is not deletion.*  A linked ID missing from the index is first looked up in archive files and =org-id-locations=.  Found out of scope \to unlink; truly gone \to =item_delete=, only after confirmation.
 - =org-archive-subtree=: archive files are indexed.  Archiving a DONE task is a no-op; archiving a TODO asks whether to complete or unlink it.
 - Logbook notes added after linking \to =note_add=.  Notes already present at link time are the baseline and are never pushed.
-- Attachments: task headings (and their non-task children, as today), never notes headings.
+- Attachments: task headings (and their non-task children, as today), never notes outside tasks.
 
 ** Apply inbound edits in-process
 
 For overlay files, remote changes are applied to live buffers in the main Emacs: when a file is open, its buffer is the truth.  The subprocess only fetches and converts (network, pandoc) and returns an edit list.  That removes hazard 10: no disk write races an open, modified notes buffer.
 
-All buffer mutation goes through a small set of guarded primitives: set field, insert heading, refile, unlink, replace drawer, journaled delete. These are the only code paths the blast-radius guards and journal need to cover.
+All buffer mutation goes through a small set of guarded primitives: set field, merge description, insert heading, refile, unlink, journaled delete. These are the only code paths the blast-radius guards and journal need to cover.
 
 ** Staging — projection-only first
 
@@ -233,24 +251,41 @@ A useful first overlay is push-only projection, plus inbound completion and comm
 
 * Multiple machines
 
-Today each machine has its own mirror files and state, and Todoist is the hub; every machine converges on it.  Overlay files live on a share that all machines edit.  With per-machine snapshots, stamps and token:
+Today each machine has its own mirror files and state, and Todoist is the hub every machine converges on.  Overlay files are shared by every machine — over SMB today, through NextCloud later — and that changes what is safe.
+
+With per-machine snapshots, stamps and token, two failures appear on either transport:
 
 - Machine B sees A's inbound writes as local edits and pushes them back. That is mostly idempotent, but B's three-way merges run against the wrong base and turn into reverts when a collaborator edited in between.
 - A stale buffer on B with unsaved edits, saved after A's pull, overwrites A's changes while A's state records them as applied.  The resulting drift is pushed back as reverts.
 
-| Option                  | How                                                                     | Trade-off                                     |
-|-------------------------+-------------------------------------------------------------------------+-----------------------------------------------|
-| A. Shared state + lease | state dir next to the files; one machine syncs at a time through a lock | any machine syncs; SMB semantics, stale locks |
-| B. Sync host            | an always-on headless Emacs owns Todoist I/O; desktops edit and review  | single writer; needs a review channel (queue) |
-| C. Designated machine   | configuration names the one machine allowed to sync overlay files       | simplest; no sync while that machine is off   |
+The two transports differ in what they offer against this:
 
-Recommendation: A, with B available later as a deployment choice.
+|                                | SMB (today)                                    | NextCloud (later)                                 |
+|--------------------------------+------------------------------------------------+---------------------------------------------------|
+| Copies of a file               | one, on the server                             | one per machine, synced asynchronously            |
+| Cross-machine atomic operation | yes (=make-directory=)                           | none: lock and state files propagate with a delay |
+| Concurrent writes to one file  | last save wins (Emacs warns on a stale buffer) | a "conflicted copy" file next to the original     |
+
+| Option                              | SMB        | NextCloud                           | Notes                                                          |
+|-------------------------------------+------------+-------------------------------------+----------------------------------------------------------------|
+| 1. Every machine syncs, coordinated | lock works | no lock; only the reconcile variant | no extra machine                                               |
+| 2. Dedicated sync machine           | works      | works                               | single Todoist writer; needs a review channel                  |
+| 3. NextCloud server-side plugin     | —          | works                               | always on, next to the canonical files; org handling rewritten |
+
+*Option 1.*  Over SMB, a lock (atomic =make-directory= holding host, pid and expiry, with a heartbeat, held for one pull + push cycle) plus shared state works.  Over NextCloud neither exists, so the only variant is to reconcile instead of lock: store the sync base in the file itself (a per-heading hash of the last-synced fields) so base and content always travel together, and make commands deterministic (command =uuid= and =temp_id= derived from the heading ID and content) so two machines pushing the same change produce one effect.  That depends on Todoist deduplicating repeated command UUIDs across clients (to verify), and it still leaves conflicted copies.
+
+*Option 3.*  A NextCloud app is PHP: org parsing, editing and the Todoist mapping would be reimplemented outside Emacs, duplicating orgist without org-mode's own parser.  Its real advantage is location: always on, next to the canonical files.  If NextCloud should also expose tasks (its Tasks app speaks CalDAV VTODO), that is a second projection target beside Todoist, so the projection layer should not assume Todoist.
+
+*Recommendation — option 2, placed server-side.*  A headless Emacs sync worker runs next to the file store and is the only Todoist writer.  On SMB it works on the share directly; on NextCloud it is woken by file-change events and writes through NextCloud (WebDAV, or =occ files:scan= after a direct write) so clients see its changes.  This takes option 3's location without rewriting orgist, works on both transports, keeps working while laptops are offline, and needs no cross-machine lock.  Desktops keep editing and reviewing: the worker publishes pending changes, outbound and inbound, as data; org-sync-confirm renders them in Emacs; approvals go back as data.
+
+Whatever the option, NextCloud makes the sync writer one more editor of the files: a human edit on a laptop concurrent with a sync write produces a conflicted copy.  Keep sync writes small and quick, detect conflicted copies, and merge them by heading ID (three-way, with the history commit as base) — useful beyond orgist.
+
+Constraints that hold for every option:
 
 - State keyed by root-relative paths, never absolute: =C:/…=, =Z:/…= and =/Users/…= name the same file on different machines.
-- Lock: atomic =make-directory= holding host, pid and expiry, with a heartbeat.  It is held for one cycle (pull + push), not while editing.
-- A machine whose buffer is modified *and* stale (file changed on disk) must not sync that file and must warn: that is the lost-update window.
-- Overlay buffers use auto-revert and keep the file's coding system (=utf-8-unix=); Windows must not introduce CRLF into shared files.
-- When the share is unreachable, overlay sync pauses; mirror projects are unaffected.
+- A machine whose buffer is modified *and* stale (file changed on disk) must not sync that file, and must warn: that is the lost-update window.
+- Buffers of overlay files use auto-revert and keep the file's coding system (=utf-8-unix=); Windows must not introduce CRLF into shared files.
+- When the file store is unreachable, overlay sync pauses; mirror projects are unaffected.
 
 * Adoption — collapsing a mirror file into a notes file
 
@@ -262,7 +297,7 @@ Recommendation: A, with B available later as a deployment choice.
    - container mapping and the destination of each task subtree;
    - DONE history: into the notes file, its =_archive= file, or left in the retired mirror file;
    - attachment relocation;
-   - property migration: keep =:ID:= as the org-id, add =TODOIST_ID=, move =TODOIST-ORDER=, =TODOIST_DUE_STRING= and =SECTION= into state.
+   - property migration: tasks keep =:ID:= (it already holds the Todoist ID); containers matched to headings that have an org-id get =TODOIST_ID=; =TODOIST-ORDER=, =TODOIST_DUE_STRING= and =SECTION= move into state.
 4. Apply.
 5. Verify round-trip identity: a pull changes no buffer and a diff scan emits zero commands.  Otherwise roll back automatically from history.
 6. Retire the mirror file to =<base>/retired/=, excluded from mirror sync. It is never deleted.
@@ -275,18 +310,18 @@ Pilot order: synthetic fixture \to test project \to a small unshared project \to
 
 - *Query views.*  A Todoist project defined by a query, e.g. every TODO tagged =:errand:= across files.  A task has exactly one Todoist home, so views must partition (first match wins).  A later phase, but the projection code should not preclude it.
 - *Capture anywhere, organize in org.*  Phone captures land in the inbox; refiling in org moves the task in Todoist.
-- *Privacy boundary.*  In a shared project the projection is exactly what collaborators see.  The =none= description policy and per-subtree routing keep private notes private — stricter than mirror mode, where every description is shared.
+- *Privacy boundary.*  In a shared project the projection is exactly what collaborators see: tasks with their bodies, never notes outside tasks.  The per-project =none= description policy and per-subtree routing cover tasks whose bodies should stay private.
 - *=orgist-doctor=.*  Duplicates, orphans, unlinked TODOs in scope, limit headroom per project, lock holder, history size, last cycle outcome.
-- *Shared core with ejira.*  Registry, identity property, history, journal, guards, projection and review are tracker-agnostic.  Decide before [[id:b07d5ba5-76ed-4069-8058-c02f3806a57b][M0 — Safety net]] and [[id:c6b4f748-2dab-4955-bdc9-34154b4b5268][M1 — Seams refactor]] whether they live in orgist or in a library next to org-sync-confirm.
+- *One review library.*  All review stays in org-sync-confirm: the single place to review, select and approve what gets sent to a remote, for orgist and ejira alike.  Overlay adds two needs there: reviewing inbound changes before they are applied, and reviewing a queue produced by another process (the sync worker), which means review items must be describable as data rather than closures.  Whether history, journal, guards and projection also move into a library shared with ejira stays open; decide before [[id:c6b4f748-2dab-4955-bdc9-34154b4b5268][M1 — Seams refactor]].
 - *Agenda.*  Once a project is adopted its tasks appear once, from the notes file.
 
 * Testing strategy
 
-- *Content preservation.*  Property test: a synthetic notes fixture receives random sequences of remote events (update, move, delete, complete, reorder, description edit).  After every pull, all org-only text — unlinked headings, bodies outside the description region — is preserved as a multiset of lines, apart from journaled removals.
+- *Content preservation.*  Property test: a synthetic notes fixture receives random sequences of remote events (update, move, delete, complete, reorder, description edit).  After every pull, all notes outside tasks are preserved as a multiset of lines, apart from journaled removals, and task bodies change only in the fields the events touched.
 - *Blast radius.*  Each event changes only its declared region.
 - *Round-trip identity* after adoption: pull \to no buffer change; diff \to zero commands.
 - *Projection.*  Deterministic output, limit enforcement, structural diffs for renames and moves.
-- *Multiple machines.*  Two batch Emacs processes share a state dir and a lock; each change is pushed exactly once.
+- *Multiple machines.*  A worker process and an editor process on one shared directory: concurrent edits and pulls lose nothing, each change is pushed exactly once, and a forced conflicted copy merges by heading.
 - *Mirror regression.*  Every existing suite stays green through [[id:b07d5ba5-76ed-4069-8058-c02f3806a57b][M0 — Safety net]] and [[id:c6b4f748-2dab-4955-bdc9-34154b4b5268][M1 — Seams refactor]].
 - Fixtures are synthetic only (public repository).
 
@@ -295,13 +330,14 @@ Pilot order: synthetic fixture \to test project \to a small unshared project \to
 Each with the current recommendation.
 
 1. Mode names — /mirror/ and /overlay/.
-2. Default description policy — =none=.
-3. Remote deletion — unlink, optionally set CANCELED.
-4. Deep containers — header tasks; flatten per file.
-5. Multiple machines — shared state + lease.
-6. DONE history on adoption — the notes file's =_archive= file.
-7. Inbound reorder — only within adjacent task runs.
-8. Shared core with ejira — decide before [[id:c6b4f748-2dab-4955-bdc9-34154b4b5268][M1 — Seams refactor]].
+2. Task bodies — decided: synced as today, extended to non-task child headings; =none= per project for private bodies.
+3. Identity — decided: the Todoist ID stays in =:ID:=; =TODOIST_ID= only for headings that already have an org-id.
+4. Remote deletion — unlink.  Open: also set CANCELED; delete headings that hold nothing beyond what Todoist had.
+5. Deep containers — header tasks; flatten per file.
+6. Multiple machines — a server-side sync worker (option 2 placed next to the file store); an SMB lock only as a stepping stone before NextCloud.
+7. DONE history on adoption — the notes file's =_archive= file.
+8. Inbound reorder — only within adjacent task runs.
+9. Review — decided: org-sync-confirm is the one review library.  Open: share history, journal, guards and projection with ejira; decide before [[id:c6b4f748-2dab-4955-bdc9-34154b4b5268][M1 — Seams refactor]].
 
 * Roadmap
 
@@ -310,9 +346,9 @@ Each with the current recommendation.
 :ID:       b07d5ba5-76ed-4069-8058-c02f3806a57b
 :END:
 
-File history, destruction journal, blast-radius guards, safe reset, history browsing.  Ships in mirror mode.
+Fixes for the live mirror-mode loss paths (rows 16 and 17), then file history, destruction journal, blast-radius guards, safe reset, history browsing.  Ships in mirror mode.
 
-Exit: every sync cycle is reconstructible from history; an injected smear (one update touching many headings) aborts and restores; reset cannot delete an unmarked file.
+Exit: a pre-existing org-id survives a push; an edit below a task's first child heading reaches Todoist; every sync cycle is reconstructible from history; an injected smear (one update touching many headings) aborts and restores; reset cannot delete an unmarked file.
 
 ** TODO M1 — Seams refactor
 :PROPERTIES:
@@ -346,7 +382,7 @@ Exit: the content-preservation property test passes; a week on the pilot with ze
 :ID:       f80c14de-520f-4d20-abb9-a00da93c543b
 :END:
 
-Three-way merge, echo suppression, description policies, remote moves, unlink-on-delete, inbound review, archive handling, absence-is-not-deletion.
+Three-way merge, echo suppression, description merge, remote moves, unlink-on-delete, inbound review, archive handling, absence-is-not-deletion.
 
 Exit: randomized remote-event suite green; the pilot runs two-way.
 
@@ -364,9 +400,9 @@ Exit: adopted projects pass round-trip identity; mirror files retired, not delet
 :ID:       78b61267-03b6-4a9a-902f-e15740904b17
 :END:
 
-Shared state keyed by relative paths, lease lock, stale-buffer detection, unreachable-share handling.
+A headless sync worker next to the file store as the only Todoist writer (SMB now, NextCloud later), a review queue rendered by org-sync-confirm on desktops, stale-buffer detection, merge of NextCloud conflicted copies by heading, unreachable-store handling.
 
-Exit: the two-process test pushes each change exactly once.
+Exit: edits from any machine reach Todoist exactly once; a forced conflicted copy merges without loss.
 
 ** TODO M7 — Public release
 :PROPERTIES:
