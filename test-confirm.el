@@ -3,7 +3,7 @@
 ;; Usage: emacs --batch -L . -l ert -l test-confirm.el -f ert-run-tests-batch-and-exit
 ;;
 ;; Covers orgist-confirm.el: building the org-sync-confirm tree from
-;; diff results (labels, kinds, fields, payloads, live remote values
+;; diff results (labels, kinds, fields, live remote values
 ;; and the "changed in Todoist" warning), and executing a partial
 ;; selection (commands regenerated for the ticked changes, stamps
 ;; dropped so the rest stays pending).
@@ -115,17 +115,15 @@ Call the studio.
                                                (plist-get f :new)))
                              (plist-get modified :fields))))
       (should (null (plist-get modified :warning)))
-      (should (string-match-p "item_update" (plist-get modified :payload)))
       (should (equal (assoc "T1" orgist-test-confirm--changes) (plist-get modified :data)))
       (should (eq 'new (plist-get new :kind)))
       (should (equal '(("title" . "Book photographer") ("description" . "Call the studio."))
                      (mapcar (lambda (f) (cons (plist-get f :name) (plist-get f :new)))
                              (plist-get new :fields))))
-      (should (string-match-p "item_add" (plist-get new :payload)))
       (should (eq 'deleted (plist-get deleted :kind)))
       (should (equal "permanent" (plist-get deleted :warning)))
+      (should (equal (assoc "T3" orgist-test-confirm--changes) (plist-get deleted :data)))
       (should (equal '((:name "description" :old "Gone soon")) (plist-get deleted :fields)))
-      (should (string-match-p "item_delete" (plist-get deleted :payload)))
       (let ((label-item (car (plist-get batch :children))))
         (should (equal "label_add urgent" (plist-get label-item :label)))
         (should (plist-get label-item :fixed))

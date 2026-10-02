@@ -180,13 +180,6 @@ used to convert the description."
 
 ;;; Items
 
-(defun orgist-confirm--payload (commands)
-  "Return COMMANDS pretty-printed as JSON, or nil when there are none."
-  (when commands
-    (let ((json-encoding-pretty-print t)
-          (json-encoding-default-indentation "  "))
-      (mapconcat #'json-encode commands "\n"))))
-
 (defun orgist-confirm--command-element-id (cmd)
   "Return the element ID that command CMD acts on, or nil."
   (let ((args (alist-get 'args cmd)))
@@ -197,15 +190,9 @@ used to convert the description."
         (when (member (alist-get 'type cmd) '("item_add" "section_add"))
           (alist-get 'temp_id cmd)))))
 
-(defun orgist-confirm--commands-by-element (commands)
-  "Return (TABLE . REST): COMMANDS keyed by element ID, and the unkeyed rest."
-  (let ((table (make-hash-table :test 'equal))
-        (rest nil))
-    (dolist (cmd commands)
-      (if-let* ((id (orgist-confirm--command-element-id cmd)))
-          (puthash id (append (gethash id table) (list cmd)) table)
-        (push cmd rest)))
-    (cons table (nreverse rest))))
+(defun orgist-confirm--unattached-commands (commands)
+  "Return the COMMANDS that act on no element, such as `label_add'."
+  (cl-remove-if #'orgist-confirm--command-element-id commands))
 
 (defun orgist-confirm--new-fields (local)
   "Return the fields describing a new element from its LOCAL state."
@@ -258,10 +245,9 @@ state, REMOTE its live state or nil, LOC its (PROJECT BUFFER . POS)."
                 fields)))))
     (cons (nreverse fields) (nreverse remote-changed))))
 
-(defun orgist-confirm--item (change buffers remotes commands)
+(defun orgist-confirm--item (change buffers remotes)
   "Return (PROJECT . ITEM) for CHANGE.
-BUFFERS is the project buffer alist, REMOTES the live-state table,
-COMMANDS the per-element command table."
+BUFFERS is the project buffer alist, REMOTES the live-state table."
   (let* ((id (car change))
          (diff (cdr change))
          (snapshot (gethash id orgist-snapshots))
@@ -275,7 +261,6 @@ COMMANDS the per-element command table."
          (project (or (car loc)
                       (and snapshot (orgist-confirm--project-of-deleted snapshot buffers))
                       "?"))
-         (payload (orgist-confirm--payload (gethash id commands)))
          (item
           (pcase diff
             ('deleted
@@ -302,7 +287,7 @@ COMMANDS the per-element command table."
                      :warning (when (cdr parts)
                                 (format "changed in Todoist since last sync: %s"
                                         (string-join (cdr parts) ", ")))))))))
-    (cons project (append item (list :payload payload :data change)))))
+    (cons project (append item (list :data change)))))
 
 (defun orgist-confirm--fetch-remotes (changes buffers)
   "Return a table ID → live state for the modified elements of CHANGES."
@@ -329,10 +314,10 @@ COMMANDS the per-element command table."
   "Build the `org-sync-confirm' tree for CHANGES and their COMMANDS."
   (let* ((buffers (orgist-confirm--project-buffers))
          (remotes (orgist-confirm--fetch-remotes changes buffers))
-         (by-element (orgist-confirm--commands-by-element commands))
+         (unattached (orgist-confirm--unattached-commands commands))
          (projects nil))
     (dolist (change changes)
-      (let* ((entry (orgist-confirm--item change buffers remotes (car by-element)))
+      (let* ((entry (orgist-confirm--item change buffers remotes))
              (cell (or (assoc (car entry) projects)
                        (let ((c (list (car entry))))
                          (push c projects)
@@ -341,7 +326,7 @@ COMMANDS the per-element command table."
     (setq projects (sort projects (lambda (a b) (string< (car a) (car b)))))
     (append
      (mapcar (lambda (p) (list :label (car p) :children (cdr p))) projects)
-     (when (cdr by-element)
+     (when unattached
        (list (list :label "Batch"
                    :children
                    (mapcar (lambda (cmd)
@@ -349,9 +334,8 @@ COMMANDS the per-element command table."
                                                   (alist-get 'type cmd)
                                                   (or (alist-get 'name (alist-get 'args cmd)) ""))
                                    :kind 'new :fixed t
-                                   :summary "sent with the batch"
-                                   :payload (orgist-confirm--payload (list cmd))))
-                           (cdr by-element))))))))
+                                   :summary "sent with the batch"))
+                           unattached)))))))
 
 ;;; Execution
 

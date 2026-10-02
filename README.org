@@ -296,31 +296,18 @@ Orgist Write-Back — 3 changes: 2 modified, 1 new
 
 ▼ Family  2 modified, 1 new
   ▼ [x] ✎ Renouveler mon passeport  description
-      ▶ description:  -1 +1 line, +288 chars
-      ▶ payload:      14 lines, sent as is
+      ▶ description:  -1 +1 line, +21 words: est valide jusqu'en mars…
   ▶ [x] + Book photographer  new
 
 C-c C-c  Confirm    C-c C-k  Cancel    TAB  Toggle    S-TAB  Cycle all    RET  Checkbox    n/p  Move
 #+end_example
 
-- Short fields show =old → new= inline with the differing words
-  highlighted; long fields expand (=TAB=) to a unified diff with
-  word-level refinement.  =S-TAB= cycles the whole buffer.
-- The old side of a modified task is its *live* Todoist state, fetched
-  when the buffer opens (up to =orgist-confirm-remote-fetch-limit=
-  tasks); when that state no longer matches the last sync, the task
-  line warns =changed in Todoist since last sync= because confirming
-  overwrites the remote edit.
-- =payload= shows the exact Sync API commands for the task.  Commands
-  that belong to no task (=label_add=) are listed under a =Batch=
-  container and always go with the batch.
-- =RET= on a task unticks it.  Unticked changes are not sent: the
-  commands are regenerated for the ticked changes only and the
-  verification stamps are dropped, so the file stays due and the rest
-  is offered again on the next save or sync.
+- Short fields show =old → new= inline with the differing words highlighted; long fields show the lines removed and added, the change in word count and an excerpt of the first change, and expand (=TAB=) to a unified diff with word-level refinement.  =S-TAB= cycles the whole buffer.
+- The old side of a modified task is its *live* Todoist state, fetched when the buffer opens (up to =orgist-confirm-remote-fetch-limit= tasks); when that state no longer matches the last sync, the task line warns =changed in Todoist since last sync= because confirming overwrites the remote edit.
+- Commands that belong to no task (=label_add=) are listed under a =Batch= container and always go with the batch.
+- =RET= on a task unticks it.  Unticked changes are not sent: the commands are regenerated for the ticked changes only and the verification stamps are dropped, so the file stays due and the rest is offered again on the next save or sync.
 - =C-c C-c= confirms — executes the write-back then continues the sync.
-- =C-c C-k= / =q= cancels — aborts the sync cycle; local changes are
-  preserved for the next run.
+- =C-c C-k= / =q= cancels — aborts the sync cycle; local changes are preserved for the next run.
 
 =orgist-confirm.el= builds the review tree and executes the confirmed
 subset; the buffer itself is =org-sync-confirm-mode=.
