@@ -208,7 +208,7 @@ that value: `[[id:...]]' links and ID-derived attachment directories
 depend on it.  The Todoist ID then lives in this property instead.")
 
 (defconst orgist--managed-properties
-  '("ID" "TODOIST_ID" "TODOIST-PROJECT" "TODOIST-ORDER" "TODOIST_DUE_STRING"
+  `("ID" ,orgist-todoist-id-property "TODOIST-PROJECT" "TODOIST-ORDER" "TODOIST_DUE_STRING"
     "SECTION" "ASSIGNEE" "REMINDER-LOC" "CREATED" "LAST_REPEAT"
     "CATEGORY" "ATTACH_DIR" "DIR" "ITEM")
   "Property names managed by orgist or org-mode internals.
@@ -3810,7 +3810,21 @@ REMINDERS is a list of reminder alists from the Todoist API.
 `point-min' this reads the file-level drawer (the project ID)."
   (let ((pom (or pom (point))))
     (or (org-entry-get pom orgist-todoist-id-property)
-        (org-entry-get pom "ID"))))
+        (orgist--org-id pom))))
+
+(defun orgist--org-id (&optional pom)
+  "Return the :ID: of the heading at POM (default point), or nil.
+Whatever it holds: the Todoist ID of most synced headings, an org-id
+the heading had before orgist bound it, or a temporary ID an older
+orgist minted.  `orgist--element-id' answers which element a heading
+is; this is for code that must tell those cases apart."
+  (org-entry-get (or pom (point)) "ID"))
+
+(defun orgist--replace-legacy-temp-id (id &optional pom)
+  "Replace the temporary :ID: an older orgist minted at POM with ID.
+Older versions minted the temporary ID of a pending creation into
+:ID: itself; once Todoist returns the real ID it takes that place."
+  (org-entry-put (or pom (point)) "ID" id))
 
 (defun orgist--temp-id-p (id)
   "Return non-nil if ID is a temporary UUID rather than a Todoist ID.
@@ -3824,7 +3838,7 @@ A different :ID: already on the heading is an org-id that links or
 attachment directories may depend on; it is kept and ID goes to
 `orgist-todoist-id-property'.  Otherwise ID becomes the :ID:."
   (let* ((pom (or pom (point)))
-         (org-id (org-entry-get pom "ID")))
+         (org-id (orgist--org-id pom)))
     (if (and org-id (not (equal org-id id)))
         (org-entry-put pom orgist-todoist-id-property id)
       (org-entry-put pom "ID" id)
@@ -5596,7 +5610,7 @@ which does not make it an element."
     (or (org-get-todo-state)
         (org-entry-get (point) "SECTION")
         (org-entry-get (point) orgist-todoist-id-property)
-        (let ((id (org-entry-get (point) "ID")))
+        (let ((id (orgist--org-id)))
           (and id (or (not (orgist--temp-id-p id))
                       (and orgist-snapshots (gethash id orgist-snapshots))))))))
 
@@ -5883,7 +5897,7 @@ and every other element and file is still processed."
                 (goto-char (point-min))
                 (while (re-search-forward org-heading-regexp nil t)
                   (org-back-to-heading t)
-                  (let* ((org-id (org-entry-get (point) "ID"))
+                  (let* ((org-id (orgist--org-id))
                          (todoist-id (org-entry-get (point) orgist-todoist-id-property))
                          (section (org-entry-get (point) "SECTION"))
                          (element-id (or todoist-id org-id))
@@ -6733,8 +6747,7 @@ directories that depend on it (see `orgist--set-element-id')."
                 (progn
                   (org-entry-delete (point) orgist-todoist-id-property)
                   (orgist--set-element-id real-id))
-              ;; Temporary ID minted into :ID: by an older orgist.
-              (org-entry-put (point) "ID" real-id))
+              (orgist--replace-legacy-temp-id real-id))
             ;; Re-key id-cache while point is at the heading
             ;; so orgist-id-cache-put records the correct position.
             (remhash temp-id orgist-id-cache)
