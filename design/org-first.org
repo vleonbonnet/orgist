@@ -394,7 +394,7 @@ Delivered in steps, each a commit with every suite green:
 1. File registry: =orgist--project-files=, =orgist--project-buffers=, =orgist--element-location= and =orgist--at-element= replace the listings of =orgist-base-dir=.
 2. Identity: the last direct =:ID:= reads go through the identity accessors.
 3. Remote seam: every Todoist request goes through backend operations on a backend object; while =orgist-read-only= is set, every write operation refuses.  A validation run against real data on 2026-10-03 guarded HTTP requests by method and still sent a real =item_update=; the guard belongs at the operation, not the request.
-4. Per-file policy: =orgist-file-policy= answers mode, destructive operations allowed and description policy; for mirror files it answers what the code does today.
+4. Per-file policy: =orgist-file-policy= answers mode, destructive operations allowed and description policy; for mirror files it answers what the code does today.  =:restructure= covers project files (deletion, rename, moves of projects between files); a task moved to another project still moves, since skipping it would push the old placement back.  Reviewing inbound moves is [[id:f80c14de-520f-4d20-abb9-a00da93c543b][M4 — Overlay, full two-way]].
 5. Row 10: a large pull never overwrites a buffer edited while it runs.  How the editor behaves meanwhile is a choice for the user.
 
 ** TODO M2 — Rebuild-and-validate from remote

@@ -166,5 +166,108 @@ Detection binds new headings to temporary IDs, which already edits files."
                (lambda (&rest _) (error "Sent commands"))))
       (should-not (orgist-write-back)))))
 
+;;; File policy
+;;
+;; A mirror file is Todoist's, so a remote change may do anything to
+;; it.  The policy names what overlay files will refuse; where a policy
+;; says no, the file is left alone.
+
+(ert-deftest orgist-seams/mirror-policy-by-default ()
+  "Files are mirror files unless an override matches; first match wins."
+  (should (equal (orgist-file-policy "/x/A.org") orgist--mirror-policy))
+  (let ((orgist--file-policies '(("/Notes/" :mode overlay :restructure nil)
+                                 ("\\.org\\'" :description none))))
+    (should (eq (orgist--policy :mode "/x/Notes/a.org") 'overlay))
+    (should-not (orgist--policy :restructure "/x/Notes/a.org"))
+    ;; Unset properties keep the mirror answer.
+    (should (eq (orgist--policy :description "/x/Notes/a.org") 'sync))
+    (should (eq (orgist--policy :description "/x/B.org") 'none))
+    (should (orgist--policy :restructure "/x/B.org"))))
+
+(ert-deftest orgist-seams/policy-keeps-a-deleted-project-file ()
+  "A remote project deletion leaves a file whose policy keeps its structure."
+  (orgist-test--with-files `(("A.org" . ,(orgist-test--project "PA" "TA"))
+                             ("B.org" . ,(orgist-test--project "PB" "TB")))
+    (let ((orgist-log-file nil)
+          (orgist-history-directory nil)
+          (orgist-project-buffer-cache nil)
+          (orgist--file-policies '(("/A\\.org\\'" :restructure nil))))
+      (orgist-delete-project "PA")
+      (should (file-exists-p (expand-file-name "A.org" orgist-base-dir)))
+      (orgist-delete-project "PB")
+      (should-not (file-exists-p (expand-file-name "B.org" orgist-base-dir))))))
+
+(ert-deftest orgist-seams/policy-keeps-a-renamed-project-file ()
+  "A project renamed in Todoist keeps its file name when the policy says so."
+  (orgist-test--with-files `(("A.org" . ,(orgist-test--project "PA" "TA")))
+    (let ((orgist-log-file nil)
+          (orgist--file-policies '(("/A\\.org\\'" :restructure nil)))
+          (buf (find-file-noselect (expand-file-name "A.org" orgist-base-dir))))
+      (orgist-update-root-project-in-place '((id . "PA") (name . "Renamed")) buf)
+      (should (file-exists-p (expand-file-name "A.org" orgist-base-dir)))
+      (should-not (file-exists-p (expand-file-name "Renamed.org" orgist-base-dir)))
+      ;; The title is a field, not structure: it still follows Todoist.
+      (should (string-match-p "^#\\+TITLE: Renamed$"
+                              (with-current-buffer buf (buffer-string)))))))
+
+(ert-deftest orgist-seams/description-policy-none-keeps-the-body ()
+  "With description policy `none', a pull leaves the body and write-back ignores it."
+  (orgist-test--with-files `(("A.org" . ,(concat (orgist-test--project "PA" "TA")
+                                                 "Local notes.\n")))
+    (let ((orgist--file-policies '(("/A\\.org\\'" :description none)))
+          (orgist-log-file nil)
+          (orgist-enable-write-back t)
+          (orgist-snapshots (make-hash-table :test 'equal))
+          (orgist-snapshot-file (expand-file-name "snapshots.el" orgist-base-dir))
+          (orgist-sync-comments nil)
+          (orgist-sync-attachments nil)
+          (orgist-reminders nil))
+      (with-current-buffer (find-file-noselect (expand-file-name "A.org" orgist-base-dir))
+        (goto-char (orgist-find-element-by-id "TA"))
+        (orgist-update-element '((id . "TA") (content . "Task") (description . "Remote text.")
+                                 (project_id . "PA") (checked . :json-false) (priority . 1)))
+        (should (string-match-p "Local notes\\." (buffer-string)))
+        (should-not (string-match-p "Remote text" (buffer-string)))
+        (goto-char (point-max))
+        (insert "More notes.\n")
+        (should-not (assq :description (orgist-diff-element "TA")))))))
+
+(defvar orgist-test--new-heading-id nil
+  "Element ID the last scan bound the new heading to.")
+
+(defun orgist-test--scan-new-headings ()
+  "Add an unbound TODO heading to A.org and return the scan's changes."
+  (let ((orgist-log-file nil)
+        (orgist-snapshot-file (expand-file-name "snapshots.el" orgist-base-dir))
+        (orgist--write-back-stamps nil)
+        (orgist--write-back-stamps-path nil)
+        (orgist--pending-stamps nil)
+        (orgist-snapshots (make-hash-table :test 'equal))
+        (orgist-sync-comments nil)
+        (orgist-sync-attachments nil)
+        (orgist-enable-write-back t))
+    (with-current-buffer (find-file-noselect (expand-file-name "A.org" orgist-base-dir))
+      (orgist-build-id-cache)
+      (goto-char (orgist-find-element-by-id "TA"))
+      (puthash "TA" (orgist-element-local-state) orgist-snapshots)
+      (goto-char (point-max))
+      (insert "* TODO Local only\n")
+      (save-buffer)
+      (prog1 (orgist-diff-all-elements)
+        (goto-char (point-max))
+        (org-back-to-heading t)
+        (should (equal (org-get-heading t t t t) "Local only"))
+        (setq orgist-test--new-heading-id (orgist--element-id))))))
+
+(ert-deftest orgist-seams/policy-without-exposure-adds-no-element ()
+  "An unbound TODO heading becomes a new task only where the policy exposes it."
+  (orgist-test--with-files `(("A.org" . ,(orgist-test--project "PA" "TA")))
+    (let ((orgist--file-policies '(("/A\\.org\\'" :expose nil))))
+      (should-not (rassq 'new (orgist-test--scan-new-headings)))
+      (should-not orgist-test--new-heading-id)))
+  (orgist-test--with-files `(("A.org" . ,(orgist-test--project "PA" "TA")))
+    (should (rassq 'new (orgist-test--scan-new-headings)))
+    (should orgist-test--new-heading-id)))
+
 (provide 'test-seams)
 ;;; test-seams.el ends here

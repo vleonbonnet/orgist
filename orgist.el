@@ -469,6 +469,53 @@ Returns nil without evaluating BODY when no project buffer holds ID."
            (goto-char (cdr ,location))
            ,@body)))))
 
+;;; File policy
+
+;; What a remote change may do to a project file.  A mirror file is
+;; owned by Todoist, so everything is allowed, as orgist has always
+;; done.  A notes file synced in overlay mode will answer differently;
+;; where a policy says no, orgist leaves the file alone and logs why.
+
+(defconst orgist--mirror-policy
+  '(:mode mirror :restructure t :description sync :expose t)
+  "Policy of a mirror file, whose content Todoist owns.
+:mode         `mirror'.
+:restructure  non-nil: a remote change may delete, move or rename the
+              file, and move subtrees between files.
+:description  `sync': a task's body is its Todoist description, in
+              both directions; `none': the body never syncs.
+:expose       non-nil: an unbound TODO heading becomes a new task and
+              an unbound top-level heading a new section.")
+
+(defvar orgist--file-policies nil
+  "Per-file overrides of `orgist--mirror-policy', as (REGEXP . PLIST).
+The first REGEXP matching a project file's absolute name applies; its
+properties replace the defaults.  Empty until overlay mode registers
+files.")
+
+(defun orgist-file-policy (&optional file)
+  "Return the policy plist of project FILE; see `orgist--mirror-policy'.
+FILE defaults to the current buffer's file."
+  (let ((file (or file (buffer-file-name (buffer-base-buffer)))))
+    (append (and file
+                 (cdr (seq-find (lambda (entry) (string-match-p (car entry) file))
+                                orgist--file-policies)))
+            orgist--mirror-policy)))
+
+(defun orgist--policy (key &optional file)
+  "Return KEY of the policy of FILE (default: the current buffer's file)."
+  (plist-get (orgist-file-policy file) key))
+
+(defun orgist--may-restructure-p (buffers what)
+  "Return non-nil if the policies of BUFFERS allow WHAT, a restructuring.
+When one does not, log that WHAT was skipped."
+  (or (seq-every-p (lambda (buffer)
+                     (orgist--policy :restructure (buffer-file-name buffer)))
+                   (delq nil buffers))
+      (progn
+        (orgist-log 'warn "Skipped %s: the file's policy keeps its structure" what)
+        nil)))
+
 ;;; Remote backend
 
 ;; Every request to the remote goes through `orgist-remote' as a named
@@ -2319,7 +2366,9 @@ sub-project is a heading in its parent's file, whose buffer
 `orgist-get-project-buffer' returns: only that heading's subtree is
 removed, never the parent's file."
   (if-let* ((project-buffer (orgist-get-project-buffer project-id)))
-      (progn
+      (when (orgist--may-restructure-p
+             (list project-buffer)
+             (format "deletion of project %s, deleted in Todoist" project-id))
         (setq orgist-project-buffer-cache
               (assoc-delete-all project-id orgist-project-buffer-cache))
         (if (with-current-buffer project-buffer
@@ -2428,30 +2477,32 @@ A root project has its ID as the file-level ID property."
          (parent-id (alist-get 'parent_id project))
          (parent-buffer (orgist-get-project-buffer parent-id))
          (current-file-path (buffer-file-name project-buffer)))
+    (when (orgist--may-restructure-p
+           (list project-buffer parent-buffer)
+           (format "moving project %s into %s" project-name (buffer-name parent-buffer)))
+      ;; Copy all content from current file to parent file as a heading
+      (with-current-buffer project-buffer
+        (let ((content (buffer-string)))
+          (with-current-buffer parent-buffer
+            (goto-char (point-max))
+            (insert (concat "\n* " project-name "\n"))
+            (orgist--set-element-id project-id)
+            ;; Insert original content under this heading (adjust levels)
+            (let ((adjusted-content (orgist-adjust-content-for-subproject content)))
+              (when adjusted-content
+                (insert adjusted-content)))
+            (orgist--save-buffer))))
 
-    ;; Copy all content from current file to parent file as a heading
-    (with-current-buffer project-buffer
-      (let ((content (buffer-string)))
-        (with-current-buffer parent-buffer
-          (goto-char (point-max))
-          (insert (concat "\n* " project-name "\n"))
-          (orgist--set-element-id project-id)
-          ;; Insert original content under this heading (adjust levels)
-          (let ((adjusted-content (orgist-adjust-content-for-subproject content)))
-            (when adjusted-content
-              (insert adjusted-content)))
-          (orgist--save-buffer))))
+      ;; Remove from cache; the original file's content now lives in the
+      ;; parent's, so the file goes to the trash.
+      (setq orgist-project-buffer-cache
+            (assoc-delete-all project-id orgist-project-buffer-cache))
+      (with-current-buffer project-buffer (set-buffer-modified-p nil))
+      (kill-buffer project-buffer)
+      (orgist--trash-file current-file-path)
 
-    ;; Remove from cache; the original file's content now lives in the
-    ;; parent's, so the file goes to the trash.
-    (setq orgist-project-buffer-cache
-          (assoc-delete-all project-id orgist-project-buffer-cache))
-    (with-current-buffer project-buffer (set-buffer-modified-p nil))
-    (kill-buffer project-buffer)
-    (orgist--trash-file current-file-path)
-
-    ;; Update cache to point to parent buffer
-    (push (cons project-id parent-buffer) orgist-project-buffer-cache)))
+      ;; Update cache to point to parent buffer
+      (push (cons project-id parent-buffer) orgist-project-buffer-cache))))
 
 (defun orgist-convert-subproject-to-root (project project-buffer)
   "Convert a subproject to a root project by extracting it to a new file."
@@ -2459,32 +2510,35 @@ A root project has its ID as the file-level ID property."
          (project-name (alist-get 'name project))
          (new-file-path (orgist-get-project-file-path project-name)))
     (orgist-log 'debug "orgist-convert-subproject-to-root %s %s %s" project-id project-name new-file-path)
-    ;; Find the subproject heading in current buffer
-    (with-current-buffer project-buffer
-      (let ((project-point (orgist-find-element-by-id project-id)))
-        (when project-point
-          (goto-char project-point)
-          ;; Extract the subtree content (org-copy-subtree puts it in kill ring)
-          (org-copy-subtree 1 t)
-          (let ((subtree-content (current-kill 0)))
-            ;; Create new file
-            (with-current-buffer (find-file-noselect new-file-path)
-              (erase-buffer)
-              (insert (concat "#+TITLE: " project-name "\n\n"))
-              (orgist--set-element-id project-id)
-              (org-set-property "TODOIST-PROJECT" "")
-              ;; Insert content (adjust heading levels)
-              (let ((adjusted-content (orgist-adjust-content-for-root-project subtree-content)))
-                (when adjusted-content
-                  (insert adjusted-content)))
-              (orgist--save-buffer))
-            (orgist--save-buffer))))
+    (when (orgist--may-restructure-p
+           (list project-buffer)
+           (format "moving sub-project %s to its own file" project-name))
+      ;; Find the subproject heading in current buffer
+      (with-current-buffer project-buffer
+        (let ((project-point (orgist-find-element-by-id project-id)))
+          (when project-point
+            (goto-char project-point)
+            ;; Extract the subtree content (org-copy-subtree puts it in kill ring)
+            (org-copy-subtree 1 t)
+            (let ((subtree-content (current-kill 0)))
+              ;; Create new file
+              (with-current-buffer (find-file-noselect new-file-path)
+                (erase-buffer)
+                (insert (concat "#+TITLE: " project-name "\n\n"))
+                (orgist--set-element-id project-id)
+                (org-set-property "TODOIST-PROJECT" "")
+                ;; Insert content (adjust heading levels)
+                (let ((adjusted-content (orgist-adjust-content-for-root-project subtree-content)))
+                  (when adjusted-content
+                    (insert adjusted-content)))
+                (orgist--save-buffer))
+              (orgist--save-buffer))))
 
-      ;; Update cache
-      (let ((new-buffer (find-file-noselect new-file-path)))
-        (setq orgist-project-buffer-cache
-              (cons (cons project-id new-buffer)
-                    (assoc-delete-all project-id orgist-project-buffer-cache)))))))
+        ;; Update cache
+        (let ((new-buffer (find-file-noselect new-file-path)))
+          (setq orgist-project-buffer-cache
+                (cons (cons project-id new-buffer)
+                      (assoc-delete-all project-id orgist-project-buffer-cache))))))))
 
 (defun orgist-update-subproject (project project-buffer)
   "Update a subproject heading.  Creates it if missing, moves it if
@@ -2508,6 +2562,11 @@ parent changed, or updates name in place."
             (goto-char project-point)
             (org-edit-headline project-name)
             (orgist--save-buffer))
+           ;; Different file, but a policy keeps the files' structure
+           ((not (orgist--may-restructure-p
+                  (list project-buffer new-parent-buffer)
+                  (format "moving sub-project %s to %s"
+                          project-name (buffer-name new-parent-buffer)))))
            ;; Different file — move the subtree
            (t
             (orgist-log 'debug "Moving subproject %s from %s to %s"
@@ -2546,7 +2605,12 @@ parent changed, or updates name in place."
         (orgist--save-buffer)))
 
     ;; Rename file if name changed
-    (unless (string= current-file-path new-file-path)
+    (when (and (not (string= current-file-path new-file-path))
+               (orgist--may-restructure-p
+                (list project-buffer)
+                (format "renaming %s to %s"
+                        (file-name-nondirectory current-file-path)
+                        (file-name-nondirectory new-file-path))))
       (orgist--move-file-aside current-file-path new-file-path)
       (with-current-buffer project-buffer
         (set-visited-file-name new-file-path)
@@ -2855,12 +2919,13 @@ See `orgist-update-element', which guards this."
                         (progn (orgist-load-snapshots)
                                (gethash id orgist-snapshots))))
          (keep-description
-          (and old-snap
-               (plist-member old-snap :remote-description)
-               (orgist--same-description-p
-                (plist-get old-snap :remote-description) description)
-               (equal (plist-get old-snap :reminder-stamps)
-                      (orgist--absolute-reminder-stamps reminders))))
+          (or (eq (orgist--policy :description) 'none)
+              (and old-snap
+                   (plist-member old-snap :remote-description)
+                   (orgist--same-description-p
+                    (plist-get old-snap :remote-description) description)
+                   (equal (plist-get old-snap :reminder-stamps)
+                          (orgist--absolute-reminder-stamps reminders)))))
          ;; The description text the rebuild removed, journaled below
          ;; when what replaced it differs.
          (removed-description nil)
@@ -5789,7 +5854,9 @@ of (FIELD . (OLD . NEW)) for each changed field."
             (goto-char pos)
             (let* ((local (orgist-element-local-state))
                    (fields `(:content :checked :priority :labels
-                             :due :due-string :deadline :duration :description
+                             :due :due-string :deadline :duration
+                             ,@(when (eq (orgist--policy :description) 'sync)
+                                 '(:description))
                              :parent-id :order :section-p :archived-p :last-repeat
                              ,@(when orgist-sync-attachments
                                  '(:attachment-files))))
@@ -5991,7 +6058,7 @@ and every other element and file is still processed."
                             id (file-name-nondirectory file)
                             (error-message-string err)))))
            orgist-snapshots)
-          ;; Detect new headings.
+          ;; Detect new headings, where the file's policy exposes them.
           ;; - TODO/DONE heading not bound to Todoist, no SECTION → new task.
           ;; - Level-1 non-TODO heading not bound to Todoist, no SECTION →
           ;;   new section.  We mark it with :SECTION: t and a placeholder
@@ -6004,72 +6071,73 @@ and every other element and file is still processed."
           ;; to `orgist-todoist-id-property', never to :ID:, so an
           ;; existing org-id is kept and links to it survive the push
           ;; (see `orgist-remap-temp-ids').
-          (condition-case err
-              (save-excursion
-                (goto-char (point-min))
-                (while (re-search-forward org-heading-regexp nil t)
-                  (org-back-to-heading t)
-                  (let* ((org-id (orgist--org-id))
-                         (todoist-id (org-entry-get (point) orgist-todoist-id-property))
-                         (section (org-entry-get (point) "SECTION"))
-                         (element-id (or todoist-id org-id))
-                         ;; Pending: bound to a temporary ID whose creation
-                         ;; never reached Todoist (a follow-up save replaced
-                         ;; the confirm buffer before the user accepted, or
-                         ;; the API call failed).  Temporary IDs live in
-                         ;; `orgist-todoist-id-property'; a SECTION heading
-                         ;; may still carry one in :ID: from older orgist
-                         ;; versions.  Only temporary IDs qualify: a
-                         ;; dash-free ID is a real Todoist ID whose snapshot
-                         ;; went missing, and re-adding it would duplicate
-                         ;; the element.
-                         (pending (and (orgist--temp-id-p element-id)
-                                       (not (gethash element-id orgist-snapshots))
-                                       (or todoist-id section)
-                                       element-id))
-                         (unbound (and (not todoist-id)
-                                       (not section)
-                                       (or (null org-id)
-                                           (and (orgist--temp-id-p org-id)
-                                                (not (gethash org-id orgist-snapshots)))))))
-                    (cond
-                     ((and unbound (org-get-todo-state) (not section))
-                      (let ((temp-id (orgist--mint-temp-id)))
-                        (push (cons temp-id 'new) file-changes)
-                        ;; A heading that had no ID at all is always
-                        ;; renumbered among its siblings; one that only
-                        ;; carried an org-id keeps an order it already has.
-                        (when (or (null org-id)
-                                  (not (org-entry-get (point) "TODOIST-ORDER")))
+          (when (orgist--policy :expose)
+            (condition-case err
+                (save-excursion
+                  (goto-char (point-min))
+                  (while (re-search-forward org-heading-regexp nil t)
+                    (org-back-to-heading t)
+                    (let* ((org-id (orgist--org-id))
+                           (todoist-id (org-entry-get (point) orgist-todoist-id-property))
+                           (section (org-entry-get (point) "SECTION"))
+                           (element-id (or todoist-id org-id))
+                           ;; Pending: bound to a temporary ID whose creation
+                           ;; never reached Todoist (a follow-up save replaced
+                           ;; the confirm buffer before the user accepted, or
+                           ;; the API call failed).  Temporary IDs live in
+                           ;; `orgist-todoist-id-property'; a SECTION heading
+                           ;; may still carry one in :ID: from older orgist
+                           ;; versions.  Only temporary IDs qualify: a
+                           ;; dash-free ID is a real Todoist ID whose snapshot
+                           ;; went missing, and re-adding it would duplicate
+                           ;; the element.
+                           (pending (and (orgist--temp-id-p element-id)
+                                         (not (gethash element-id orgist-snapshots))
+                                         (or todoist-id section)
+                                         element-id))
+                           (unbound (and (not todoist-id)
+                                         (not section)
+                                         (or (null org-id)
+                                             (and (orgist--temp-id-p org-id)
+                                                  (not (gethash org-id orgist-snapshots)))))))
+                      (cond
+                       ((and unbound (org-get-todo-state) (not section))
+                        (let ((temp-id (orgist--mint-temp-id)))
+                          (push (cons temp-id 'new) file-changes)
+                          ;; A heading that had no ID at all is always
+                          ;; renumbered among its siblings; one that only
+                          ;; carried an org-id keeps an order it already has.
+                          (when (or (null org-id)
+                                    (not (org-entry-get (point) "TODOIST-ORDER")))
+                            (setq file-changes
+                                  (orgist--merge-sibling-order-changes
+                                   (orgist--assign-new-heading-order) file-changes)))))
+                       ((and unbound
+                             (= (org-current-level) 1)
+                             (not (org-get-todo-state))
+                             (not section))
+                        (let ((temp-id (orgist--mint-temp-id)))
+                          (org-entry-put (point) "SECTION" "t")
+                          (org-entry-put (point) "TODOIST-ORDER" "0")
+                          (push (cons temp-id 'new-section) file-changes)))
+                       ;; Pending section: re-emit so the section actually
+                       ;; gets created and any child item_move referencing
+                       ;; it can resolve.
+                       ((and pending section)
+                        (push (cons pending 'new-section) file-changes))
+                       ;; Pending task.
+                       ((and pending (org-get-todo-state))
+                        (push (cons pending 'new) file-changes)
+                        (unless (org-entry-get (point) "TODOIST-ORDER")
                           (setq file-changes
                                 (orgist--merge-sibling-order-changes
-                                 (orgist--assign-new-heading-order) file-changes)))))
-                     ((and unbound
-                           (= (org-current-level) 1)
-                           (not (org-get-todo-state))
-                           (not section))
-                      (let ((temp-id (orgist--mint-temp-id)))
-                        (org-entry-put (point) "SECTION" "t")
-                        (org-entry-put (point) "TODOIST-ORDER" "0")
-                        (push (cons temp-id 'new-section) file-changes)))
-                     ;; Pending section: re-emit so the section actually
-                     ;; gets created and any child item_move referencing
-                     ;; it can resolve.
-                     ((and pending section)
-                      (push (cons pending 'new-section) file-changes))
-                     ;; Pending task.
-                     ((and pending (org-get-todo-state))
-                      (push (cons pending 'new) file-changes)
-                      (unless (org-entry-get (point) "TODOIST-ORDER")
-                        (setq file-changes
-                              (orgist--merge-sibling-order-changes
-                               (orgist--assign-new-heading-order) file-changes))))))
-                  (end-of-line)))
-            (error
-             (cl-incf file-errors)
-             (orgist-log 'warn "New-heading scan failed in %s: %s (will retry next scan)"
-                         (file-name-nondirectory file)
-                         (error-message-string err)))))
+                                 (orgist--assign-new-heading-order) file-changes))))))
+                    (end-of-line)))
+              (error
+               (cl-incf file-errors)
+               (orgist-log 'warn "New-heading scan failed in %s: %s (will retry next scan)"
+                           (file-name-nondirectory file)
+                           (error-message-string err))))))
         (setq changes (nconc file-changes changes))
         ;; Stamp bookkeeping.  SCAN-HASH is nil when the visiting
         ;; buffer had unsaved modifications — the on-disk content was
@@ -6192,7 +6260,8 @@ Returns a list of command alists with keys `type', `uuid', `args'."
               (when-let* ((dur (plist-get local :duration)))
                 (push (cons 'duration dur) add-args))
               (let ((desc (plist-get local :description)))
-                (when (and desc (not (string-empty-p desc)))
+                (when (and desc (not (string-empty-p desc))
+                           (eq (orgist--policy :description) 'sync))
                   (push (cons 'description
                               (orgist-convert-description-to-markdown desc))
                         add-args)))
