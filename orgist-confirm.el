@@ -36,11 +36,10 @@
 (declare-function orgist--description-as-extracted "orgist" (markdown))
 (declare-function orgist-parse-todoist-date-with-duration "orgist" (date-info duration-info))
 (declare-function orgist--label-to-tag "orgist" (label-name))
-(declare-function orgist--request-with-retry "orgist" (url &rest args))
+(declare-function orgist-remote "orgist" (operation &rest args))
 (defvar orgist-snapshots)
 (defvar orgist-sync-mutex)
 (defvar orgist-base-dir)
-(defvar orgist-bearer-token)
 (defvar orgist--pending-stamps)
 
 (defcustom orgist-confirm-remote-fetch-limit 20
@@ -129,18 +128,13 @@ Walks :parent-id up to a file-level ID among BUFFERS."
 
 ;;; Live remote state
 
-(defun orgist-confirm--token ()
-  "Return the bearer token, calling it when it is a function."
-  (if (functionp orgist-bearer-token)
-      (funcall orgist-bearer-token)
-    orgist-bearer-token))
-
 (defun orgist-confirm--fetch-remote (id section-p)
   "Return the current Todoist state of element ID as an alist, or nil."
   (let ((result nil))
-    (orgist--request-with-retry
-     (format "https://api.todoist.com/api/v1/%s/%s" (if section-p "sections" "tasks") id)
-     :headers `(("Authorization" . ,(format "Bearer %s" (orgist-confirm--token))))
+    (orgist-remote
+     (if section-p 'get-section 'get-task)
+     :path (list id)
+     :retry t
      :parser 'json-read
      :sync t
      :error (cl-function

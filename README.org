@@ -79,6 +79,7 @@ All settings live in the =orgist= customize group.
 | =orgist-sync-project-filter=      | =nil=                          | Restrict sync to one project by name          |
 | =orgist-enable-write-back=        | ='ask=                         | Write-back mode: =nil=, =t=, or ='ask=              |
 | =orgist-write-back-dry-run=       | =t=                            | Log write-back commands without API calls     |
+| =orgist-read-only=                | =nil=                          | Refuse every remote write; pulls still work   |
 | =orgist-treat-priority-4-as-none= | =t=                            | Map Todoist p4 to no org priority             |
 | =orgist-sync-on-save=             | =t=                            | Write-back on =C-x C-s= (after-save hook)      |
 | =orgist-auto-pull-interval=       | =300=                          | Auto-pull every N seconds (=nil= to disable)    |
@@ -429,7 +430,7 @@ commands with a =project_id= target.
 | Metadata          | =./test-run.sh metadata=          |    18 | Non-Todoist property preservation    |
 | New features      | =./test-run.sh features=          |   100 | Timezone, duration, labels, etc.     |
 | Attachments       | =./test-run.sh attachments=       |    52 | ATTACH tag, pull/push, diff, confirm |
-| ERT regression    | =./test-run.sh ert=               |   100 | Identity, ordering, spacing, log notes, guards, review, seams |
+| ERT regression    | =./test-run.sh ert=               |   105 | Identity, ordering, spacing, log notes, guards, review, seams |
 | Live write-back   | =./test-run.sh live-writeback=    |    27 | Real API identity, description and safety-net round trips (needs token) |
 | Live attachments  | =./test-run.sh live-attachments=  |    19 | Real API attachment CRUD (needs token) |
 

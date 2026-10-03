@@ -109,6 +109,13 @@
   (let ((data (plist-get args :data)))
     (cdr (assoc "sync_token" data))))
 
+(defun orgist-test--request-param (url args name)
+  "Return query parameter NAME of a request to URL with ARGS, or nil.
+Read from the :params in ARGS, or from URL's query string."
+  (or (cdr (assoc name (plist-get args :params)))
+      (when (string-match (concat "[?&]" (regexp-quote name) "=\\([^&]+\\)") url)
+        (match-string 1 url))))
+
 (defun orgist-test--request-advice (orig-fn url &rest args)
   "Advice around `request' for record/replay of API responses.
 ORIG-FN is the original `request', URL is the endpoint, ARGS are kwargs."
@@ -139,9 +146,9 @@ ORIG-FN is the original `request', URL is the endpoint, ARGS are kwargs."
         (when success-fn (funcall success-fn))))
 
      ;; Comments API: GET /api/v1/comments?task_id=ID
-     ((string-match-p "/comments" url)
-       (let* ((task-id (when (string-match "task_id=\\([^&]+\\)" url)
-                         (match-string 1 url)))
+     ((and (string-match-p "/comments" url)
+           (orgist-test--request-param url args "task_id"))
+       (let* ((task-id (orgist-test--request-param url args "task_id"))
               (cache-file (orgist-test--task-cache-file "comments" task-id))
               (success-fn (plist-get args :success)))
         (if (eq orgist-test-record-mode 'record)
@@ -314,7 +321,7 @@ ORIG-FN is the original `request', URL is the endpoint, ARGS are kwargs."
 
      ;; Project comments API: GET /api/v1/comments?project_id=ID
      ((and (string-match-p "/comments" url)
-           (string-match "project_id=\\([^&]+\\)" url))
+           (orgist-test--request-param url args "project_id"))
       (let ((success-fn (plist-get args :success)))
         (message "[test-harness] MOCK project comments")
         (when success-fn

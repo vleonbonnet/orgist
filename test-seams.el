@@ -85,5 +85,86 @@ Buffers visiting them are killed afterwards."
       (should-not (orgist--at-element "missing" t (setq ran t)))
       (should-not ran))))
 
+;;; Remote backend
+;;
+;; A validation run against real data on 2026-10-03 guarded HTTP
+;; requests by method and still sent a real item_update: orgist's
+;; command request carries no :type.  Writes are now refused by
+;; operation, before any request is built.
+
+(defmacro orgist-test--recording-requests (&rest body)
+  "Run BODY with `request' and the retry wrapper recording, not sending.
+Binds CALLS to the list of (URL . ARGS), oldest first."
+  (declare (indent 0))
+  `(let ((calls nil))
+     (cl-letf (((symbol-function 'request)
+                (lambda (url &rest args) (setq calls (append calls (list (cons url args)))) nil))
+               ((symbol-function 'orgist--request-with-retry)
+                (lambda (url &rest args) (setq calls (append calls (list (cons url args)))) nil))
+               ((symbol-function 'url-copy-file)
+                (lambda (url file &rest _) (setq calls (append calls (list (list url :file file)))) nil)))
+       ,@body)))
+
+(ert-deftest orgist-seams/every-operation-has-a-todoist-endpoint ()
+  "The operation table and the Todoist endpoints name the same operations."
+  (should (equal (sort (mapcar #'car orgist-todoist--endpoints) #'string<)
+                 (sort (remq 'download (mapcar #'car orgist--remote-operations))
+                       #'string<))))
+
+(ert-deftest orgist-seams/read-only-refuses-every-write ()
+  "While read-only, no write operation reaches `request'."
+  (let ((orgist-read-only t)
+        (orgist-log-file nil))
+    (orgist-test--recording-requests
+      (dolist (op orgist--remote-operations)
+        (when (eq (cdr op) 'write)
+          (should-error (orgist-remote (car op) :path '("1") :data '(("commands" . "[]")))
+                        :type 'orgist-read-only)))
+      (should-not calls))))
+
+(ert-deftest orgist-seams/reads-pass-in-read-only-mode ()
+  "Reads go through with their endpoint, method and authorization."
+  (let ((orgist-read-only t)
+        (orgist-bearer-token (lambda () "secret")))
+    (orgist-test--recording-requests
+      (orgist-remote 'get-task :path '("42") :retry t)
+      (orgist-remote 'comments :params '(("project_id" . "7")))
+      (orgist-remote 'download :url "https://files.example/x" :file "/tmp/x")
+      (should (= (length calls) 3))
+      (pcase-let ((`(,url . ,args) (nth 0 calls)))
+        (should (equal url "https://api.todoist.com/api/v1/tasks/42"))
+        (should (equal (plist-get args :type) "GET"))
+        (should (equal (cdr (assoc "Authorization" (plist-get args :headers)))
+                       "Bearer secret"))
+        (should-not (plist-member args :path))
+        (should-not (plist-member args :retry)))
+      (should (equal (car (nth 1 calls)) "https://api.todoist.com/api/v1/comments"))
+      (should (equal (plist-get (cdr (nth 1 calls)) :params) '(("project_id" . "7"))))
+      (should (equal (nth 2 calls) '("https://files.example/x" :file "/tmp/x"))))))
+
+(ert-deftest orgist-seams/commands-are-posted-with-extra-headers ()
+  "The command request is a POST and keeps its own headers."
+  (let ((orgist-bearer-token "t"))
+    (orgist-test--recording-requests
+      (orgist-remote 'commands :retry t :headers '(("Connection" . "close"))
+                     :data '(("commands" . "[]")))
+      (pcase-let ((`(,url . ,args) (car calls)))
+        (should (equal url "https://api.todoist.com/api/v1/sync"))
+        (should (equal (plist-get args :type) "POST"))
+        (should (equal (plist-get args :headers)
+                       '(("Authorization" . "Bearer t") ("Connection" . "close"))))))))
+
+(ert-deftest orgist-seams/read-only-write-back-stops-before-detection ()
+  "Read-only write-back neither scans for changes nor sends anything.
+Detection binds new headings to temporary IDs, which already edits files."
+  (let ((orgist-read-only t)
+        (orgist-enable-write-back t)
+        (orgist-log-file nil))
+    (cl-letf (((symbol-function 'orgist-diff-all-elements)
+               (lambda () (error "Scanned for changes")))
+              ((symbol-function 'orgist-execute-write-back)
+               (lambda (&rest _) (error "Sent commands"))))
+      (should-not (orgist-write-back)))))
+
 (provide 'test-seams)
 ;;; test-seams.el ends here

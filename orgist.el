@@ -469,6 +469,120 @@ Returns nil without evaluating BODY when no project buffer holds ID."
            (goto-char (cdr ,location))
            ,@body)))))
 
+;;; Remote backend
+
+;; Every request to the remote goes through `orgist-remote' as a named
+;; operation.  Whether an operation reads or writes is declared once,
+;; independently of any HTTP method, so `orgist-read-only' holds for
+;; every backend.  The backend object maps operations to its API.
+
+(defcustom orgist-read-only nil
+  "When non-nil, orgist changes nothing remotely.
+Every write operation in `orgist--remote-operations' signals
+`orgist-read-only' instead of reaching the remote, and write-back
+stops before building commands; pulls work as usual."
+  :group 'orgist
+  :type 'boolean)
+
+(define-error 'orgist-read-only "Orgist is read-only; refused")
+
+(defconst orgist--remote-operations
+  '((sync . read)
+    (get-task . read)
+    (get-section . read)
+    (archived-sections . read)
+    (completed-tasks . read)
+    (comments . read)
+    (activities . read)
+    (download . read)
+    (commands . write)
+    (upload . write)
+    (add-comment . write)
+    (update-comment . write)
+    (delete-comment . write)
+    (quick-add . write))
+  "Remote operations orgist performs, and whether each reads or writes.")
+
+(defun orgist--bearer-token ()
+  "Return `orgist-bearer-token', calling it when it is a function."
+  (if (functionp orgist-bearer-token)
+      (funcall orgist-bearer-token)
+    orgist-bearer-token))
+
+(cl-defstruct (orgist-todoist (:constructor orgist-todoist-create)
+                              (:copier nil))
+  "Todoist, through its API v1."
+  (url "https://api.todoist.com/api/v1/"))
+
+(defvar orgist-backend (orgist-todoist-create)
+  "The remote orgist syncs with.")
+
+(cl-defgeneric orgist-backend-request (backend operation args)
+  "Perform OPERATION on BACKEND and return the result.
+ARGS is the plist `orgist-remote' received.")
+
+(defun orgist-remote (operation &rest args)
+  "Perform the remote OPERATION with ARGS through `orgist-backend'.
+OPERATION is a key of `orgist--remote-operations'.  While
+`orgist-read-only' is set, a write operation signals
+`orgist-read-only' without reaching the remote.
+
+For the Todoist backend, ARGS are `request' keywords, plus :path, a
+list substituted into the operation's endpoint, and :retry, non-nil to
+retry transient errors (see `orgist--request-with-retry').  The
+operation sets the URL, the HTTP method and authorization.  The
+`download' operation takes :url and :file instead."
+  (pcase (alist-get operation orgist--remote-operations)
+    ('nil (error "Unknown remote operation: %S" operation))
+    ('write
+     (when orgist-read-only
+       (orgist-log 'warn "Read-only: refused remote %s" operation)
+       (signal 'orgist-read-only (list operation)))))
+  (orgist-backend-request orgist-backend operation args))
+
+(defconst orgist-todoist--endpoints
+  '((sync "POST" "sync")
+    (commands "POST" "sync")
+    (get-task "GET" "tasks/%s")
+    (get-section "GET" "sections/%s")
+    (archived-sections "GET" "sections/archived")
+    (completed-tasks "GET" "tasks/completed/by_completion_date")
+    (comments "GET" "comments")
+    (activities "GET" "activities")
+    (upload "POST" "uploads")
+    (add-comment "POST" "comments")
+    (update-comment "POST" "comments/%s")
+    (delete-comment "DELETE" "comments/%s")
+    (quick-add "POST" "tasks/quick"))
+  "Each remote operation's HTTP method and path under the Todoist API.")
+
+(cl-defmethod orgist-backend-request ((backend orgist-todoist) operation args)
+  "Send OPERATION to Todoist with ARGS; see `orgist-remote'."
+  (if (eq operation 'download)
+      (url-copy-file (plist-get args :url) (plist-get args :file) t)
+    (pcase-let* ((`(,method ,path) (or (alist-get operation orgist-todoist--endpoints)
+                                       (error "Todoist has no endpoint for %S" operation)))
+                 (url (concat (orgist-todoist-url backend)
+                              (apply #'format path (plist-get args :path))))
+                 (retry (plist-get args :retry))
+                 (settings (orgist--plist-without args '(:path :retry :type :headers))))
+      (apply (if retry #'orgist--request-with-retry #'request)
+             url
+             :type method
+             :headers (cons (cons "Authorization"
+                                  (format "Bearer %s" (orgist--bearer-token)))
+                            (plist-get args :headers))
+             settings))))
+
+(defun orgist--plist-without (plist keys)
+  "Return PLIST without the properties in KEYS."
+  (let (result)
+    (while plist
+      (unless (memq (car plist) keys)
+        (setq result (cons (cadr plist) (cons (car plist) result))))
+      (setq plist (cddr plist)))
+    (nreverse result)))
+
 ;;; Auto-pull
 
 (defun orgist--auto-pull-due-p ()
@@ -874,9 +988,8 @@ errors (curl SSL, timeout, HTTP 429/5xx) are retried up to
                           (insert-file-contents orgist-sync-token-filename)
                           (buffer-string))
                       "*")))
-    (request
-      "https://api.todoist.com/api/v1/sync"
-      :headers `(("Authorization" . ,(format "Bearer %s" orgist-bearer-token)))
+    (orgist-remote
+      'sync
       :data `(("sync_token" . ,sync-token)
               ("resource_types" . "[\"projects\", \"sections\", \"items\", \"labels\", \"reminders\", \"collaborators\", \"user\", \"user_plan_limits\"]"))
       :parser 'json-read
@@ -1053,9 +1166,7 @@ PLIST is a property list with these keys:
                         (file-name-directory f)))
          (review-dir (when-let* ((f (symbol-file 'org-sync-confirm-show)))
                        (file-name-directory f)))
-         (token (if (functionp orgist-bearer-token)
-                    (funcall orgist-bearer-token)
-                  orgist-bearer-token))
+         (token (orgist--bearer-token))
          (dep-paths (seq-filter
                      (lambda (p)
                        (or (string-match-p "/request" p)
@@ -1111,6 +1222,7 @@ PLIST is a property list with these keys:
                      (setq orgist-log-file nil)
                      (setq orgist-log-level ',orgist-log-level)
                      (setq orgist-bearer-token ,token)
+                     (setq orgist-read-only ,orgist-read-only)
                      (setq orgist-tag ,orgist-tag)
                      (setq orgist-treat-priority-4-as-none
                            ,orgist-treat-priority-4-as-none)
@@ -2013,9 +2125,9 @@ only sent for labels that genuinely don't exist — a code 54
 \"already exists\" failure then remains a real error signal.
 Returns non-nil on success, nil on request failure."
   (let ((fetched nil))
-    (orgist--request-with-retry
-      "https://api.todoist.com/api/v1/sync"
-      :headers `(("Authorization" . ,(format "Bearer %s" orgist-bearer-token)))
+    (orgist-remote
+      'sync
+      :retry t
       :data '(("sync_token" . "*")
               ("resource_types" . "[\"labels\"]"))
       :parser 'json-read
@@ -6485,9 +6597,10 @@ string, TODO state, and LAST_REPEAT so the buffer reflects
 Todoist's authoritative next occurrence."
   (dolist (id item-ids)
     (let ((task nil))
-      (orgist--request-with-retry
-        (format "https://api.todoist.com/api/v1/tasks/%s" id)
-        :headers `(("Authorization" . ,(format "Bearer %s" orgist-bearer-token)))
+      (orgist-remote
+        'get-task
+        :path (list id)
+        :retry t
         :parser 'json-read
         :sync t
         :error (cl-function
@@ -6947,10 +7060,10 @@ token would advance the read cursor past remote changes that Orgist has not
 downloaded or applied."
   (let* ((json-commands (json-encode (vconcat commands)))
          (response nil))
-    (orgist--request-with-retry
-      "https://api.todoist.com/api/v1/sync"
-      :headers `(("Authorization" . ,(format "Bearer %s" orgist-bearer-token))
-                 ("Connection" . "close"))
+    (orgist-remote
+      'commands
+      :retry t
+      :headers '(("Connection" . "close"))
       :data `(("commands" . ,json-commands))
       :parser 'json-read
       :sync t
@@ -7096,9 +7209,10 @@ SUCCEEDED and FAILED are the respective command counts."
 (defun orgist--fetch-task-description (id)
   "Return Todoist's current description of task ID, or nil on failure."
   (let ((result nil))
-    (orgist--request-with-retry
-     (format "https://api.todoist.com/api/v1/tasks/%s" id)
-     :headers `(("Authorization" . ,(format "Bearer %s" orgist-bearer-token)))
+    (orgist-remote
+     'get-task
+     :path (list id)
+     :retry t
      :parser 'json-read
      :sync t
      :timeout orgist-write-back-timeout
@@ -7167,6 +7281,9 @@ synchronously and the caller is responsible for continuing."
   (cond
    ((not orgist-enable-write-back)
     (orgist-log 'debug "Write-back disabled, skipping"))
+   ;; Before change detection, which binds new headings to temporary IDs.
+   (orgist-read-only
+    (orgist-log 'info "Read-only, skipping write-back"))
    (t
     (orgist-load-snapshots)
     (if (= (hash-table-count orgist-snapshots) 0)
@@ -7357,9 +7474,9 @@ Caches the result in `orgist-plan-limits'.  Returns the alist.
 Key fields: `activity_log' (boolean), `activity_log_limit' (integer)."
   (or orgist-plan-limits
       (progn
-        (orgist--request-with-retry
-          "https://api.todoist.com/api/v1/sync"
-          :headers `(("Authorization" . ,(format "Bearer %s" orgist-bearer-token)))
+        (orgist-remote
+          'sync
+          :retry t
           :data `(("sync_token" . "*")
                   ("resource_types" . "[\"user_plan_limits\"]"))
           :parser 'json-read
@@ -7400,11 +7517,9 @@ Paginates via cursor.  Returns a flat list of section alists."
             (params `(("project_id" . ,project-id))))
         (when cursor
           (push (cons "cursor" cursor) params))
-        (orgist--request-with-retry
-          "https://api.todoist.com/api/v1/sections/archived"
-          :type "GET"
-          :headers `(("Authorization"
-                      . ,(format "Bearer %s" orgist-bearer-token)))
+        (orgist-remote
+          'archived-sections
+          :retry t
           :params params
           :parser 'json-read
           :sync t
@@ -7473,10 +7588,9 @@ Paginates via cursor."
           (push (cons "project_id" project-id) params))
         (when cursor
           (push (cons "cursor" cursor) params))
-        (orgist--request-with-retry
-          "https://api.todoist.com/api/v1/tasks/completed/by_completion_date"
-          :type "GET"
-          :headers `(("Authorization" . ,(format "Bearer %s" orgist-bearer-token)))
+        (orgist-remote
+          'completed-tasks
+          :retry t
           :params params
           :parser 'json-read
           :sync t
@@ -7748,9 +7862,10 @@ Returns a list of comment alists, or nil on error.
 HTTP 403/404/410 are treated as empty (task gone or inaccessible).
 Retries automatically on HTTP 429 rate limiting."
   (let ((result nil))
-    (orgist--request-with-retry
-      (format "https://api.todoist.com/api/v1/comments?task_id=%s" task-id)
-      :headers `(("Authorization" . ,(format "Bearer %s" orgist-bearer-token)))
+    (orgist-remote
+      'comments
+      :retry t
+      :params `(("task_id" . ,task-id))
       :parser 'json-read
       :sync t
       :error (cl-function
@@ -7790,9 +7905,9 @@ Only returns completed/uncompleted events (state changes)."
                       ("limit" . ,(number-to-string limit)))))
         (when cursor
           (push (cons "cursor" cursor) params))
-        (orgist--request-with-retry
-          "https://api.todoist.com/api/v1/activities"
-          :headers `(("Authorization" . ,(format "Bearer %s" orgist-bearer-token)))
+        (orgist-remote
+          'activities
+          :retry t
           :params params
           :parser 'json-read
           :sync t
@@ -7995,7 +8110,7 @@ Uses `url-copy-file' for simplicity.
 Returns DEST-PATH on success, nil on error."
   (condition-case err
       (progn
-        (url-copy-file url dest-path t)
+        (orgist-remote 'download :url url :file dest-path)
         dest-path)
     (error
      (orgist-log 'warn "Failed to download %s: %s" url (error-message-string err))
@@ -8007,10 +8122,9 @@ Returns the file attachment alist (file_url, file_name, file_type, file_size)
 on success, or nil on error."
   (let ((result nil)
         (file-name (file-name-nondirectory file-path)))
-    (orgist--request-with-retry
-      "https://api.todoist.com/api/v1/uploads"
-      :type "POST"
-      :headers `(("Authorization" . ,(format "Bearer %s" orgist-bearer-token)))
+    (orgist-remote
+      'upload
+      :retry t
       :files `(("file" . ,file-path))
       :parser 'json-read
       :sync t
@@ -8028,11 +8142,10 @@ on success, or nil on error."
 ATTACHMENT-META is the alist returned by `orgist-upload-file'.
 Returns the created comment alist, or nil on error."
   (let ((result nil))
-    (orgist--request-with-retry
-      "https://api.todoist.com/api/v1/comments"
-      :type "POST"
-      :headers `(("Authorization" . ,(format "Bearer %s" orgist-bearer-token))
-                 ("Content-Type" . "application/json"))
+    (orgist-remote
+      'add-comment
+      :retry t
+      :headers '(("Content-Type" . "application/json"))
       :data (json-encode
              `((task_id . ,task-id)
                (content . ,(or (alist-get 'file_name attachment-meta) ""))
@@ -8056,10 +8169,10 @@ Returns the created comment alist, or nil on error."
   "Delete a Todoist comment by COMMENT-ID.
 Returns non-nil on success."
   (let ((ok nil))
-    (orgist--request-with-retry
-      (format "https://api.todoist.com/api/v1/comments/%s" comment-id)
-      :type "DELETE"
-      :headers `(("Authorization" . ,(format "Bearer %s" orgist-bearer-token)))
+    (orgist-remote
+      'delete-comment
+      :path (list comment-id)
+      :retry t
       :sync t
       :error (cl-function
               (lambda (&key data error-thrown &allow-other-keys)
@@ -8175,11 +8288,10 @@ Point must be on the heading."
   "Create a metadata comment on TASK-ID with CONTENT.
 Returns the created comment alist, or nil on error."
   (let ((result nil))
-    (orgist--request-with-retry
-      "https://api.todoist.com/api/v1/comments"
-      :type "POST"
-      :headers `(("Authorization" . ,(format "Bearer %s" orgist-bearer-token))
-                 ("Content-Type" . "application/json"))
+    (orgist-remote
+      'add-comment
+      :retry t
+      :headers '(("Content-Type" . "application/json"))
       :data (json-encode `((task_id . ,task-id) (content . ,content)))
       :parser 'json-read
       :sync t
@@ -8196,11 +8308,11 @@ Returns the created comment alist, or nil on error."
   "Update metadata comment COMMENT-ID with CONTENT.
 Returns non-nil on success."
   (let ((ok nil))
-    (orgist--request-with-retry
-      (format "https://api.todoist.com/api/v1/comments/%s" comment-id)
-      :type "POST"
-      :headers `(("Authorization" . ,(format "Bearer %s" orgist-bearer-token))
-                 ("Content-Type" . "application/json"))
+    (orgist-remote
+      'update-comment
+      :path (list comment-id)
+      :retry t
+      :headers '(("Content-Type" . "application/json"))
       :data (json-encode `((content . ,content)))
       :parser 'json-read
       :sync t
@@ -8479,9 +8591,9 @@ that haven't been pulled yet.  When FORCE is non-nil (manual
   "Fetch comments for PROJECT-ID from the Todoist API.
 Returns a list of comment alists, or nil on error."
   (let ((result nil))
-    (request
-      (format "https://api.todoist.com/api/v1/comments?project_id=%s" project-id)
-      :headers `(("Authorization" . ,(format "Bearer %s" orgist-bearer-token)))
+    (orgist-remote
+      'comments
+      :params `(("project_id" . ,project-id))
       :parser 'json-read
       :sync t
       :error (cl-function
@@ -8681,15 +8793,11 @@ pull the result into the appropriate org buffer."
   (interactive "sQuick add: ")
   (when (string-empty-p (string-trim text))
     (user-error "Task text cannot be empty"))
-  (let ((result nil)
-        (token (if (functionp orgist-bearer-token)
-                   (funcall orgist-bearer-token)
-                 orgist-bearer-token)))
-    (request
-      "https://api.todoist.com/api/v1/tasks/quick"
-      :type "POST"
-      :headers `(("Authorization" . ,(format "Bearer %s" token))
-                 ("Content-Type" . "application/json"))
+  (let ((result nil))
+    ;; Never retried: a retry after a timeout could create the task twice.
+    (orgist-remote
+      'quick-add
+      :headers '(("Content-Type" . "application/json"))
       :data (json-encode `((text . ,text)
                            (meta . t)
                            (auto_reminder . t)))
