@@ -20,6 +20,7 @@
 
 ;; Load orgist from current directory
 (add-to-list 'load-path default-directory)
+(require 'test-isolation)
 (require 'orgist)
 
 ;; Set bearer token from env, falling back to `pass`

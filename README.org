@@ -407,6 +407,7 @@ commands with a =project_id= target.
 | =test-attachments-live.el= | Live attachment CRUD test (needs token)        |
 | =test-writeback-live.el= | Live write-back round trips on Orgtest (needs token) |
 | =test-*.el= (others) | Standalone ERT regression suites (=./test-run.sh ert=) |
+| =test-isolation.el= | Sandboxes =user-emacs-directory= for every test run |
 | =test-data/=        | Shared cached API responses (committed)              |
 | =screenshots/=      | Synthetic Org, Todoist, and confirmation views      |
 

@@ -8,6 +8,7 @@
 ;; not explain.
 
 (add-to-list 'load-path default-directory)
+(require 'test-isolation)
 (require 'ert)
 (require 'cl-lib)
 (require 'org-sync-safety)

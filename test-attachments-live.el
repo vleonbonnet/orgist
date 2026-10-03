@@ -14,6 +14,7 @@
   (when (file-directory-p (expand-file-name dir))
     (add-to-list 'load-path (expand-file-name dir))))
 (add-to-list 'load-path default-directory)
+(require 'test-isolation)
 (let ((script-dir (file-name-directory (or load-file-name buffer-file-name))))
   (load (expand-file-name "orgist.el" script-dir) nil nil t))
 (require 'json)

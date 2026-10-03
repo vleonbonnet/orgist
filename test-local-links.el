@@ -7,6 +7,7 @@
   (when (file-directory-p (expand-file-name dir))
     (add-to-list 'load-path (expand-file-name dir))))
 (add-to-list 'load-path (file-name-directory (or load-file-name buffer-file-name)))
+(require 'test-isolation)
 (require 'ert)
 (require 'orgist)
 (setq orgist-log-file nil)

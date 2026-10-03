@@ -19,6 +19,7 @@
   (when (file-directory-p (expand-file-name dir))
     (add-to-list 'load-path (expand-file-name dir))))
 (add-to-list 'load-path default-directory)
+(require 'test-isolation)
 (require 'orgist)
 (require 'cl-lib)
 (require 'json)

@@ -48,6 +48,7 @@ Never run orgist batch code against the real `orgist-base-dir`: in batch, write-
 - `test-description-subtree.el` — ERT regression tests for task descriptions (non-task child headings travel in the description; unchanged descriptions keep the org body; nested tasks are never deleted)
 - `test-safety.el` — ERT tests for `org-sync-safety` (history backends, journal, trash, guards)
 - `test-safety-orgist.el` — ERT tests for orgist's safety net (journaled deletions, sub-project deletion, rollback on smear or lost element, user hooks exempt, safe reset, journal restore)
+- `test-isolation.el` — Required first by every test file: sandboxes `user-emacs-directory`, so orgist defaults, org-id and org-persist never write into `~/.emacs.d`
 - `test-capture.el` — Batch-output capture shim (works around the Emacs 30.2 Windows `--batch` stderr bug; see `test-run.sh`)
 - `test-data/` — Shared cached API responses (`full-sync.json`, `incremental-sync.json`)
 - `test-data-move/` — Synthetic fixture for the cross-project `move` test (invented projects/tasks, no live data)
