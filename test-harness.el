@@ -1134,6 +1134,94 @@ temp dir containing only orgist.el (no orgist-confirm.el)."
 ;;; E2. Subprocess incremental sync test
 ;;; -----------------------------------------------------------
 
+(defun orgist-test-run-sole-writer-race ()
+  "An edit made while a background sync runs is kept, and the sync deferred.
+With `orgist-sole-writer', the subprocess works on a staged copy: the
+buffer edited meanwhile keeps the edit and does not get the sync's
+change, its snapshots and the sync token stay, and the next sync
+applies the change to the edited buffer."
+  (setq orgist-test--failures 0)
+  (setq orgist-test--passes 0)
+  (message "")
+  (message "========================================")
+  (message "=== Sole writer: edit during a background sync ===")
+  (message "========================================")
+  (orgist-test-setup-isolation "Orgtest")
+  (let* ((orgist-sole-writer t)
+         (json-object-type 'alist)
+         (json-array-type 'vector)
+         (json-key-type 'symbol)
+         (data (json-read-file (expand-file-name "full-sync.json" orgist-test-cache-dir)))
+         (filter-ids (orgist-resolve-project-filter (alist-get 'projects data)))
+         (in-project (lambda (key) (lambda (e) (member (alist-get key e) filter-ids))))
+         (projects (seq-filter (funcall in-project 'id) (alist-get 'projects data)))
+         (sections (seq-filter (funcall in-project 'project_id) (alist-get 'sections data)))
+         (items (seq-filter (funcall in-project 'project_id) (alist-get 'items data))))
+    ;; Phase 1: the project as a previous sync left it.
+    (let ((inhibit-redisplay t)
+          (orgist--batch-save-pending (make-hash-table :test 'eq)))
+      (orgist-update-projects (orgist-sort-hierarchically projects))
+      (orgist-update-elements sections 'section)
+      (orgist-update-elements (orgist-sort-hierarchically items) 'item)
+      (orgist--flush-pending-saves)
+      (orgist-save-snapshots))
+    (orgist-save-sync-token "token-before")
+    (let* ((item (seq-find (lambda (i) (alist-get 'content i)) items))
+           (id (alist-get 'id item))
+           (old-title (plist-get (gethash id orgist-snapshots) :content))
+           (renamed (cons '(content . "Renamed by Todoist")
+                          (assq-delete-all 'content (copy-sequence item))))
+           (file (expand-file-name "Orgtest.org" orgist-base-dir))
+           (buffer (find-file-noselect file)))
+      ;; Phase 2: a background sync renames the task; the user types.
+      (orgist--subprocess-pull `((sync_token . "token-after")
+                                 (projects . []) (sections . [])
+                                 (items . ,(vector renamed))))
+      (with-current-buffer buffer
+        (goto-char (point-max))
+        (insert "* Typed during the sync\n"))
+      (let ((proc (get-process "orgist-sync"))
+            (waited 0))
+        (while (and proc (process-live-p proc) (< waited 120))
+          (accept-process-output proc 1)
+          (setq waited (1+ waited)))
+        (accept-process-output nil 0.5))
+      ;; Phase 3: the edit stands, the sync is deferred.
+      (with-current-buffer buffer
+        (orgist-test-assert (string-match-p "Typed during the sync" (buffer-string))
+                            "The edit made during the sync is still in the buffer")
+        (orgist-test-assert (buffer-modified-p) "The edited buffer was not saved behind the user")
+        (orgist-test-assert (not (string-match-p "Renamed by Todoist" (buffer-string)))
+                            "The sync's change waits for the next sync"))
+      (let ((on-disk (with-temp-buffer (insert-file-contents file) (buffer-string))))
+        (orgist-test-assert (not (string-match-p "Renamed by Todoist\\|Typed during" on-disk))
+                            "The file on disk was not written behind the user"))
+      (orgist-test-assert-equal "token-before"
+                                (with-temp-buffer
+                                  (insert-file-contents orgist-sync-token-filename)
+                                  (string-trim (buffer-string)))
+                                "The sync token stays, so the change is fetched again")
+      (orgist-test-assert-equal old-title (plist-get (gethash id orgist-snapshots) :content)
+                                "The deferred task's snapshot is unchanged")
+      (orgist-test-assert (not (file-directory-p
+                                (expand-file-name "staging" (orgist--safety-directory))))
+                          "The staging copy is gone")
+      ;; Phase 4: the next sync applies the change to the edited buffer.
+      (let ((orgist--batch-save-pending (make-hash-table :test 'eq)))
+        (orgist--apply-pull nil nil (list renamed))
+        (orgist--flush-pending-saves))
+      (with-current-buffer buffer
+        (orgist-test-assert (and (string-match-p "Renamed by Todoist" (buffer-string))
+                                 (string-match-p "Typed during the sync" (buffer-string)))
+                            "The next sync lands its change next to the edit"))
+      (orgist-test-assert-equal "Renamed by Todoist"
+                                (plist-get (gethash id orgist-snapshots) :content)
+                                "The snapshot follows once the change is applied")))
+  (message "")
+  (message "=== Results: Sole writer race ===")
+  (message "=== Passed: %d  Failed: %d ===" orgist-test--passes orgist-test--failures)
+  orgist-test--failures)
+
 (defun orgist-test-run-subprocess-incremental ()
   "Test that subprocess sync handles incremental data (items only).
 Simulates the real-world scenario where an incremental API
@@ -5932,6 +6020,12 @@ CLOSED: [2026-03-17 Tue 12:43]
      (setq orgist-test-record-mode 'replay)
      (setq total-failures (+ (orgist-test-run-subprocess)
                               (orgist-test-run-subprocess-incremental))))
+    ("sole-writer"
+     (setq orgist-test-record-mode 'replay)
+     (let ((orgist-sole-writer t))
+       (setq total-failures (+ (orgist-test-run-subprocess)
+                                (orgist-test-run-subprocess-incremental)
+                                (orgist-test-run-sole-writer-race)))))
     ("format"
      (setq total-failures (orgist-test-run-formatting)))
     ("comments"

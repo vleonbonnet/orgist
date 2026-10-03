@@ -338,5 +338,140 @@ Detection binds new headings to temporary IDs, which already edits files."
             (should (multibyte-string-p (plist-get (cdar delta) :content)))))
       (delete-directory dir t))))
 
+;;; Sole writer
+;;
+;; A background sync used to save project files behind Emacs: a buffer
+;; edited while it ran later overwrote its result, and a file saved
+;; meanwhile was overwritten by it.  With `orgist-sole-writer' the
+;; subprocess works on a staged copy, and Emacs takes over only what
+;; nobody touched; a file edited meanwhile is deferred to the next sync.
+
+(defmacro orgist-test--with-staging (files &rest body)
+  "Run BODY with FILES in `orgist-base-dir', staged as `orgist-sole-writer' does.
+Binds STAGING to the staging, and DIR to its directory."
+  (declare (indent 1))
+  `(orgist-test--with-files ,files
+     (let* ((orgist-log-file nil)
+            (orgist-history-directory nil)
+            (orgist-sync-token-filename (expand-file-name "sync_token" orgist-base-dir))
+            (orgist-snapshot-file (expand-file-name "snapshots.el" orgist-base-dir))
+            (orgist-labels-file (expand-file-name "labels.el" orgist-base-dir))
+            (staging (orgist--stage-project-files "test"))
+            (dir (car staging)))
+       ,@body)))
+
+(defun orgist-test--append-to (file text)
+  "Append TEXT to FILE on disk."
+  (write-region text nil file t 'silent))
+
+(defun orgist-test--file-string (file)
+  (with-temp-buffer (insert-file-contents file) (buffer-string)))
+
+(ert-deftest orgist-seams/sole-writer-takes-over-untouched-files-only ()
+  "A file nobody touched takes the sync's result; edited or saved ones are deferred."
+  (orgist-test--with-staging `(("A.org" . ,(orgist-test--project "PA" "TA"))
+                               ("B.org" . ,(orgist-test--project "PB" "TB"))
+                               ("C.org" . ,(orgist-test--project "PC" "TC"))
+                               ("sync_token" . "old-token"))
+    (let ((a (find-file-noselect (expand-file-name "A.org" orgist-base-dir)))
+          (b (find-file-noselect (expand-file-name "B.org" orgist-base-dir))))
+      ;; The subprocess changes all three and advances the token.
+      (dolist (name '("A.org" "B.org" "C.org"))
+        (orgist-test--append-to (expand-file-name name dir) "* TODO Pulled\n"))
+      (with-temp-file (expand-file-name "sync_token" dir) (insert "new-token"))
+      ;; Meanwhile B is edited, C is saved by someone else.
+      (with-current-buffer b (goto-char (point-max)) (insert "Typed\n"))
+      (orgist-test--append-to (expand-file-name "C.org" orgist-base-dir) "Saved meanwhile\n")
+      (let ((deferred-ids (orgist--finish-staged-run "test" staging)))
+        ;; A: taken over, buffer refreshed and saved.
+        (with-current-buffer a
+          (should (string-match-p "Pulled" (buffer-string)))
+          (should-not (buffer-modified-p)))
+        (should (string-match-p "Pulled" (orgist-test--file-string
+                                          (expand-file-name "A.org" orgist-base-dir))))
+        ;; B: the edit stays, the sync's change waits.
+        (with-current-buffer b
+          (should (string-match-p "Typed" (buffer-string)))
+          (should-not (string-match-p "Pulled" (buffer-string))))
+        (should-not (string-match-p "Pulled" (orgist-test--file-string
+                                              (expand-file-name "B.org" orgist-base-dir))))
+        ;; C: the save stays.
+        (let ((c (orgist-test--file-string (expand-file-name "C.org" orgist-base-dir))))
+          (should (string-match-p "Saved meanwhile" c))
+          (should-not (string-match-p "Pulled" c)))
+        ;; The deferred files' elements keep their snapshots, and the
+        ;; token stays so the next sync fetches their changes again.
+        (dolist (id '("PB" "TB" "PC" "TC"))
+          (should (gethash id deferred-ids)))
+        (should-not (gethash "TA" deferred-ids))
+        (should (equal (orgist-test--file-string orgist-sync-token-filename) "old-token"))
+        (should-not (file-directory-p dir))))))
+
+(ert-deftest orgist-seams/sole-writer-commits-state-without-deferral ()
+  "With every file taken over, the advanced sync token is taken over too."
+  (orgist-test--with-staging `(("A.org" . ,(orgist-test--project "PA" "TA"))
+                               ("sync_token" . "old-token"))
+    (orgist-test--append-to (expand-file-name "A.org" dir) "* TODO Pulled\n")
+    (with-temp-file (expand-file-name "sync_token" dir) (insert "new-token"))
+    (should (= (hash-table-count (orgist--finish-staged-run "test" staging)) 0))
+    (should (equal (orgist-test--file-string orgist-sync-token-filename) "new-token"))))
+
+(ert-deftest orgist-seams/sole-writer-creates-removes-and-renames ()
+  "New, removed and renamed project files are mirrored; an open buffer follows a rename."
+  (orgist-test--with-staging `(("A.org" . ,(orgist-test--project "PA" "TA"))
+                               ("B.org" . ,(orgist-test--project "PB" "TB")))
+    (let ((a (find-file-noselect (expand-file-name "A.org" orgist-base-dir)))
+          (b (find-file-noselect (expand-file-name "B.org" orgist-base-dir))))
+      (ignore a)
+      ;; The subprocess trashes A, renames B to Renamed, creates D.
+      (delete-file (expand-file-name "A.org" dir))
+      (rename-file (expand-file-name "B.org" dir) (expand-file-name "Renamed.org" dir))
+      (orgist-test--append-to (expand-file-name "Renamed.org" dir) "* TODO After rename\n")
+      (with-temp-file (expand-file-name "D.org" dir) (insert (orgist-test--project "PD" "TD")))
+      (orgist--finish-staged-run "test" staging)
+      (should-not (file-exists-p (expand-file-name "A.org" orgist-base-dir)))
+      (should (directory-files-recursively (orgist--trash-directory) "\\`A\\.org\\'"))
+      (should-not (orgist-test--visited-p "A.org"))
+      (should-not (file-exists-p (expand-file-name "B.org" orgist-base-dir)))
+      (should (file-exists-p (expand-file-name "Renamed.org" orgist-base-dir)))
+      (with-current-buffer b
+        (should (equal (file-name-nondirectory (buffer-file-name)) "Renamed.org"))
+        (should (string-match-p "After rename" (buffer-string)))
+        (should-not (buffer-modified-p)))
+      (should (file-exists-p (expand-file-name "D.org" orgist-base-dir))))))
+
+(ert-deftest orgist-seams/element-ids-do-not-depend-on-the-current-buffer ()
+  "IDs read from file text stop at the line end whatever buffer is current.
+A process sentinel runs in whatever buffer is current; in an
+Emacs-Lisp buffer a newline is not whitespace, and the IDs of a
+deferred file ran on into the next line and matched no snapshot."
+  (let ((text (orgist-test--project "PA" "TA")))
+    (with-temp-buffer
+      (emacs-lisp-mode)
+      (should (equal (sort (orgist--text-element-ids text) #'string<) '("PA" "TA")))
+      (should (equal (orgist--text-project-id text) "PA")))))
+
+(ert-deftest orgist-seams/sole-writer-keeps-line-ends ()
+  "Staging and taking over keep a file's CRLF line ends."
+  (orgist-test--with-files '(("A.org" . ""))
+    (let ((file (expand-file-name "A.org" orgist-base-dir)))
+      (let ((coding-system-for-write 'utf-8-dos))
+        (write-region (orgist-test--project "PA" "TA") nil file nil 'silent))
+      (let* ((orgist-log-file nil)
+             (orgist-history-directory nil)
+             (staging (orgist--stage-project-files "test"))
+             (staged (expand-file-name "A.org" (car staging))))
+        (with-current-buffer (find-file-noselect staged)
+          (goto-char (point-max))
+          (insert "* TODO Pulled\n")
+          (save-buffer)
+          (kill-buffer))
+        (orgist--finish-staged-run "test" staging)
+        (with-temp-buffer
+          (set-buffer-multibyte nil)
+          (insert-file-contents-literally file)
+          (should (string-match-p "Pulled\r\n" (buffer-string)))
+          (should-not (string-match-p "[^\r]\n" (buffer-string))))))))
+
 (provide 'test-seams)
 ;;; test-seams.el ends here

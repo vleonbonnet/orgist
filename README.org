@@ -80,6 +80,7 @@ All settings live in the =orgist= customize group.
 | =orgist-enable-write-back=        | ='ask=                         | Write-back mode: =nil=, =t=, or ='ask=              |
 | =orgist-write-back-dry-run=       | =t=                            | Log write-back commands without API calls     |
 | =orgist-read-only=                | =nil=                          | Refuse every remote write; pulls still work   |
+| =orgist-sole-writer=              | =nil=                          | Background syncs never write files (experimental) |
 | =orgist-treat-priority-4-as-none= | =t=                            | Map Todoist p4 to no org priority             |
 | =orgist-sync-on-save=             | =t=                            | Write-back on =C-x C-s= (after-save hook)      |
 | =orgist-auto-pull-interval=       | =300=                          | Auto-pull every N seconds (=nil= to disable)    |
@@ -336,6 +337,7 @@ Syncs rewrite files you also edit.  Implemented in =org-sync-safety.el=, a libra
 - *Journal.*  Text a pull removes is appended verbatim to =.history/journal.org=, with what removed it and why: a task or sub-project deleted in Todoist, a description replaced from Todoist, a stale copy left by a cross-project move, a project file removed.  =M-x orgist-journal-restore= on an entry puts a removed task back under its former parent without its Todoist binding, so the next write-back offers to create it again.
 - *Trash.*  Files a sync removes (a deleted project's file, attachments of deleted comments) move to =.history/trash/= instead of being deleted.
 - *Guards.*  A task update may only change that task's own subtree; changes made by your Org hooks during the update, such as an org-edna trigger completing the next task, are exempt.  When the pull is done, every element present before must still exist unless Todoist deleted it, no element may appear twice, and no file may lose most of its content.  On a violation, or any error, the project buffers return to their state before the pull (unsaved edits included), nothing is saved, and the sync token is not advanced: the next pull retries from the same point, and the error says what went wrong.
+- *Background syncs.*  Large pulls, completed tasks and comments run in a background Emacs, which saves the project files itself: a file you edit while one runs can lose either your edit or the sync's changes.  With =orgist-sole-writer= (experimental), the background Emacs works on a staged copy instead, and Emacs takes over its result for each file nobody touched meanwhile.  A file you edited or saved during the sync keeps your text and gets that sync's changes from the next one: its snapshots and the sync cursors are not advanced.  Each run logs what it took over, what it deferred and how long Emacs was busy (=took over N file(s) in 0.05s=).  Its snapshot changes are merged field by field in either mode, so a write-back made during a background sync keeps its own.
 - *Reset.*  =M-x orgist-reset= moves the project files, state, logs and attachments to a dated folder under =.history/= and syncs afresh; nothing is deleted.  It refuses a base directory that is your home, under version control, holds an =.org= file orgist did not create, or has a project buffer with unsaved changes.
 
 ** Labels
@@ -423,6 +425,7 @@ commands with a =project_id= target.
 | Formatting        | =./test-run.sh format=            |    95 | Spacing, write-back, new/delete/move |
 | Comments          | =./test-run.sh comments=          |    17 | Comment pull, dedup, note push       |
 | Subprocess        | =./test-run.sh subprocess=        |    12 | Full + incremental subprocess sync   |
+| Sole writer       | =./test-run.sh sole-writer=       |    21 | Subprocess syncs on a staged copy; edit during a sync |
 | Cross-project     | =./test-run.sh move=              |    11 | Cross-project task moves             |
 | State log         | =./test-run.sh state-log=         |    12 | Completion timestamps, reopen, repeats |
 | Archived          | =./test-run.sh archived=          |    21 | Archived sections, order sync        |
@@ -430,7 +433,7 @@ commands with a =project_id= target.
 | Metadata          | =./test-run.sh metadata=          |    18 | Non-Todoist property preservation    |
 | New features      | =./test-run.sh features=          |   100 | Timezone, duration, labels, etc.     |
 | Attachments       | =./test-run.sh attachments=       |    52 | ATTACH tag, pull/push, diff, confirm |
-| ERT regression    | =./test-run.sh ert=               |   113 | Identity, ordering, spacing, log notes, guards, review, seams |
+| ERT regression    | =./test-run.sh ert=               |   123 | Identity, ordering, spacing, log notes, guards, review, seams |
 | Live write-back   | =./test-run.sh live-writeback=    |    27 | Real API identity, description and safety-net round trips (needs token) |
 | Live attachments  | =./test-run.sh live-attachments=  |    19 | Real API attachment CRUD (needs token) |
 

@@ -1185,6 +1185,251 @@ into a backquoted subprocess program with `,@'."
                 org-todo-keywords
               '((sequence "TODO" "DONE"))))))
 
+;;; Sole writer
+
+;; Background subprocesses (a large pull, completed tasks, comments)
+;; used to save the project files themselves, behind Emacs: a buffer
+;; edited while one ran overwrote its result on save, and a file saved
+;; meanwhile was overwritten by it.  With `orgist-sole-writer', a
+;; subprocess works on a staged copy, and Emacs compares each file's
+;; copy, the subprocess's result and the live buffer or file.  A file
+;; nobody touched takes the result; one edited meanwhile is deferred:
+;; left as it is, with its snapshot changes dropped and the sync
+;; cursors held back, so the next sync redoes its changes.  Emacs never
+;; re-applies a sync itself, which keeps it responsive.
+
+(defcustom orgist-sole-writer nil
+  "When non-nil, background syncs never write project files themselves.
+They work on a staged copy, and Emacs takes over the changes to the
+files nobody edited during the sync; the others get their changes
+from the next sync.  The log reports what was taken over, what was
+deferred and how long Emacs was busy.  Experimental: when nil,
+background syncs save the files directly, and a file edited or saved
+while one runs can lose either the edits or the sync's changes."
+  :group 'orgist
+  :type 'boolean)
+
+(defun orgist--state-files ()
+  "Return the state files a subprocess may update, as (FILE . STAGED-NAME).
+In a staging directory each lives under STAGED-NAME.  They are taken
+over only when no project file was deferred, so a deferred change is
+fetched again.  Snapshots are merged instead (see
+`orgist--merge-snapshot-delta')."
+  `((,orgist-sync-token-filename . "sync_token")
+    (,orgist-labels-file . "labels.el")
+    (,(expand-file-name "completed_pull_timestamp" orgist-base-dir) . "completed_pull_timestamp")
+    (,(orgist--completed-retry-file) . "completed-retry.json")))
+
+(defun orgist--file-text (file)
+  "Return FILE's text as Emacs decodes it when visiting, or nil."
+  (when (file-exists-p file)
+    (with-temp-buffer
+      (insert-file-contents file)
+      (buffer-string))))
+
+(defun orgist--live-text (file)
+  "Return the current text of project FILE: its buffer's, else the file's."
+  (if-let* ((buffer (find-buffer-visiting file)))
+      (with-current-buffer buffer
+        (save-restriction
+          (widen)
+          (buffer-substring-no-properties (point-min) (point-max))))
+    (orgist--file-text file)))
+
+(defun orgist--stage-project-files (name)
+  "Copy the project and state files to a fresh staging directory for NAME.
+A project file is staged as its buffer holds it, unsaved edits
+included, as an in-process pull would see it.  Return (DIR . BASE):
+DIR is the directory, BASE an alist of each project file's name and
+text when staged."
+  (let ((dir (file-name-as-directory
+              (expand-file-name (concat "staging/" name) (orgist--safety-directory))))
+        (base nil))
+    ;; A leftover from an interrupted run holds nothing committed: its
+    ;; cursors were never taken over, so the next sync fetches again.
+    (when (file-directory-p dir)
+      (delete-directory dir t))
+    (make-directory dir t)
+    (dolist (file (orgist--project-files))
+      (let ((staged (expand-file-name (file-name-nondirectory file) dir))
+            (buffer (find-buffer-visiting file)))
+        ;; Keep the file's coding system and line ends.
+        (if (and buffer (buffer-modified-p buffer))
+            (with-current-buffer buffer
+              (let ((coding-system-for-write buffer-file-coding-system))
+                (write-region nil nil staged nil 'silent)))
+          (copy-file file staged t))
+        (push (cons (file-name-nondirectory file) (orgist--live-text file)) base)))
+    (dolist (state (cons (cons orgist-snapshot-file "snapshots.el")
+                         (orgist--state-files)))
+      (when (file-exists-p (car state))
+        (copy-file (car state) (expand-file-name (cdr state) dir) t)))
+    (cons dir (nreverse base))))
+
+(defun orgist--text-element-ids (text)
+  "Return the IDs in the property drawers of project file TEXT."
+  (let ((ids nil)
+        (start 0))
+    ;; Not \\S-: what counts as whitespace depends on the current
+    ;; buffer's syntax table.
+    (while (string-match "^[ \t]*:\\(?:TODOIST_\\)?ID:[ \t]+\\([^ \t\n]+\\)" text start)
+      (push (match-string 1 text) ids)
+      (setq start (match-end 0)))
+    ids))
+
+(defun orgist--text-project-id (text)
+  "Return the project ID in the file-level drawer of project file TEXT."
+  (when (and text
+             (string-match "\\`[ \t]*:PROPERTIES:[ \t]*\n\\(\\(?:[ \t]*:.*\n\\)*?\\)[ \t]*:END:"
+                           text))
+    (let ((drawer (match-string 1 text)))
+      (cond
+       ((string-match "^[ \t]*:TODOIST_ID:[ \t]+\\([^ \t\n]+\\)" drawer) (match-string 1 drawer))
+       ((string-match "^[ \t]*:ID:[ \t]+\\([^ \t\n]+\\)" drawer) (match-string 1 drawer))))))
+
+(defun orgist--take-staged-file (staged file &optional renamed-from)
+  "Copy STAGED over project FILE and refresh the buffer visiting it.
+With RENAMED-FROM, FILE is that file renamed, and its buffer follows."
+  (let ((buffer (find-buffer-visiting (or renamed-from file))))
+    (when renamed-from
+      (rename-file renamed-from file)
+      (when buffer
+        (with-current-buffer buffer
+          (set-visited-file-name file t t))))
+    (copy-file staged file t)
+    (when buffer
+      (with-current-buffer buffer
+        ;; As a revert does: visiting the new state, so Emacs does not
+        ;; ask whether to edit a buffer whose file changed on disk, and
+        ;; no undo entry.
+        (let ((buffer-undo-list t)
+              (inhibit-read-only t))
+          (insert-file-contents file t nil nil t))
+        (orgist-build-id-cache)
+        (org-cycle-hide-drawers 'all)))))
+
+(defun orgist--reconcile-staging (dir base)
+  "Take over the changes a subprocess made to the project files in DIR.
+BASE is the alist `orgist--stage-project-files' returned.  A file the
+subprocess changed is taken over only if its live text (buffer or
+file) is still BASE's; otherwise it is deferred.  Returns a plist:
+:taken, :created, :removed and :renamed list what was taken over,
+:deferred the deferred file names, :deferred-ids a hash set of the
+element IDs in them (before or after the subprocess), :seconds the
+time spent."
+  (let* ((start (float-time))
+         (staged-names (mapcar #'file-name-nondirectory
+                               (directory-files dir t "\\`[^.].*\\.org\\'")))
+         (base-names (mapcar #'car base))
+         (removed (seq-difference base-names staged-names))
+         (created (seq-difference staged-names base-names))
+         (renamed nil) (taken nil) (taken-created nil) (taken-removed nil)
+         (deferred nil)
+         (deferred-ids (make-hash-table :test 'equal)))
+    (cl-labels ((real (name) (expand-file-name name orgist-base-dir))
+                (staged (name) (expand-file-name name dir))
+                (unchanged-p (name)
+                  (equal (orgist--live-text (real name)) (cdr (assoc name base))))
+                (defer (&rest names)
+                  (dolist (name names)
+                    (push name deferred)
+                    (dolist (text (list (cdr (assoc name base))
+                                        (orgist--file-text (staged name))
+                                        (orgist--live-text (real name))))
+                      (when text
+                        (dolist (id (orgist--text-element-ids text))
+                          (puthash id t deferred-ids))))))
+                (take (names action)
+                  ;; A file that cannot be taken over is deferred.
+                  (condition-case err
+                      (progn (funcall action) t)
+                    (error
+                     (orgist-log 'error "Could not take over %s: %s"
+                                 (string-join names ", ") (error-message-string err))
+                     (apply #'defer names)
+                     nil))))
+      ;; A removed file and a created one with the same project: a rename.
+      (dolist (old removed)
+        (when-let* ((project (orgist--text-project-id (cdr (assoc old base))))
+                    (new (seq-find (lambda (name)
+                                     (equal project (orgist--text-project-id
+                                                     (orgist--file-text (staged name)))))
+                                   created)))
+          (setq removed (delete old removed)
+                created (delete new created))
+          (if (and (unchanged-p old) (not (file-exists-p (real new))))
+              (when (take (list old new)
+                          (lambda () (orgist--take-staged-file (staged new) (real new) (real old))))
+                (push (cons old new) renamed))
+            (defer old new))))
+      (dolist (name staged-names)
+        (when (and (assoc name base)
+                   (not (equal (orgist--file-text (staged name)) (cdr (assoc name base)))))
+          (if (unchanged-p name)
+              (when (take (list name)
+                          (lambda () (orgist--take-staged-file (staged name) (real name))))
+                (push name taken))
+            (defer name))))
+      (dolist (name created)
+        (if (or (file-exists-p (real name)) (find-buffer-visiting (real name)))
+            (defer name)
+          (when (take (list name) (lambda () (copy-file (staged name) (real name))))
+            (push name taken-created))))
+      (dolist (name removed)
+        (if (not (unchanged-p name))
+            (defer name)
+          (when (take (list name)
+                      (lambda ()
+                        (when-let* ((buffer (find-buffer-visiting (real name))))
+                          (with-current-buffer buffer (set-buffer-modified-p nil))
+                          (kill-buffer buffer))
+                        (when (file-exists-p (real name))
+                          (orgist--trash-file (real name)))))
+            (push name taken-removed)))))
+    (list :taken (nreverse taken) :created (nreverse taken-created)
+          :removed (nreverse taken-removed) :renamed (nreverse renamed)
+          :deferred (nreverse (delete-dups deferred)) :deferred-ids deferred-ids
+          :seconds (- (float-time) start))))
+
+(defun orgist--finish-staged-run (name staging)
+  "Take over what subprocess NAME did in STAGING.
+STAGING is what `orgist--stage-project-files' returned.  Takes over
+the files nobody edited meanwhile, and the state files
+when none was deferred; logs what happened and how long Emacs was
+busy.  Returns the hash set of element IDs in deferred files, whose
+snapshot changes must not be merged."
+  (let* ((dir (car staging))
+         (result (orgist--reconcile-staging dir (cdr staging)))
+         (deferred (plist-get result :deferred))
+         (count (+ (length (plist-get result :taken))
+                   (length (plist-get result :created))
+                   (length (plist-get result :removed))
+                   (length (plist-get result :renamed)))))
+    (unless deferred
+      (orgist--commit-staged-state dir))
+    (delete-directory dir t)
+    (let ((parent (file-name-directory (directory-file-name dir))))
+      (when (null (directory-files parent nil directory-files-no-dot-files-regexp))
+        (delete-directory parent)))
+    (cond
+     (deferred
+      (orgist-log 'warn "%s: took over %d file(s) in %.2fs; deferred %s, edited during the sync: its changes come with the next sync"
+                  name count (plist-get result :seconds) (string-join deferred ", ")))
+     ((> count 0)
+      (orgist-log 'info "%s: took over %d file(s) in %.2fs"
+                  name count (plist-get result :seconds)))
+     (t
+      (orgist-log 'debug "%s: no file changed (%.2fs)" name (plist-get result :seconds))))
+    (plist-get result :deferred-ids)))
+
+(defun orgist--commit-staged-state (dir)
+  "Take over the state files the subprocess changed in staging DIR."
+  (dolist (state (orgist--state-files))
+    (let ((staged (expand-file-name (cdr state) dir)))
+      (when (and (file-exists-p staged)
+                 (not (equal (orgist--file-text staged) (orgist--file-text (car state)))))
+        (copy-file staged (car state) t)))))
+
 (defun orgist--run-subprocess (plist)
   "Spawn an Emacs subprocess with shared boilerplate.
 PLIST is a property list with these keys:
@@ -1212,6 +1457,10 @@ PLIST is a property list with these keys:
          (snapshot-base (progn (orgist-load-snapshots)
                                (orgist--copy-snapshots
                                 (or orgist-snapshots (make-hash-table :test 'equal)))))
+         ;; With `orgist-sole-writer', the subprocess works on a copy.
+         (staging (when orgist-sole-writer
+                    (orgist--stage-project-files name)))
+         (staging-dir (car staging))
          ;; Resolve paths
          (emacs-path (concat invocation-directory invocation-name))
          (orgist-el-dir orgist--directory)
@@ -1279,6 +1528,19 @@ PLIST is a property list with these keys:
                      (setq orgist-tag ,orgist-tag)
                      (setq orgist-treat-priority-4-as-none
                            ,orgist-treat-priority-4-as-none)
+                     ;; Sole writer: project and state files are the
+                     ;; staged copies; attachments still go to the real
+                     ;; attachment directory.
+                     ,@(when staging-dir
+                         `((setq orgist-base-dir ,staging-dir)
+                           (setq orgist-sync-token-filename
+                                 ,(expand-file-name "sync_token" staging-dir))
+                           (setq orgist-snapshot-file
+                                 ,(expand-file-name "snapshots.el" staging-dir))
+                           (setq orgist-labels-file
+                                 ,(expand-file-name "labels.el" staging-dir))
+                           (setq org-attach-id-dir
+                                 ,(expand-file-name org-attach-id-dir orgist-base-dir))))
                      ;; Enable write-back so snapshots are recorded
                      ;; during element updates; the subprocess never
                      ;; calls orgist-write-back itself.
@@ -1351,13 +1613,23 @@ PLIST is a property list with these keys:
                       (delete-file f)))
                   (when (file-exists-p done-file)
                     (delete-file done-file))
-                  ;; Revert all orgist buffers from disk
-                  (orgist--revert-buffers-from-disk)
-                  ;; Merge the subprocess's snapshot changes
-                  (when-let* ((delta (orgist--read-snapshot-delta delta-file)))
-                    (orgist-log 'debug "%s: merged %d snapshot change(s)"
-                                name (orgist--merge-snapshot-delta delta snapshot-base))
-                    (orgist-save-snapshots))
+                  ;; Take the subprocess's file changes: from its
+                  ;; staging copy, or by reverting what it saved.
+                  (let ((deferred-ids
+                         (if staging-dir
+                             (orgist--finish-staged-run name staging)
+                           (orgist--revert-buffers-from-disk)
+                           nil)))
+                    ;; Merge the subprocess's snapshot changes, except
+                    ;; for elements of deferred files.
+                    (when-let* ((delta (orgist--read-snapshot-delta delta-file)))
+                      (when deferred-ids
+                        (setq delta (seq-remove (lambda (change)
+                                                  (gethash (car change) deferred-ids))
+                                                delta)))
+                      (orgist-log 'debug "%s: merged %d snapshot change(s)"
+                                  name (orgist--merge-snapshot-delta delta snapshot-base))
+                      (orgist-save-snapshots)))
                   (when (file-exists-p delta-file)
                     (delete-file delta-file))
                   (orgist--flush-log-buffer)
@@ -1371,6 +1643,8 @@ PLIST is a property list with these keys:
                 (dolist (f (cons delta-file data-files))
                   (when (file-exists-p f)
                     (delete-file f)))
+                (when (and staging-dir (file-directory-p staging-dir))
+                  (delete-directory staging-dir t))
                 (orgist--flush-log-buffer)
                 (if on-failure
                     (funcall on-failure event)
