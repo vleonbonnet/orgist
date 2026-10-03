@@ -1206,6 +1206,12 @@ PLIST is a property list with these keys:
          (job-body (plist-get plist :job-body))
          (on-success (plist-get plist :on-success))
          (on-failure (plist-get plist :on-failure))
+         ;; The subprocess hands back its snapshot changes here; they
+         ;; merge against the snapshots as they are now.
+         (delta-file (expand-file-name (concat name "-snapshot-delta.el") orgist-base-dir))
+         (snapshot-base (progn (orgist-load-snapshots)
+                               (orgist--copy-snapshots
+                                (or orgist-snapshots (make-hash-table :test 'equal)))))
          ;; Resolve paths
          (emacs-path (concat invocation-directory invocation-name))
          (orgist-el-dir orgist--directory)
@@ -1284,6 +1290,12 @@ PLIST is a property list with these keys:
                      ;; elements not in this batch (and retain
                      ;; comment-ids, activity-ids, etc.).
                      (orgist-load-snapshots)
+                     ;; Every snapshot save also writes the changes since
+                     ;; now to the delta file, for the parent to merge.
+                     (setq orgist--snapshot-base (orgist--copy-snapshots
+                                                  (or orgist-snapshots
+                                                      (make-hash-table :test 'equal))))
+                     (setq orgist--snapshot-delta-file ,delta-file)
                      (setq orgist-sync-mutex nil)
                      (setq revert-without-query '(".*"))
                      ;; Disable file locking — the parent Emacs may hold
@@ -1315,9 +1327,10 @@ PLIST is a property list with these keys:
                              (orgist-build-id-cache))))
                      ;; Job body
                      ,@job-body)))))
-    ;; Remove stale done-file
-    (when (file-exists-p done-file)
-      (delete-file done-file))
+    ;; Remove stale done and delta files
+    (dolist (f (list done-file delta-file))
+      (when (file-exists-p f)
+        (delete-file f)))
     (let ((process
            (make-process
             :name name
@@ -1340,8 +1353,13 @@ PLIST is a property list with these keys:
                     (delete-file done-file))
                   ;; Revert all orgist buffers from disk
                   (orgist--revert-buffers-from-disk)
-                  ;; Reload snapshots from disk
-                  (orgist-load-snapshots t)
+                  ;; Merge the subprocess's snapshot changes
+                  (when-let* ((delta (orgist--read-snapshot-delta delta-file)))
+                    (orgist-log 'debug "%s: merged %d snapshot change(s)"
+                                name (orgist--merge-snapshot-delta delta snapshot-base))
+                    (orgist-save-snapshots))
+                  (when (file-exists-p delta-file)
+                    (delete-file delta-file))
                   (orgist--flush-log-buffer)
                   ;; Call on-success
                   (when on-success
@@ -1350,7 +1368,7 @@ PLIST is a property list with these keys:
                 (orgist-log 'warn "%s subprocess failed: %s"
                             name (string-trim event))
                 ;; Clean up temp files
-                (dolist (f data-files)
+                (dolist (f (cons delta-file data-files))
                   (when (file-exists-p f)
                     (delete-file f)))
                 (orgist--flush-log-buffer)
@@ -5040,6 +5058,12 @@ and process-coding so we can see what runtime state produced it."
 Used as a safety check: if the in-memory count drops significantly
 from this value, saving is refused to prevent data loss.")
 
+(defvar orgist--snapshot-base nil
+  "In a subprocess, a copy of `orgist-snapshots' as loaded at its start.")
+
+(defvar orgist--snapshot-delta-file nil
+  "In a subprocess, the file its snapshot changes are written to.")
+
 (defun orgist-save-snapshots ()
   "Persist `orgist-snapshots' to `orgist-snapshot-file'.
 Refuses to save if the entry count dropped by more than half
@@ -5081,7 +5105,102 @@ a partially-loaded hash that would overwrite good data)."
             (insert "\n")))
         (setq orgist--snapshot-count-on-disk new-count)
         (orgist-log 'debug "Saved %d snapshots to %s"
-                    new-count orgist-snapshot-file)))))
+                    new-count orgist-snapshot-file))
+      ;; In a subprocess, also hand the changes back to the parent.
+      (when orgist--snapshot-delta-file
+        (orgist--write-snapshot-delta)))))
+
+;; A subprocess works on the snapshots it loaded at its start, while the
+;; parent may change its own (a write-back during the run).  Reloading
+;; the subprocess's file would drop those changes, so the subprocess
+;; hands back only what it changed and the parent merges it.
+
+(defun orgist--copy-snapshots (table)
+  "Return a copy of snapshot TABLE that shares no list structure with it.
+Snapshot code updates entries with `plist-put', which can modify an
+entry in place."
+  (let ((copy (make-hash-table :test 'equal :size (max 1 (hash-table-count table)))))
+    (maphash (lambda (id plist) (puthash id (copy-tree plist) copy)) table)
+    copy))
+
+(defun orgist--snapshot-delta (base current)
+  "Return the changes from snapshot table BASE to CURRENT.
+A list of (ID . FIELDS): FIELDS is a plist of the fields whose value
+changed, every field for an entry BASE lacks, or the symbol `removed'
+for an entry CURRENT lacks."
+  (let ((delta nil))
+    (maphash
+     (lambda (id plist)
+       (let ((old (gethash id base 'absent)))
+         (if (eq old 'absent)
+             (push (cons id plist) delta)
+           (let ((fields nil))
+             (cl-loop for (key value) on plist by #'cddr
+                      unless (equal value (plist-get old key))
+                      do (setq fields (plist-put fields key value)))
+             (cl-loop for (key _) on old by #'cddr
+                      unless (plist-member plist key)
+                      do (setq fields (plist-put fields key nil)))
+             (when fields
+               (push (cons id fields) delta))))))
+     current)
+    (maphash (lambda (id _)
+               (when (eq (gethash id current 'absent) 'absent)
+                 (push (cons id 'removed) delta)))
+             base)
+    delta))
+
+(defun orgist--write-snapshot-delta ()
+  "Write the changes since `orgist--snapshot-base' to the delta file."
+  (let ((delta (orgist--snapshot-delta (or orgist--snapshot-base
+                                           (make-hash-table :test 'equal))
+                                       orgist-snapshots))
+        (print-length nil)
+        (print-level nil)
+        (coding-system-for-write 'utf-8-unix))
+    (with-temp-file orgist--snapshot-delta-file
+      (prin1 delta (current-buffer)))))
+
+(defun orgist--read-snapshot-delta (file)
+  "Return the snapshot delta a subprocess wrote to FILE, or nil."
+  (when (file-exists-p file)
+    (with-temp-buffer
+      (let ((coding-system-for-read 'utf-8))
+        (insert-file-contents file))
+      (orgist--snapshot-decode-tree (ignore-errors (read (current-buffer)))))))
+
+(defun orgist--merge-snapshot-delta (delta base)
+  "Merge DELTA, a subprocess's snapshot changes, into `orgist-snapshots'.
+BASE is the copy of `orgist-snapshots' taken when the subprocess
+started.  A field takes the subprocess's value unless this Emacs
+changed it since BASE (a write-back during the run): that newer value
+stays.  An entry this Emacs removed meanwhile is not brought back, and
+one it changed meanwhile is not removed.  Returns the number of
+entries changed."
+  (let ((merged 0))
+    (dolist (change delta)
+      (let* ((id (car change))
+             (fields (cdr change))
+             (current (gethash id orgist-snapshots 'absent))
+             (before (gethash id base 'absent)))
+        (cond
+         ((eq fields 'removed)
+          (when (and (not (eq current 'absent)) (equal current before))
+            (remhash id orgist-snapshots)
+            (cl-incf merged)))
+         ((eq current 'absent)
+          (when (eq before 'absent)
+            (puthash id fields orgist-snapshots)
+            (cl-incf merged)))
+         (t
+          (let ((entry current))
+            (cl-loop for (key value) on fields by #'cddr
+                     when (or (eq before 'absent)
+                              (equal (plist-get current key) (plist-get before key)))
+                     do (setq entry (plist-put entry key value)))
+            (puthash id entry orgist-snapshots)
+            (cl-incf merged))))))
+    merged))
 
 (defun orgist--snapshot-decode-tree (val)
   "Recursively decode unibyte UTF-8 strings to multibyte in VAL.

@@ -269,5 +269,74 @@ Detection binds new headings to temporary IDs, which already edits files."
     (should (rassq 'new (orgist-test--scan-new-headings)))
     (should orgist-test--new-heading-id)))
 
+;;; Subprocess snapshot hand-back
+;;
+;; A subprocess used to save its whole snapshot table, which the parent
+;; then reloaded: a write-back during the run lost its snapshot updates
+;; and its changes diffed again.  The subprocess now hands back only the
+;; fields it changed, and the parent merges them.
+
+(defun orgist-test--table (&rest entries)
+  "A snapshot table from ENTRIES, each (ID . PLIST)."
+  (let ((table (make-hash-table :test 'equal)))
+    (dolist (entry entries)
+      (puthash (car entry) (copy-tree (cdr entry)) table))
+    table))
+
+(ert-deftest orgist-seams/snapshot-delta-names-only-changes ()
+  "The delta holds changed fields, new entries and removals."
+  (let* ((base (orgist-test--table '("A" :content "a" :due nil)
+                                   '("B" :content "b")
+                                   '("C" :content "c" :order 1)))
+         (current (orgist-test--table '("A" :content "a" :due "<2026-10-04>")
+                                      '("C" :content "c")
+                                      '("D" :content "d"))))
+    (should (equal (sort (orgist--snapshot-delta base current)
+                         (lambda (x y) (string< (car x) (car y))))
+                   '(("A" :due "<2026-10-04>")
+                     ("B" . removed)
+                     ("C" :order nil)
+                     ("D" :content "d"))))))
+
+(ert-deftest orgist-seams/snapshot-merge-keeps-changes-made-meanwhile ()
+  "A field or entry the parent changed during the run keeps the parent's value."
+  (let* ((base (orgist-test--table '("A" :content "old" :due "d1")
+                                   '("B" :content "b")
+                                   '("C" :content "c")
+                                   '("E" :content "e")))
+         ;; Meanwhile, a write-back: A's title pushed, C changed, E deleted.
+         (orgist-snapshots (orgist-test--table '("A" :content "pushed" :due "d1")
+                                               '("B" :content "b")
+                                               '("C" :content "c2")))
+         (delta '(("A" :content "pulled" :due "d2")
+                  ("B" . removed)
+                  ("C" . removed)
+                  ("E" :due "d3")
+                  ("N" :content "new"))))
+    (orgist--merge-snapshot-delta delta base)
+    ;; A: the pushed title stays, the pulled due date lands.
+    (should (equal (gethash "A" orgist-snapshots) '(:content "pushed" :due "d2")))
+    (should-not (gethash "B" orgist-snapshots))
+    (should (equal (gethash "C" orgist-snapshots) '(:content "c2")))
+    (should-not (gethash "E" orgist-snapshots))
+    (should (equal (gethash "N" orgist-snapshots) '(:content "new")))))
+
+(ert-deftest orgist-seams/snapshot-delta-survives-the-file ()
+  "A delta written by a subprocess reads back equal, with multibyte text."
+  (let* ((dir (make-temp-file "orgist-delta-" t))
+         (orgist--snapshot-delta-file (expand-file-name "delta.el" dir))
+         (orgist--snapshot-base (orgist-test--table '("A" :content "a")))
+         (orgist-snapshots (orgist-test--table '("A" :content "Café – 2 €")))
+         (orgist-snapshot-file (expand-file-name "snapshots.el" dir))
+         (orgist--snapshot-count-on-disk nil)
+         (orgist-log-file nil))
+    (unwind-protect
+        (progn
+          (orgist-save-snapshots)
+          (let ((delta (orgist--read-snapshot-delta orgist--snapshot-delta-file)))
+            (should (equal delta '(("A" :content "Café – 2 €"))))
+            (should (multibyte-string-p (plist-get (cdar delta) :content)))))
+      (delete-directory dir t))))
+
 (provide 'test-seams)
 ;;; test-seams.el ends here
