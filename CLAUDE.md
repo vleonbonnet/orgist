@@ -39,6 +39,7 @@ Orgist is an Emacs Lisp package for bidirectional sync between Todoist and Org-M
 - `test-confirm.el` — ERT regression tests for the review adapter (tree building, live remote values, partial selection)
 - `test-local-links.el` — ERT regression tests for local Org links across Markdown conversion
 - `test-element-identity.el` — ERT regression tests for element identity (a pre-existing org-id survives the push; Todoist ID in `TODOIST_ID`)
+- `test-description-subtree.el` — ERT regression tests for task descriptions (non-task child headings travel in the description; unchanged descriptions keep the org body; nested tasks are never deleted)
 - `test-capture.el` — Batch-output capture shim (works around the Emacs 30.2 Windows `--batch` stderr bug; see `test-run.sh`)
 - `test-data/` — Shared cached API responses (`full-sync.json`, `incremental-sync.json`)
 - `test-data-move/` — Synthetic fixture for the cross-project `move` test (invented projects/tasks, no live data)

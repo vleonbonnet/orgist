@@ -2093,6 +2093,26 @@ that have no body to clear)."
          (level (or (orgist-calculate-heading-level (or parent-id section-id project-id))
                     (org-current-level)
                     1))
+         (reminders (and orgist-reminders id (gethash id orgist-reminders)))
+         ;; Echo suppression: when Todoist's description and the body
+         ;; text its reminders write are unchanged since the snapshot,
+         ;; the org body already reflects them and is left alone.
+         ;; Rebuilding it from Markdown would drop what the conversion
+         ;; cannot carry — org-ids and attachment directories on
+         ;; description sub-headings, drawers, exact org markup — on
+         ;; every unrelated remote edit (a new due date, a label).
+         ;; Snapshots from before `:remote-description' existed do not
+         ;; qualify, so their first pull rebuilds the body as before.
+         (old-snap (and content id orgist-enable-write-back
+                        (progn (orgist-load-snapshots)
+                               (gethash id orgist-snapshots))))
+         (keep-description
+          (and old-snap
+               (plist-member old-snap :remote-description)
+               (orgist--same-description-p
+                (plist-get old-snap :remote-description) description)
+               (equal (plist-get old-snap :reminder-stamps)
+                      (orgist--absolute-reminder-stamps reminders))))
          ;; Pre-update state, for synthesizing reopen/repeat log entries.
          (old-state (org-get-todo-state))
          (old-scheduled (org-entry-get (point) "SCHEDULED"))
@@ -2164,13 +2184,14 @@ that have no body to clear)."
         (orgist-log 'debug "Setting deadline: %s" org-timestamp)
         (when org-timestamp
           (org-deadline nil org-timestamp))))
-    ;; Clear old body text (between meta-data/drawers and first child heading)
-    ;; Must happen before inserting log entries or description.
-    (unless skip-clear-body
+    ;; Clear the old description (body text and description
+    ;; sub-headings).  Must happen before inserting log entries or the
+    ;; new description.  Sections have no description in Todoist, so
+    ;; their body is org-only and never cleared.
+    (unless (or skip-clear-body (not content) keep-description)
       (orgist-clear-body))
     ;; Apply reminders to SCHEDULED/DEADLINE timestamps
-    (when-let* ((reminders (and orgist-reminders id
-                                (gethash id orgist-reminders))))
+    (when reminders
       (orgist-apply-reminders reminders))
     ;; Clean up any duplicate logbook entries from previous syncs.
     (orgist-deduplicate-logbook)
@@ -2239,7 +2260,8 @@ that have no body to clear)."
     ;; with argument t skips past property drawers, planning, clocks,
     ;; and bare logbook lines.  Blank-line spacing is fixed by
     ;; `orgist--normalize-body-spacing' below.
-    (when (and description (not (string-empty-p description)))
+    (when (and description (not (string-empty-p description))
+               (not keep-description))
       (orgist-log 'debug "Setting description (%d chars)" (length description))
       (save-excursion
         (org-end-of-meta-data t)
@@ -2252,7 +2274,7 @@ that have no body to clear)."
     (orgist--normalize-body-spacing)
     ;; Snapshot this element's Todoist state for write-back diffing.
     (when orgist-enable-write-back
-      (orgist-snapshot-element element))))
+      (orgist-snapshot-element element keep-description))))
 
 (defun orgist--subtree-end ()
   "Return the end of the subtree at point, validating the element cache.
@@ -2350,7 +2372,7 @@ touched."
            ((> depth 0)
             (forward-line 1))
            ((looking-at org-outline-regexp-bol)
-            (let* ((id (orgist--element-id))
+            (let* ((id (orgist--element-heading-p))
                    (id-end (and id (orgist--subtree-end))))
               (cond
                ;; Todoist child with a usable subtree end: record it as
@@ -2375,12 +2397,16 @@ touched."
       (let ((bol (car target))
             (id-p (eq (cdr target) 'id)))
         (save-excursion
-          ;; After side: one blank between the heading and its content.
-          ;; ID children keep their property drawer glued to the
-          ;; heading, so only description sub-headings get this.
+          ;; After side: one blank between the heading's metadata and
+          ;; its content.  Element children are their own updates'
+          ;; business, so only description sub-headings get this.  The
+          ;; blank goes after any planning line and property or logbook
+          ;; drawer: one between the heading and its drawer would turn
+          ;; the drawer into plain text, losing an org-id that links
+          ;; point to.
           (unless id-p
             (goto-char bol)
-            (forward-line 1)
+            (org-end-of-meta-data 'logbook)
             (when (and (< (point) subtree-end)
                        (not (looking-at "^[ \t]*$"))
                        (not (looking-at org-outline-regexp-bol)))
@@ -2504,13 +2530,91 @@ or the end of the subtree; BODY-END is exclusive.  Implements the
         (when (< body-start body-end)
           (delete-region body-start body-end))))))
 
+(defun orgist--hoist-nested-elements ()
+  "Move element subtrees nested under description headings up to the task.
+Point is on the task heading.  A Todoist element (see
+`orgist--element-heading-p') written under a description sub-heading
+would be deleted together with that heading when the description is
+replaced, and the next write-back would then push its deletion.  Each
+such subtree is moved, in buffer order, to be a direct child of the
+task, then placed among its siblings by its TODOIST-ORDER, as its
+Todoist parent is the task.  Returns the number of subtrees moved."
+  (let* ((task-level (or (org-current-level) 0))
+         (task (point-marker))
+         (subtree-end (orgist--subtree-end))
+         (regions '()))
+    ;; Collect nested element regions: an element below a non-element
+    ;; heading, skipping each element's own subtree.
+    (save-excursion
+      (forward-line 1)
+      (let ((desc-level nil))
+        (while (re-search-forward org-outline-regexp-bol subtree-end t)
+          (goto-char (line-beginning-position))
+          (let ((level (org-current-level)))
+            (when (and desc-level (<= level desc-level))
+              (setq desc-level nil))
+            (cond
+             ((orgist--element-heading-p)
+              (let ((end (min subtree-end (orgist--subtree-end))))
+                (when desc-level
+                  (push (cons (point) end) regions))
+                (goto-char end)))
+             (t
+              (unless desc-level (setq desc-level level))
+              (forward-line 1)))))))
+    (when regions
+      ;; REGIONS runs bottom-up, so deleting in this order keeps the
+      ;; earlier positions valid; texts end up in buffer order.
+      (let ((texts '()))
+        (dolist (region regions)
+          (push (buffer-substring (car region) (cdr region)) texts)
+          (delete-region (car region) (cdr region)))
+        (goto-char task)
+        (let ((end (orgist--subtree-end))
+              (starts '()))
+          (goto-char end)
+          (unless (bolp) (insert "\n"))
+          (dolist (text texts)
+            (push (point-marker) starts)
+            (insert (orgist--shift-subtree-text text (1+ task-level)))
+            (unless (bolp) (insert "\n")))
+          (dolist (start (nreverse starts))
+            (goto-char start)
+            (when-let* ((order (org-entry-get (point) "TODOIST-ORDER")))
+              (orgist-position-element-by-order (string-to-number order) 'item))
+            (set-marker start nil))))
+      (goto-char task)
+      (orgist-rebuild-subtree-cache)
+      (orgist-log 'warn "Moved %d task(s) out of description headings under %s"
+                  (length regions) (org-get-heading t t t t)))
+    (set-marker task nil)
+    (length regions)))
+
+(defun orgist--shift-subtree-text (text level)
+  "Return subtree TEXT re-leveled so its top heading is at LEVEL.
+Every heading line keeps its depth relative to the top heading."
+  (with-temp-buffer
+    (insert text)
+    (goto-char (point-min))
+    (let ((delta (when (looking-at "\\(\\*+\\) ")
+                   (- level (length (match-string 1))))))
+      (when (and delta (/= delta 0))
+        (while (re-search-forward "^\\(\\*+\\) " nil t)
+          (replace-match (make-string (max 1 (+ (length (match-string 1)) delta)) ?*)
+                         t t nil 1))))
+    (buffer-string)))
+
 (defun orgist-clear-body ()
-  "Delete body text of the current heading.
-Preserves only child subtrees that have an ID property (i.e. Todoist
-elements).  Deletes all other content: plain text, description
-headings from pandoc, and any non-ID child subtrees."
+  "Delete the description of the task at point.
+The description is the body text and every heading under the task
+that is not a Todoist element (see `orgist--element-heading-p').
+Element subtrees are preserved; one nested under a description
+heading is first moved up to be a direct child of the task (see
+`orgist--hoist-nested-elements'), so replacing a description never
+deletes a Todoist task."
   (save-excursion
     (org-back-to-heading-or-point-min t)
+    (orgist--hoist-nested-elements)
     (org-end-of-meta-data t)
     (let ((pos (point))
           (subtree-end (orgist--subtree-end)))
@@ -2524,10 +2628,10 @@ headings from pandoc, and any non-ID child subtrees."
                 (delete-region pos subtree-end)
                 (setq subtree-end pos))
               (setq pos subtree-end))
-          ;; Found a heading — check if it has an ID.
+          ;; Found a heading — keep it when it is a Todoist element.
           (goto-char (line-beginning-position))
-          (if (orgist--element-id)
-              ;; ID heading: delete gap before it, skip past its subtree.
+          (if (orgist--element-heading-p)
+              ;; Element heading: delete gap before it, skip past its subtree.
               (progn
                 (when (< pos (point))
                   (let ((gap (- (point) pos)))
@@ -2756,6 +2860,25 @@ should be a time string that can be parsed by
        "\n"))))
 
 ;;; Reminders
+
+(defun orgist--absolute-reminder-stamps (reminders)
+  "Return the active timestamps REMINDERS place in a task's body, sorted.
+Only absolute reminders write body text (see `orgist-apply-reminders');
+relative and location reminders live in planning lines and properties."
+  (sort (delq nil
+              (mapcar (lambda (reminder)
+                        (when (equal (alist-get 'type reminder) "absolute")
+                          (when-let* ((due-obj (alist-get 'due reminder)))
+                            (orgist-parse-todoist-date-with-duration due-obj nil))))
+                      reminders))
+        #'string<))
+
+(defun orgist--same-description-p (a b)
+  "Return non-nil if Todoist descriptions A and B are the same text.
+nil and the empty string are equivalent; surrounding whitespace and
+line-ending style are ignored."
+  (cl-flet ((norm (s) (string-trim (replace-regexp-in-string "\r\n" "\n" (or s "")))))
+    (equal (norm a) (norm b))))
 
 (defun orgist-apply-reminders (reminders)
   "Apply REMINDERS to the current heading's timestamps.
@@ -3613,7 +3736,10 @@ Falls back to simple org-link conversion when pandoc is absent."
         (orgist--org-links-to-markdown description)
       (let ((result
              (with-temp-buffer
-               (insert description)
+               ;; Pandoc's org reader applies Org's default export depth
+               ;; (H:3) and turns deeper headlines into paragraphs; keep
+               ;; every description sub-heading a heading.
+               (insert "#+OPTIONS: H:20\n" description)
                (let ((exit-code
                       (call-process-region (point-min) (point-max)
                                            "pandoc" t t nil
@@ -3625,6 +3751,17 @@ Falls back to simple org-link conversion when pandoc is absent."
                                exit-code)
                    nil)))))
         (or result description)))))
+
+(defun orgist--description-as-extracted (markdown)
+  "Return Todoist description MARKDOWN as `orgist-extract-body-text' reads it.
+The description is converted and inserted under a scratch task the
+way a pull inserts it, then read back, so the result compares
+directly with snapshot and local descriptions."
+  (with-temp-buffer
+    (delay-mode-hooks (org-mode))
+    (insert "* TODO Description\n" (orgist-convert-description markdown 1) "\n")
+    (goto-char (point-min))
+    (orgist-extract-body-text)))
 
 (defun orgist-adjust-heading-levels-and-clean (content current-level)
   "Adjust org heading levels in CONTENT to be relative to CURRENT-LEVEL.
@@ -3801,11 +3938,15 @@ heading is not later mistaken for a local deletion to push back."
 
 ;;; Write-back (local changes -> Todoist)
 
-(defun orgist-snapshot-element (element)
+(defun orgist-snapshot-element (element &optional description-kept)
   "Record ELEMENT's Todoist state in `orgist-snapshots'.
 ELEMENT is the raw alist from the Todoist API response.
 Reads scheduled/deadline from the org buffer (post-update) so
-the snapshot matches what `orgist-element-local-state' will return."
+the snapshot matches what `orgist-element-local-state' will return.
+DESCRIPTION-KEPT means the pull left the body untouched because
+Todoist's description did not change: the previous snapshot's
+description still mirrors Todoist and is kept, since the buffer may
+hold local edits that have not been pushed yet."
   (unless orgist-snapshots
     (orgist-load-snapshots)
     (unless orgist-snapshots
@@ -3849,7 +3990,16 @@ the snapshot matches what `orgist-element-local-state' will return."
                      :due-string (org-entry-get (point) "TODOIST_DUE_STRING")
                      :deadline deadline
                      :duration duration
-                     :description description
+                     :description (if (and description-kept old-snap)
+                                      (plist-get old-snap :description)
+                                    description)
+                     ;; What Todoist holds, to recognise an unchanged
+                     ;; description on the next pull (see
+                     ;; `orgist-update-element').
+                     :remote-description (alist-get 'description element)
+                     :reminder-stamps (orgist--absolute-reminder-stamps
+                                       (and orgist-reminders id
+                                            (gethash id orgist-reminders)))
                      :parent-id parent-id
                      :order order
                      :section-p section-p
@@ -4613,10 +4763,78 @@ using the current `org-priority-highest' setting."
       (max 1 (min 4 todoist)))))
 
 (defun orgist-extract-body-text ()
-  "Extract body text of the current heading (description content).
-Returns text between the end of meta-data and the first child
-heading, excluding state-change log entries (both at the start
-and end of the body)."
+  "Extract the description of the heading at point.
+For a task the description is its own body text followed by every
+heading under it that is not a Todoist element (see
+`orgist--element-heading-p'): the sub-headings a Markdown description
+becomes on pull, and notes written in org, all of which travel in the
+Todoist description as Markdown headings.  Sub-heading levels are made
+relative to the task (a direct child becomes `*'), so moving a task to
+another depth leaves its description unchanged.  A sub-heading's tags
+and metadata (planning, properties, logbook) are org-only and left
+out, as are element subtrees.  Sections and the file level have no
+description in Todoist: only their own body text is returned.
+State-change log lines are excluded."
+  (save-excursion
+    (org-back-to-heading-or-point-min t)
+    (let ((parts (cons (orgist--entry-body-text)
+                       (when (and (org-at-heading-p)
+                                  (not (org-entry-get (point) "SECTION")))
+                         (orgist--description-subheadings)))))
+      (string-trim (string-join (seq-remove #'string-empty-p parts) "\n\n")))))
+
+(defun orgist--element-heading-p (&optional pom)
+  "Return non-nil if the heading at POM (default point) is a Todoist element.
+Tasks (any TODO keyword), sections, and headings bound to a Todoist
+ID are elements.  Any other heading under a task belongs to the
+task's description; such a heading may carry an org-id of its own,
+which does not make it an element."
+  (save-excursion
+    (goto-char (or pom (point)))
+    (or (org-get-todo-state)
+        (org-entry-get (point) "SECTION")
+        (org-entry-get (point) orgist-todoist-id-property)
+        (let ((id (org-entry-get (point) "ID")))
+          (and id (or (not (orgist--temp-id-p id))
+                      (and orgist-snapshots (gethash id orgist-snapshots))))))))
+
+(defun orgist--description-subheadings ()
+  "Return the description sub-headings of the task at point, as strings.
+Each string is one non-element heading line, its stars relative to
+the task and its tags dropped, followed by its own text without
+metadata.  Element subtrees are skipped whole."
+  (let ((task-level (org-current-level))
+        (subtree-end (orgist--subtree-end))
+        (parts '()))
+    (save-excursion
+      (forward-line 1)
+      (while (re-search-forward org-outline-regexp-bol subtree-end t)
+        (goto-char (line-beginning-position))
+        (if (orgist--element-heading-p)
+            (goto-char (min subtree-end (orgist--subtree-end)))
+          (let* ((stars (make-string (max 1 (- (org-current-level) task-level)) ?*))
+                 (title (org-get-heading t t t t))
+                 (text-end (save-excursion
+                             (forward-line 1)
+                             (if (re-search-forward org-outline-regexp-bol subtree-end t)
+                                 (line-beginning-position)
+                               subtree-end)))
+                 (text-start (min text-end
+                                  (save-excursion
+                                    (org-end-of-meta-data 'logbook)
+                                    (point))))
+                 (text (string-trim (buffer-substring-no-properties text-start text-end))))
+            (push (if (string-empty-p text)
+                      (concat stars " " title)
+                    (concat stars " " title "\n" text))
+                  parts)
+            (forward-line 1)))))
+    (nreverse parts)))
+
+(defun orgist--entry-body-text ()
+  "Return the body text of the heading at point, up to its first child.
+Text between the end of meta-data and the first child heading,
+trimmed, excluding state-change log entries at its start and end."
   (save-excursion
     (org-back-to-heading-or-point-min t)
     (org-end-of-meta-data t)
@@ -5888,7 +6106,8 @@ for note_add commands instead of a content fingerprint."
                         (let ((local (orgist-element-local-state))
                               (old (gethash id orgist-snapshots))
                               (keys (orgist--command-snapshot-keys
-                                     cmd-type args)))
+                                     cmd-type args))
+                              (sent-description (assq 'description args)))
                           (if (and old (not (eq keys 'all)))
                               ;; Existing snapshot — advance ONLY the
                               ;; fields this command carried.  Local
@@ -5898,11 +6117,18 @@ for note_add commands instead of a content fingerprint."
                               ;; by comment/activity pull).
                               (let ((updated (copy-sequence old)))
                                 (dolist (key keys)
-                                  (plist-put updated key (plist-get local key)))
+                                  (setq updated (plist-put updated key (plist-get local key))))
+                                (when sent-description
+                                  (setq updated (plist-put updated :remote-description
+                                                           (cdr sent-description))))
                                 (puthash id updated orgist-snapshots))
-                            ;; New element — full local state is the baseline
-                            (puthash id local orgist-snapshots))
-                          ))
+                            ;; New element — full local state is the
+                            ;; baseline.  An item_add without a
+                            ;; description leaves Todoist's empty.
+                            (when (equal cmd-type "item_add")
+                              (setq local (plist-put local :remote-description
+                                                     (or (cdr sent-description) ""))))
+                            (puthash id local orgist-snapshots))))
                       (throw 'found nil))))))))))))
   (orgist-log 'debug "Updated snapshots from local state for %d command(s)"
               (length commands)))
@@ -6094,6 +6320,67 @@ SUCCEEDED and FAILED are the respective command counts."
                           tag i cmd-type (orgist--id-label id snap-name)
                           (string-join detail " "))))
 
+(defun orgist--fetch-task-description (id)
+  "Return Todoist's current description of task ID, or nil on failure."
+  (let ((result nil))
+    (orgist--request-with-retry
+     (format "https://api.todoist.com/api/v1/tasks/%s" id)
+     :headers `(("Authorization" . ,(format "Bearer %s" orgist-bearer-token)))
+     :parser 'json-read
+     :sync t
+     :timeout orgist-write-back-timeout
+     :error (cl-function
+             (lambda (&key error-thrown &allow-other-keys)
+               (orgist-log 'warn "Could not fetch task %s: %S" id error-thrown)))
+     :success (cl-function
+               (lambda (&key data &allow-other-keys)
+                 (let ((description (alist-get 'description data)))
+                   (when (stringp description)
+                     (setq result description))))))
+    result))
+
+(defun orgist--settle-legacy-descriptions (changes)
+  "Drop description diffs in CHANGES that only reflect an old snapshot.
+Snapshots written before `:remote-description' existed recorded a
+task's description only up to its first child heading, so a task
+with description sub-headings diffs once after upgrading even when
+nothing was edited.  For each such diff, Todoist's description is
+fetched: when the local description is exactly what a pull of it
+produces, the difference is not a local edit, so the snapshot is
+completed from Todoist and the diff dropped — pushing it would only
+re-send Todoist its own text through a lossy round trip.  Otherwise,
+or when the fetch fails, the diff stays and its local edits are
+pushed.  Returns CHANGES without the settled diffs."
+  (let ((settled 0))
+    (prog1
+        (delq nil
+              (mapcar
+               (lambda (change)
+                 (let* ((id (car change))
+                        (diff (cdr change))
+                        (desc-diff (and (consp diff) (assq :description diff)))
+                        (snap (and desc-diff (gethash id orgist-snapshots)))
+                        (remote (and snap
+                                     orgist-bearer-token
+                                     (not (plist-member snap :remote-description))
+                                     (not (plist-get snap :section-p))
+                                     (orgist--fetch-task-description id))))
+                   (if (not (and remote
+                                 (equal (orgist--description-as-extracted remote)
+                                        (or (cddr desc-diff) ""))))
+                       change
+                     (setq snap (plist-put snap :description (cddr desc-diff)))
+                     (setq snap (plist-put snap :remote-description remote))
+                     (puthash id snap orgist-snapshots)
+                     (cl-incf settled)
+                     (when-let* ((rest (assq-delete-all :description (copy-alist diff))))
+                       (cons id rest)))))
+               changes))
+      (when (> settled 0)
+        (orgist-save-snapshots)
+        (orgist-log 'info "Description snapshots completed from Todoist for %d task(s); nothing to push for them"
+                    settled)))))
+
 (defun orgist-write-back (&optional continuation)
   "Detect local changes and write them back to Todoist.
 Respects `orgist-enable-write-back' and `orgist-write-back-dry-run'.
@@ -6111,9 +6398,14 @@ synchronously and the caller is responsible for continuing."
     (orgist-load-snapshots)
     (if (= (hash-table-count orgist-snapshots) 0)
         (orgist-log 'debug "No snapshots found (first sync?), skipping write-back")
-      (let ((changes (orgist-diff-all-elements)))
+      (let* ((detected (orgist-diff-all-elements))
+             (changes (orgist--settle-legacy-descriptions detected)))
         (if (not changes)
-            (orgist-log 'debug "No local changes detected")
+            (if detected
+                ;; Everything detected was settled from Todoist: the
+                ;; scanned files are verified.
+                (orgist--commit-pending-stamps)
+              (orgist-log 'debug "No local changes detected"))
           (orgist-log 'debug "Detected %d local change(s)" (length changes))
           (let ((commands (orgist-changes-to-commands changes)))
             (if (not commands)

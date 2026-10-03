@@ -33,10 +33,10 @@
 (declare-function orgist-extract-logbook-notes "orgist" ())
 (declare-function orgist-convert-content "orgist" (content))
 (declare-function orgist-convert-description "orgist" (description level))
+(declare-function orgist--description-as-extracted "orgist" (markdown))
 (declare-function orgist-parse-todoist-date-with-duration "orgist" (date-info duration-info))
 (declare-function orgist--label-to-tag "orgist" (label-name))
 (declare-function orgist--request-with-retry "orgist" (url &rest args))
-(declare-function org-current-level "org" ())
 (defvar orgist-snapshots)
 (defvar orgist-sync-mutex)
 (defvar orgist-base-dir)
@@ -151,10 +151,11 @@ Walks :parent-id up to a file-level ID among BUFFERS."
                  (setq result data))))
     result))
 
-(defun orgist-confirm--remote-state (remote section-p level)
+(defun orgist-confirm--remote-state (remote section-p)
   "Convert the REMOTE alist into the plist shape of a snapshot.
-SECTION-P selects the section field names; LEVEL is the org level
-used to convert the description."
+SECTION-P selects the section field names.  The description is read
+back in the canonical form of `orgist-extract-body-text', with
+sub-heading levels relative to the task."
   (let ((description (alist-get 'description remote)))
     (list :content (orgist-convert-content (alist-get (if section-p 'name 'content) remote))
           :checked (eq (alist-get 'checked remote) t)
@@ -164,7 +165,7 @@ used to convert the description."
                 (alist-get 'due remote) (alist-get 'duration remote))
           :deadline (orgist-parse-todoist-date-with-duration (alist-get 'deadline remote) nil)
           :description (when (and description (not (string-empty-p description)))
-                         (orgist-convert-description description level)))))
+                         (orgist--description-as-extracted description)))))
 
 (defconst orgist-confirm--remote-fields
   '(:content :checked :priority :labels :due :deadline :description)
@@ -289,7 +290,7 @@ BUFFERS is the project buffer alist, REMOTES the live-state table."
                                         (string-join (cdr parts) ", ")))))))))
     (cons project (append item (list :data change)))))
 
-(defun orgist-confirm--fetch-remotes (changes buffers)
+(defun orgist-confirm--fetch-remotes (changes)
   "Return a table ID → live state for the modified elements of CHANGES."
   (let ((table (make-hash-table :test 'equal))
         (modified (seq-filter (lambda (c) (consp (cdr c))) changes)))
@@ -300,20 +301,15 @@ BUFFERS is the project buffer alist, REMOTES the live-state table."
         (let* ((id (car change))
                (snapshot (gethash id orgist-snapshots))
                (section-p (plist-get snapshot :section-p))
-               (loc (orgist-confirm--locate id buffers))
-               (level (or (when loc
-                            (with-current-buffer (cadr loc)
-                              (save-excursion (goto-char (cddr loc)) (org-current-level))))
-                          1))
                (remote (orgist-confirm--fetch-remote id section-p)))
           (when remote
-            (puthash id (orgist-confirm--remote-state remote section-p level) table)))))
+            (puthash id (orgist-confirm--remote-state remote section-p) table)))))
     table))
 
 (defun orgist-confirm--items (changes commands)
   "Build the `org-sync-confirm' tree for CHANGES and their COMMANDS."
   (let* ((buffers (orgist-confirm--project-buffers))
-         (remotes (orgist-confirm--fetch-remotes changes buffers))
+         (remotes (orgist-confirm--fetch-remotes changes))
          (unattached (orgist-confirm--unattached-commands commands))
          (projects nil))
     (dolist (change changes)

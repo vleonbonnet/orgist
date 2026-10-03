@@ -127,7 +127,7 @@ Todoist Sync API ──► JSON parse ──► Org-Mode buffers (one file per r
 | Due date             | =SCHEDULED:=                             |
 | Deadline             | =DEADLINE:=                              |
 | Duration             | Time range in SCHEDULED (=13:00-14:00=)  |
-| Description          | Body text (pandoc markdown \to org)      |
+| Description          | Body text and non-task child headings    |
 | Comments             | Logbook =Note= entries                   |
 | Activity (state)     | Logbook state-change entries           |
 | Collaborator         | =ASSIGNEE= property (resolved name)     |
@@ -142,6 +142,14 @@ Todoist Sync API ──► JSON parse ──► Org-Mode buffers (one file per r
 
 A heading's Todoist ID lives in =:ID:=, which org-id also resolves, so =[[id:...]]= links to synced tasks work.  A heading that already carries an org-id when it is first pushed — stamped by =org-store-link=, capture or org-linker, or an existing heading turned into a task — keeps it: links and ID-derived attachment directories depend on it.  Its Todoist ID goes to =TODOIST_ID= instead, and =TODOIST_ID= takes precedence wherever orgist looks up an element.  Temporary IDs for pending creations also live in =TODOIST_ID=, and move to =:ID:= once Todoist returns the real ID, unless =:ID:= is taken by an org-id.
 
+** Descriptions
+
+A task's description is its body text plus every heading under it that is not a Todoist element: the sub-headings a Markdown description becomes on pull, and notes written in org under the task, travel in the Todoist description as Markdown headings, with levels relative to the task.  Tags and metadata (planning lines, property and logbook drawers) on those headings are org-only and never sent, so an org-id or attachment directory on a description sub-heading is not a change to push.
+
+A pull leaves the body untouched when Todoist's description and absolute reminders are unchanged since the last sync, so those org-only parts survive unrelated remote edits such as a new due date.  When the description did change, the body is rebuilt from Todoist.  A Todoist task written under a description heading is moved up to be a direct child of its task rather than deleted with the description.  Sections have no description in Todoist: their body is never cleared.
+
+Snapshots from versions that stopped the description at the first child heading make tasks with sub-headings diff once.  The first write-back after upgrading fetches those tasks' descriptions from Todoist: where the local description is exactly what a pull produces, the snapshot is completed from Todoist and nothing is sent; only descriptions with local edits are pushed.
+
 ** Body Spacing
 
 =orgist--normalize-body-spacing= enforces these rules after every element
@@ -152,6 +160,7 @@ update:
 - Exactly one blank line between body content and the next heading.
 - No runs of more than one consecutive blank line outside literal (=#+BEGIN_SRC= etc.) blocks, whose blank lines are never touched.
 - Elements with no body content have no trailing blank line.
+- Description sub-headings get one blank line around them; the one after a sub-heading goes after its planning line and drawers, which stay attached to it.
 - Description sub-headings and their content follow the same rules; child subtrees with an =ID= property (Todoist elements) are normalized by their own updates and skipped by the parent.
 - Logbook content means a =:LOGBOOK:= drawer or bare =- State= entries; a bullet-list description is body content and gets its blank line.
 
@@ -402,7 +411,7 @@ commands with a =project_id= target.
 | Cross-project     | =./test-run.sh move=              |     9 | Cross-project task moves             |
 | New features      | =./test-run.sh features=          |    61 | Timezone, duration, labels, etc.     |
 | Attachments       | =./test-run.sh attachments=       |    35 | ATTACH tag, pull/push, diff, confirm |
-| ERT regression    | =./test-run.sh ert=               |    45 | Identity, ordering, spacing, guards, review |
+| ERT regression    | =./test-run.sh ert=               |    63 | Identity, ordering, spacing, guards, review |
 | Live attachments  | =./test-run.sh live-attachments=  |    19 | Real API attachment CRUD (needs token) |
 
 ** Offline Replay (no API token needed)

@@ -5183,16 +5183,27 @@ Creates a test task, verifies it, then deletes it."
           (with-current-buffer (find-file-noselect file)
             (orgist-build-id-cache)))
         (let* ((changes (orgist-diff-all-elements))
-               ;; Filter out date-only and attachment-only diffs
+               ;; The Notes heading added under Parent task above is part
+               ;; of its description: its text is a real change, while
+               ;; its attachment metadata (ID drawer, ATTACH tag) is not.
+               (notes-diff (assq :description
+                                 (alist-get "att-task-2" changes nil nil #'equal)))
+               ;; Filter out date-only and attachment-only diffs, and
+               ;; that expected description change
                (real-diffs
                 (seq-remove
                  (lambda (c)
                    (and (listp (cdr c))
                         (seq-every-p
-                         (lambda (d) (memq (car d) '(:due :deadline
-                                                     :attachment-files)))
+                         (lambda (d)
+                           (or (memq (car d) '(:due :deadline :attachment-files))
+                               (and (equal (car c) "att-task-2")
+                                    (eq (car d) :description))))
                          (cdr c))))
                  changes)))
+          (orgist-test-assert-equal
+           "* Notes\nSome notes." (cddr notes-diff)
+           "Round-trip: non-TODO child joins the parent's description without its attachment metadata")
           (orgist-test-assert-equal
            0 (length real-diffs)
            "Round-trip: zero spurious diffs with attachments disabled")

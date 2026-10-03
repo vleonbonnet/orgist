@@ -173,7 +173,7 @@ Call the studio.
                     (labels . ["a" "b"]) (checked . t)
                     (due . ((date . "2026-10-01") (string . "Oct 1")))
                     (deadline . ((date . "2026-10-05"))))
-                  nil 1)))
+                  nil)))
       (should (equal "Title" (plist-get state :content)))
       (should (equal "BODY" (plist-get state :description)))
       (should (= 4 (plist-get state :priority)))
