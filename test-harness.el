@@ -181,6 +181,24 @@ ORIG-FN is the original `request', URL is the endpoint, ARGS are kwargs."
                       (activity_log_limit . 7)
                       (completed_tasks . t)))))))
 
+     ;; Labels ONLY: the full-label refresh write-back makes before a
+     ;; label_add (`orgist--refresh-labels-from-api').  Without this
+     ;; branch it fell through to the read-sync replay, which looks for
+     ;; full-sync.json in the current test's runtime directory.  An
+     ;; empty list leaves the known labels unchanged, so a tag that is
+     ;; genuinely unknown still produces its label_add.
+     ((and (string-match-p "/sync" url)
+           (let ((data (plist-get args :data)))
+             (and data
+                  (let ((rt (or (cdr (assoc "resource_types" data)) "")))
+                    (and (string-match-p "labels" rt)
+                         (not (string-match-p "items" rt)))))))
+      (let ((success-fn (plist-get args :success)))
+        (message "[test-harness] MOCK label refresh")
+        (when success-fn
+          (funcall success-fn :data '((sync_token . "mock-labels")
+                                      (labels . []))))))
+
      ;; Activity API: GET /api/v1/activities
      ((string-match-p "/activities" url)
        (let* ((params (plist-get args :params))
@@ -1895,6 +1913,12 @@ Creates synthetic Todoist data and verifies exact formatting of:
 
             (message "")
             (message "--- Test group: New task under parent task ---")
+            ;; Flush the section-child task above via dry-run: a new
+            ;; task that was never pushed is re-sent by every scan (the
+            ;; pending-task path), so it would be counted again here.
+            (let* ((pending (orgist-diff-all-elements))
+                   (cmds (orgist-changes-to-commands pending)))
+              (when cmds (orgist-execute-write-back cmds)))
             (orgist-save-snapshots)
             (orgist-load-snapshots t)
             (orgist-build-id-cache)
@@ -2017,12 +2041,14 @@ Creates synthetic Todoist data and verifies exact formatting of:
             (orgist-save-snapshots)
             (orgist-load-snapshots t)
             (orgist-build-id-cache)
-            ;; Create a parent task locally and sync it.  Its snapshot is
-            ;; built from local state, so it has :order nil and the heading
-            ;; has no TODOIST-ORDER property (neither arrives until the item
-            ;; round-trips through a pull).  Regression: children added under
-            ;; such a parent were misclassified as project children and sent
-            ;; with project_id = the parent task's ID ("Project not found").
+            ;; Create a parent task locally and sync it, then strip its
+            ;; order: a parent whose order has not round-tripped through a
+            ;; pull (written before the scan numbered new headings, or with
+            ;; the property removed by hand).  Regression: children added
+            ;; under such a parent were misclassified as project children
+            ;; and sent with project_id = the parent task's ID ("Project
+            ;; not found").  Placement must follow the heading's kind, not
+            ;; the presence of an order.
             (goto-char (point-max))
             (insert "\n* TODO Local parent task\n")
             (let* ((changes (orgist-diff-all-elements))
@@ -2035,11 +2061,21 @@ Creates synthetic Todoist data and verifies exact formatting of:
                "Local-parent: parent detected as new task")
               (orgist-execute-write-back (orgist-changes-to-commands changes))
               (orgist-test-assert
+               (and parent-id (gethash parent-id orgist-snapshots))
+               "Local-parent: parent snapshotted after its item_add")
+              (when parent-id
+                (save-excursion
+                  (goto-char (orgist-find-element-by-id parent-id))
+                  (org-entry-delete (point) "TODOIST-ORDER"))
+                (when-let ((snap (gethash parent-id orgist-snapshots)))
+                  (puthash parent-id (plist-put snap :order nil) orgist-snapshots)))
+              (orgist-test-assert
                (and parent-id
-                    (gethash parent-id orgist-snapshots)
-                    (null (plist-get (gethash parent-id orgist-snapshots)
-                                     :order)))
-               "Local-parent: snapshot from local state has no :order")
+                    (null (plist-get (gethash parent-id orgist-snapshots) :order))
+                    (null (save-excursion
+                            (goto-char (orgist-find-element-by-id parent-id))
+                            (org-entry-get (point) "TODOIST-ORDER"))))
+               "Local-parent: parent has no order on either side")
               ;; Add a subtask under the locally created parent
               (goto-char (orgist-find-element-by-id parent-id))
               (org-end-of-subtree t t)
