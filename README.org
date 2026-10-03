@@ -121,6 +121,7 @@ Todoist Sync API ──► JSON parse ──► Org-Mode buffers (one file per r
 | Subproject           | Heading in parent file                 |
 | Section              | Heading with =SECTION= property          |
 | Task / Item          | =* TODO= heading (pandoc markdown \to org) |
+| Element ID           | =:ID:=, or =TODOIST_ID= beside an org-id    |
 | Priority (1–4)       | =[#A]=, =[#B]=, =[#C]= or none               |
 | Labels               | =:tag1:tag2:=                            |
 | Due date             | =SCHEDULED:=                             |
@@ -136,6 +137,10 @@ Todoist Sync API ──► JSON parse ──► Org-Mode buffers (one file per r
 | Project comment      | Pre-heading text (before first =*=)      |
 | Child order          | =TODOIST-ORDER= property                 |
 | File attachment       | =org-attach= file + =ATTACH= tag             |
+
+** Element Identity
+
+A heading's Todoist ID lives in =:ID:=, which org-id also resolves, so =[[id:...]]= links to synced tasks work.  A heading that already carries an org-id when it is first pushed — stamped by =org-store-link=, capture or org-linker, or an existing heading turned into a task — keeps it: links and ID-derived attachment directories depend on it.  Its Todoist ID goes to =TODOIST_ID= instead, and =TODOIST_ID= takes precedence wherever orgist looks up an element.  Temporary IDs for pending creations also live in =TODOIST_ID=, and move to =:ID:= once Todoist returns the real ID, unless =:ID:= is taken by an org-id.
 
 ** Body Spacing
 
@@ -379,6 +384,7 @@ commands with a =project_id= target.
 | =test-run.sh=       | Shell wrapper for test-harness and live tests        |
 | =test-sync.el=      | Live API sync test script                            |
 | =test-attachments-live.el= | Live attachment CRUD test (needs token)        |
+| =test-*.el= (others) | Standalone ERT regression suites (=./test-run.sh ert=) |
 | =test-data/=        | Shared cached API responses (committed)              |
 | =screenshots/=      | Synthetic Org, Todoist, and confirmation views      |
 
@@ -396,6 +402,7 @@ commands with a =project_id= target.
 | Cross-project     | =./test-run.sh move=              |     9 | Cross-project task moves             |
 | New features      | =./test-run.sh features=          |    61 | Timezone, duration, labels, etc.     |
 | Attachments       | =./test-run.sh attachments=       |    35 | ATTACH tag, pull/push, diff, confirm |
+| ERT regression    | =./test-run.sh ert=               |    45 | Identity, ordering, spacing, guards, review |
 | Live attachments  | =./test-run.sh live-attachments=  |    19 | Real API attachment CRUD (needs token) |
 
 ** Offline Replay (no API token needed)

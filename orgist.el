@@ -199,8 +199,14 @@ Requires `orgist-sync-comments' to be non-nil."
   :group 'orgist
   :type 'boolean)
 
+(defconst orgist-todoist-id-property "TODOIST_ID"
+  "Property holding a heading's Todoist ID when :ID: is an org-id.
+A heading whose :ID: existed before orgist bound it to Todoist keeps
+that value: `[[id:...]]' links and ID-derived attachment directories
+depend on it.  The Todoist ID then lives in this property instead.")
+
 (defconst orgist--managed-properties
-  '("ID" "TODOIST-PROJECT" "TODOIST-ORDER" "TODOIST_DUE_STRING"
+  '("ID" "TODOIST_ID" "TODOIST-PROJECT" "TODOIST-ORDER" "TODOIST_DUE_STRING"
     "SECTION" "ASSIGNEE" "REMINDER-LOC" "CREATED" "LAST_REPEAT"
     "CATEGORY" "ATTACH_DIR" "DIR" "ITEM")
   "Property names managed by orgist or org-mode internals.
@@ -523,12 +529,12 @@ Added to `window-buffer-change-functions' by `orgist--start-auto-pull'."
 (defun orgist-browse-task ()
   "Open the Todoist task at point.
 Uses `orgist-browse-url-format' (or auto-detects desktop app) to
-build the URL from the heading's :ID: property."
+build the URL from the heading's Todoist ID (see `orgist--element-id')."
   (interactive)
   (unless (org-at-heading-p)
     (user-error "Not on an org heading"))
-  (let ((id (org-entry-get nil "ID")))
-    (unless (and id (not (string-match-p "-" id)))
+  (let ((id (orgist--element-id)))
+    (unless (and id (not (orgist--temp-id-p id)))
       (user-error "No Todoist ID on this heading"))
     (browse-url (format (orgist--browse-url-format) id))))
 
@@ -538,8 +544,8 @@ Returns non-nil if handled, nil otherwise.  Intended for
 `org-open-at-point-functions'."
   (when (and orgist-mode
              (org-at-heading-p)
-             (let ((id (org-entry-get nil "ID")))
-               (and id (not (string-match-p "-" id)))))
+             (let ((id (orgist--element-id)))
+               (and id (not (orgist--temp-id-p id)))))
     (orgist-browse-task)
     t))
 
@@ -596,12 +602,12 @@ with buffer position, enabling write-back to detect reorders."
 
 (defun orgist--renumber-siblings-at-point ()
   "Number the same-type siblings of the heading at point 0..n by buffer position.
-Only siblings carrying both :ID: and :TODOIST-ORDER: take part
+Only siblings carrying both a Todoist ID and :TODOIST-ORDER: take part
 \(see `orgist--collect-direct-children').  Returns an alist of
 \(ID . NEW-ORDER) for the siblings whose stored order changed, the
 heading at point excluded, so a caller that runs after the snapshot
 diff can re-diff exactly those."
-  (let* ((my-id (org-entry-get (point) "ID"))
+  (let* ((my-id (orgist--element-id))
          (is-section (not (null (org-entry-get (point) "SECTION"))))
          (parent-level (save-excursion
                          (if (org-up-heading-safe) (org-current-level) 0)))
@@ -1624,7 +1630,7 @@ projects."
       (unless (search-forward (concat "* " project-name) nil t)
         (goto-char (point-max))
         (insert (concat "* " project-name "\n")))
-      (org-set-property "ID" project-id)
+      (orgist--set-element-id project-id)
       (orgist-id-cache-put project-id)
       ;; Add to project-buffer cache so sections/items can find this subproject
       (push (cons project-id parent-buffer) orgist-project-buffer-cache)
@@ -1645,7 +1651,7 @@ projects."
           (insert (concat "#+FILETAGS: :" orgist-tag ":\n")))
         (unless (search-forward "#+TITLE:" nil t)
           (insert (concat "#+TITLE: " project-name "\n\n")))
-        (org-set-property "ID" project-id)
+        (orgist--set-element-id project-id)
         (org-set-property "TODOIST-PROJECT" "")
         (orgist-id-cache-put project-id)
         (orgist--save-buffer))
@@ -1691,7 +1697,7 @@ projects."
 A root project has its ID as the file-level ID property."
   (when file-path
     (with-current-buffer (find-file-noselect file-path)
-      (string= project-id (or (org-entry-get (point-min) "ID" t) "")))))
+      (string= project-id (or (orgist--element-id (point-min)) "")))))
 
 (defun orgist-convert-root-to-subproject (project project-buffer)
   "Convert a root project to a subproject by moving it to the parent's file."
@@ -1709,7 +1715,7 @@ A root project has its ID as the file-level ID property."
         (with-current-buffer parent-buffer
           (goto-char (point-max))
           (insert (concat "\n* " project-name "\n"))
-          (org-set-property "ID" project-id)
+          (orgist--set-element-id project-id)
           ;; Insert original content under this heading (adjust levels)
           (let ((adjusted-content (orgist-adjust-content-for-subproject content)))
             (when adjusted-content
@@ -1743,7 +1749,7 @@ A root project has its ID as the file-level ID property."
             (with-current-buffer (find-file-noselect new-file-path)
               (erase-buffer)
               (insert (concat "#+TITLE: " project-name "\n\n"))
-              (org-set-property "ID" project-id)
+              (orgist--set-element-id project-id)
               (org-set-property "TODOIST-PROJECT" "")
               ;; Insert content (adjust heading levels)
               (let ((adjusted-content (orgist-adjust-content-for-root-project subtree-content)))
@@ -2016,12 +2022,7 @@ Point must be on the element's heading.  After reparenting, point is
 on the moved heading at its new location and the ID cache is rebuilt.
 Returns non-nil if reparenting occurred."
   (org-back-to-heading t)
-  (let* ((current-org-parent-id
-          (save-excursion
-            (if (org-up-heading-safe)
-                (org-entry-get (point) "ID")
-              ;; Top-level heading — parent is the file-level ID
-              (org-entry-get (point-min) "ID"))))
+  (let* ((current-org-parent-id (orgist--parent-element-id))
          (target-level (orgist-calculate-heading-level todoist-parent-id)))
     (when (not (equal current-org-parent-id todoist-parent-id))
       (orgist-log 'debug "Reparenting %s: %s -> %s"
@@ -2059,7 +2060,7 @@ Content is filled in by `orgist-update-element'."
       (when (and level (> level current-level))
         (dotimes (_ (- level current-level))
           (org-demote-subtree))))
-    (org-set-property "ID" id)
+    (orgist--set-element-id id)
     (orgist-id-cache-put id)))
 
 (defun orgist-update-element (element &optional skip-clear-body)
@@ -2349,7 +2350,7 @@ touched."
            ((> depth 0)
             (forward-line 1))
            ((looking-at org-outline-regexp-bol)
-            (let* ((id (org-entry-get (point) "ID"))
+            (let* ((id (orgist--element-id))
                    (id-end (and id (orgist--subtree-end))))
               (cond
                ;; Todoist child with a usable subtree end: record it as
@@ -2525,7 +2526,7 @@ headings from pandoc, and any non-ID child subtrees."
               (setq pos subtree-end))
           ;; Found a heading — check if it has an ID.
           (goto-char (line-beginning-position))
-          (if (org-entry-get (point) "ID")
+          (if (orgist--element-id)
               ;; ID heading: delete gap before it, skip past its subtree.
               (progn
                 (when (< pos (point))
@@ -2854,6 +2855,60 @@ REMINDERS is a list of reminder alists from the Todoist API.
                   (setq queue (append queue (reverse children))))))))))
     (reverse result)))
 
+;;; Element identity
+;;
+;; A heading's Todoist ID normally lives in :ID:, which org-id also
+;; resolves, so `[[id:...]]' links to synced tasks work.  When a heading
+;; already carried an org-id before it was bound to Todoist (stamped by
+;; `org-store-link', capture or org-linker, or an existing notes heading
+;; turned into a task), that org-id is never overwritten: the Todoist
+;; ID goes to `orgist-todoist-id-property' instead.
+
+(defun orgist--element-id (&optional pom)
+  "Return the Todoist ID of the heading at POM (default point), or nil.
+`orgist-todoist-id-property' takes precedence over :ID:.  At
+`point-min' this reads the file-level drawer (the project ID)."
+  (let ((pom (or pom (point))))
+    (or (org-entry-get pom orgist-todoist-id-property)
+        (org-entry-get pom "ID"))))
+
+(defun orgist--temp-id-p (id)
+  "Return non-nil if ID is a temporary UUID rather than a Todoist ID.
+Todoist IDs never contain a dash; org-id UUIDs and the temporary IDs
+orgist mints for pending creations always do."
+  (and id (string-match-p "-" id)))
+
+(defun orgist--set-element-id (id &optional pom)
+  "Bind the heading at POM (default point) to Todoist element ID.
+A different :ID: already on the heading is an org-id that links or
+attachment directories may depend on; it is kept and ID goes to
+`orgist-todoist-id-property'.  Otherwise ID becomes the :ID:."
+  (let* ((pom (or pom (point)))
+         (org-id (org-entry-get pom "ID")))
+    (if (and org-id (not (equal org-id id)))
+        (org-entry-put pom orgist-todoist-id-property id)
+      (org-entry-put pom "ID" id)
+      (org-entry-delete pom orgist-todoist-id-property))))
+
+(defun orgist--mint-temp-id ()
+  "Bind the heading at point to a fresh temporary ID and return it.
+The ID goes to `orgist-todoist-id-property', leaving any :ID: alone;
+`orgist-remap-temp-ids' replaces it with the real Todoist ID once the
+creation command succeeds."
+  (let ((temp-id (org-id-uuid)))
+    (org-entry-put (point) orgist-todoist-id-property temp-id)
+    (orgist-id-cache-put temp-id)
+    temp-id))
+
+(defun orgist--parent-element-id ()
+  "Return the Todoist ID of the parent of the heading at point.
+The file-level ID (the project) for a top-level heading."
+  (save-excursion
+    (org-back-to-heading t)
+    (if (org-up-heading-safe)
+        (orgist--element-id)
+      (orgist--element-id (point-min)))))
+
 (defun orgist-build-id-cache ()
   "Build the buffer-local ID cache by scanning all property drawers.
 Markers use insertion-type t so they advance when text is inserted
@@ -2862,11 +2917,11 @@ at their position, preventing stale references after body edits."
   (save-excursion
     (goto-char (point-min))
     ;; Check file-level property drawer
-    (when-let* ((file-id (org-entry-get (point-min) "ID")))
+    (when-let* ((file-id (orgist--element-id (point-min))))
       (puthash file-id (copy-marker (point-min) t) orgist-id-cache))
     ;; Scan all headings
     (while (re-search-forward org-property-start-re nil t)
-      (when-let* ((id (org-entry-get (point) "ID")))
+      (when-let* ((id (orgist--element-id)))
         (save-excursion
           (org-back-to-heading-or-point-min t)
           (puthash id (copy-marker (point) t) orgist-id-cache))))))
@@ -2879,11 +2934,11 @@ subtree has moved."
     (save-excursion
       (org-back-to-heading-or-point-min t)
       (let ((subtree-end (orgist--subtree-end)))
-        (when-let* ((id (org-entry-get (point) "ID")))
+        (when-let* ((id (orgist--element-id)))
           (puthash id (copy-marker (point) t) orgist-id-cache))
         (while (and (re-search-forward org-property-start-re subtree-end t)
                     (<= (point) subtree-end))
-          (when-let* ((id (org-entry-get (point) "ID")))
+          (when-let* ((id (orgist--element-id)))
             (save-excursion
               (org-back-to-heading-or-point-min t)
               (puthash id (copy-marker (point) t) orgist-id-cache))))))))
@@ -2899,18 +2954,20 @@ subtree has moved."
 (defun orgist--scan-for-element-id (element-id)
   "Find the heading carrying ELEMENT-ID by scanning the buffer.
 Returns the heading position (or `point-min' for the file-level
-drawer), or nil when no drawer sets :ID: to ELEMENT-ID.  Linear in
-the buffer size — only for the rare cache-repair path."
+drawer), or nil when no drawer binds the heading to ELEMENT-ID
+\(see `orgist--element-id').  Linear in the buffer size — only for
+the rare cache-repair path."
   (save-excursion
     (goto-char (point-min))
-    (let ((re (concat "^[ \t]*:ID:[ \t]+" (regexp-quote element-id) "[ \t]*$"))
+    (let ((re (concat "^[ \t]*:\\(?:ID\\|" (regexp-quote orgist-todoist-id-property)
+                      "\\):[ \t]+" (regexp-quote element-id) "[ \t]*$"))
           (case-fold-search t)
           (found nil))
       (while (and (not found) (re-search-forward re nil t))
         (let ((pos (save-excursion
                      (org-back-to-heading-or-point-min t)
                      (point))))
-          (when (equal (org-entry-get pos "ID") element-id)
+          (when (equal (orgist--element-id pos) element-id)
             (setq found pos))))
       found)))
 
@@ -2934,7 +2991,7 @@ every snapshot ID in every file."
                     (save-excursion
                       (goto-char pos)
                       (org-back-to-heading-or-point-min t)
-                      (when (equal (org-entry-get (point) "ID") element-id)
+                      (when (equal (orgist--element-id) element-id)
                         (point))))))
       (or cached
           ;; Stale cache entry — rescan before concluding it is gone.
@@ -3765,11 +3822,7 @@ the snapshot matches what `orgist-element-local-state' will return."
          (due (org-entry-get (point) "SCHEDULED"))
          (deadline (org-entry-get (point) "DEADLINE"))
          (description (orgist-extract-body-text))
-         (parent-id (save-excursion
-                      (org-back-to-heading t)
-                      (if (org-up-heading-safe)
-                          (org-entry-get (point) "ID")
-                        (org-entry-get (point-min) "ID"))))
+         (parent-id (orgist--parent-element-id))
          (order (or (alist-get 'section_order element)
                     (alist-get 'child_order element)))
          (section-p (not (null name))))
@@ -4051,7 +4104,7 @@ Useful after a sync error that left snapshots stale."
            (goto-char (point-min))
            (while (re-search-forward "^\\*+ " nil t)
              (org-back-to-heading t)
-             (when-let* ((id (org-entry-get (point) "ID")))
+             (when-let* ((id (orgist--element-id)))
                (let* ((local (orgist-element-local-state))
                       (old (gethash id orgist-snapshots)))
                  ;; Preserve metadata from the existing snapshot
@@ -4143,7 +4196,7 @@ and offers to rebuild when problems are found."
            (goto-char (point-min))
            (while (re-search-forward "^\\*+ " nil t)
              (org-back-to-heading t)
-             (when-let* ((id (org-entry-get (point) "ID")))
+             (when-let* ((id (orgist--element-id)))
                ;; Skip file-level project IDs (they don't get snapshots)
                (unless (= (point) (point-min))
                  (puthash id (file-name-nondirectory
@@ -4393,7 +4446,7 @@ that have both ID and TODOIST-ORDER properties."
         (let ((level (org-current-level)))
           (cond
            ((= level child-level)
-            (let ((id (org-entry-get (point) "ID"))
+            (let ((id (orgist--element-id))
                   (order-str (org-entry-get (point) "TODOIST-ORDER"))
                   (sec (not (null (org-entry-get (point) "SECTION")))))
               (when (and id order-str)
@@ -4418,7 +4471,7 @@ cases with parent boundaries)."
     (when stored-str
       (let* ((stored (string-to-number stored-str))
              (is-section (not (null (org-entry-get (point) "SECTION"))))
-             (my-id (org-entry-get (point) "ID"))
+             (my-id (orgist--element-id))
              ;; Go to parent and collect children
              (parent-level (save-excursion
                              (if (org-up-heading-safe) (org-current-level) 0)))
@@ -4476,10 +4529,7 @@ as stored by `orgist-snapshot-element'."
          (deadline (org-entry-get (point) "DEADLINE"))
          (duration (orgist-org-timestamp-extract-duration due))
          (description (orgist-extract-body-text))
-         (parent-id (save-excursion
-                      (if (org-up-heading-safe)
-                          (org-entry-get (point) "ID")
-                        (org-entry-get (point-min) "ID"))))
+         (parent-id (orgist--parent-element-id))
          (order (let ((o (org-entry-get (point) "TODOIST-ORDER")))
                   (when o (string-to-number o))))
          (section-p (not (null (org-entry-get (point) "SECTION"))))
@@ -4802,73 +4852,78 @@ and every other element and file is still processed."
                             (error-message-string err)))))
            orgist-snapshots)
           ;; Detect new headings.
-          ;; - TODO/DONE heading with no :ID: and no SECTION → new task.
-          ;; - Level-1 non-TODO heading with no :ID: and no SECTION → new
-          ;;   section.  We mark it with :SECTION: t and a placeholder
+          ;; - TODO/DONE heading not bound to Todoist, no SECTION → new task.
+          ;; - Level-1 non-TODO heading not bound to Todoist, no SECTION →
+          ;;   new section.  We mark it with :SECTION: t and a placeholder
           ;;   :TODOIST-ORDER: so that subsequent diff/sibling-rank logic
           ;;   treats it like any other section; Todoist assigns the real
           ;;   section_order on creation, which round-trips on next pull.
+          ;; A heading counts as unbound when it has no :ID:, or only an
+          ;; org-id UUID (stamped by org-store-link, org-capture or
+          ;; org-linker) that no snapshot knows.  Its temporary ID goes
+          ;; to `orgist-todoist-id-property', never to :ID:, so an
+          ;; existing org-id is kept and links to it survive the push
+          ;; (see `orgist-remap-temp-ids').
           (condition-case err
               (save-excursion
                 (goto-char (point-min))
                 (while (re-search-forward org-heading-regexp nil t)
                   (org-back-to-heading t)
-                  (cond
-                   ((and (org-get-todo-state)
-                         (not (org-entry-get (point) "ID"))
-                         (not (org-entry-get (point) "SECTION")))
-                    (let ((temp-id (org-id-uuid)))
-                      (org-entry-put (point) "ID" temp-id)
-                      (orgist-id-cache-put temp-id)
-                      (push (cons temp-id 'new) file-changes)
-                      (setq file-changes
-                            (orgist--merge-sibling-order-changes
-                             (orgist--assign-new-heading-order) file-changes))))
-                   ((and (= (org-current-level) 1)
-                         (not (org-get-todo-state))
-                         (not (org-entry-get (point) "ID"))
-                         (not (org-entry-get (point) "SECTION")))
-                    (let ((temp-id (org-id-uuid)))
-                      (org-entry-put (point) "ID" temp-id)
-                      (org-entry-put (point) "SECTION" "t")
-                      (org-entry-put (point) "TODOIST-ORDER" "0")
-                      (orgist-id-cache-put temp-id)
-                      (push (cons temp-id 'new-section) file-changes)))
-                   ;; Pending section: heading has SECTION=t and an ID, but
-                   ;; the ID is not in snapshots — a prior detection marked
-                   ;; the heading but the section_add never reached Todoist
-                   ;; (e.g. a follow-up save replaced the confirm buffer
-                   ;; before the user accepted, or the API call failed).
-                   ;; Re-emit so the section actually gets created and any
-                   ;; child item_move referencing it can resolve.
-                   ((let ((id (org-entry-get (point) "ID")))
-                      (and id
-                           (org-entry-get (point) "SECTION")
-                           (not (gethash id orgist-snapshots))))
-                    (push (cons (org-entry-get (point) "ID") 'new-section)
-                          file-changes))
-                   ;; Pending task: the same failure as the section case
-                   ;; above, plus the commoner one — an org-id UUID stamped
-                   ;; on the heading (org-store-link, org-capture,
-                   ;; org-linker) before the first scan saw it, which
-                   ;; permanently disqualifies it from the no-ID branch.
-                   ;; Either way it has an ID but no snapshot, so neither
-                   ;; the snapshot-keyed diff loop nor the branches above
-                   ;; can ever see it.  Only dashed UUIDs qualify: a
-                   ;; dash-free ID is a real Todoist ID whose snapshot went
-                   ;; missing, and re-adding it would duplicate the task.
-                   ((let ((id (org-entry-get (point) "ID")))
-                      (and id
-                           (string-match-p "-" id)
-                           (org-get-todo-state)
-                           (not (org-entry-get (point) "SECTION"))
-                           (not (gethash id orgist-snapshots))))
-                    (push (cons (org-entry-get (point) "ID") 'new)
-                          file-changes)
-                    (unless (org-entry-get (point) "TODOIST-ORDER")
-                      (setq file-changes
-                            (orgist--merge-sibling-order-changes
-                             (orgist--assign-new-heading-order) file-changes)))))
+                  (let* ((org-id (org-entry-get (point) "ID"))
+                         (todoist-id (org-entry-get (point) orgist-todoist-id-property))
+                         (section (org-entry-get (point) "SECTION"))
+                         (element-id (or todoist-id org-id))
+                         ;; Pending: bound to a temporary ID whose creation
+                         ;; never reached Todoist (a follow-up save replaced
+                         ;; the confirm buffer before the user accepted, or
+                         ;; the API call failed).  Temporary IDs live in
+                         ;; `orgist-todoist-id-property'; a SECTION heading
+                         ;; may still carry one in :ID: from older orgist
+                         ;; versions.  Only temporary IDs qualify: a
+                         ;; dash-free ID is a real Todoist ID whose snapshot
+                         ;; went missing, and re-adding it would duplicate
+                         ;; the element.
+                         (pending (and (orgist--temp-id-p element-id)
+                                       (not (gethash element-id orgist-snapshots))
+                                       (or todoist-id section)
+                                       element-id))
+                         (unbound (and (not todoist-id)
+                                       (not section)
+                                       (or (null org-id)
+                                           (and (orgist--temp-id-p org-id)
+                                                (not (gethash org-id orgist-snapshots)))))))
+                    (cond
+                     ((and unbound (org-get-todo-state) (not section))
+                      (let ((temp-id (orgist--mint-temp-id)))
+                        (push (cons temp-id 'new) file-changes)
+                        ;; A heading that had no ID at all is always
+                        ;; renumbered among its siblings; one that only
+                        ;; carried an org-id keeps an order it already has.
+                        (when (or (null org-id)
+                                  (not (org-entry-get (point) "TODOIST-ORDER")))
+                          (setq file-changes
+                                (orgist--merge-sibling-order-changes
+                                 (orgist--assign-new-heading-order) file-changes)))))
+                     ((and unbound
+                           (= (org-current-level) 1)
+                           (not (org-get-todo-state))
+                           (not section))
+                      (let ((temp-id (orgist--mint-temp-id)))
+                        (org-entry-put (point) "SECTION" "t")
+                        (org-entry-put (point) "TODOIST-ORDER" "0")
+                        (push (cons temp-id 'new-section) file-changes)))
+                     ;; Pending section: re-emit so the section actually
+                     ;; gets created and any child item_move referencing
+                     ;; it can resolve.
+                     ((and pending section)
+                      (push (cons pending 'new-section) file-changes))
+                     ;; Pending task.
+                     ((and pending (org-get-todo-state))
+                      (push (cons pending 'new) file-changes)
+                      (unless (org-entry-get (point) "TODOIST-ORDER")
+                        (setq file-changes
+                              (orgist--merge-sibling-order-changes
+                               (orgist--assign-new-heading-order) file-changes))))))
                   (end-of-line)))
             (error
              (cl-incf file-errors)
@@ -4931,7 +4986,7 @@ Returns a list of command alists with keys `type', `uuid', `args'."
                     (save-excursion
                       (goto-char pos)
                       (let ((name (car (orgist-extract-heading-and-tags)))
-                            (project-id (org-entry-get (point-min) "ID")))
+                            (project-id (orgist--element-id (point-min))))
                         (push (list (cons 'type "section_add")
                                     (cons 'uuid (org-id-uuid))
                                     (cons 'temp_id id)
@@ -4950,7 +5005,7 @@ Returns a list of command alists with keys `type', `uuid', `args'."
                       (save-excursion
                         (goto-char pos)
                         (let* ((local (orgist-element-local-state))
-                               (project-id (org-entry-get (point-min) "ID"))
+                               (project-id (orgist--element-id (point-min)))
                                (parent-id (plist-get local :parent-id))
                                (parent-snap (when parent-id
                                               (gethash parent-id orgist-snapshots)))
@@ -5668,7 +5723,10 @@ Updates snapshots with the new attachment-files entries."
 (defun orgist-remap-temp-ids (commands temp-id-mapping)
   "Remap temporary IDs to real Todoist IDs after successful item_add.
 COMMANDS is the list of commands sent.  TEMP-ID-MAPPING is an alist
-mapping temp UUIDs to real Todoist IDs from the API response."
+mapping temp UUIDs to real Todoist IDs from the API response.
+The real ID becomes the heading's :ID: unless the heading carries an
+org-id there, which stays put for the links and attachment
+directories that depend on it (see `orgist--set-element-id')."
   (dolist (cmd commands)
     (when (member (alist-get 'type cmd) '("item_add" "section_add"))
       (let* ((temp-id (alist-get 'temp_id cmd))
@@ -5683,7 +5741,13 @@ mapping temp UUIDs to real Todoist IDs from the API response."
                   (when-let* ((pos (orgist-find-element-by-id temp-id)))
                     (save-excursion
                       (goto-char pos)
-                      (org-entry-put (point) "ID" real-id)
+                      (if (equal (org-entry-get (point) orgist-todoist-id-property)
+                                 temp-id)
+                          (progn
+                            (org-entry-delete (point) orgist-todoist-id-property)
+                            (orgist--set-element-id real-id))
+                        ;; Temporary ID minted into :ID: by an older orgist.
+                        (org-entry-put (point) "ID" real-id))
                       ;; Re-key id-cache while point is at the heading
                       ;; so orgist-id-cache-put records the correct position.
                       (remhash temp-id orgist-id-cache)
@@ -6314,7 +6378,7 @@ section alists."
     (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
       (when-let* ((buf (find-buffer-visiting file)))
         (with-current-buffer buf
-          (when-let* ((project-id (org-entry-get (point-min) "ID" t)))
+          (when-let* ((project-id (orgist--element-id (point-min))))
             (unless (gethash project-id seen-projects)
               (puthash project-id t seen-projects)
               (let ((sections (orgist--fetch-archived-sections-for-project
