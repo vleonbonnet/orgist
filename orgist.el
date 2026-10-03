@@ -94,7 +94,8 @@
   "Logging level for orgist operations."
   :type '(choice (const :tag "Debug" debug)
                  (const :tag "Info" info)
-                 (const :tag "Warning" warn)))
+                 (const :tag "Warning" warn)
+                 (const :tag "Error" error)))
 
 (defcustom orgist-log-file
   (concat orgist-base-dir "orgist.log")
@@ -3833,7 +3834,7 @@ Returns an inactive timestamp like '[2025-06-22 Wed 22:43]' or nil if invalid."
   "Log message at LEVEL to *Messages* and to `orgist-log-file'.
 The file always receives all levels; *Messages* respects `orgist-log-level'.
 When `orgist--log-buffer' is non-nil, file writes are deferred."
-  (let* ((priorities '((debug . 1) (info . 2) (warn . 3)))
+  (let* ((priorities '((debug . 1) (info . 2) (warn . 3) (error . 4)))
          (text (apply #'format format-string args))
          (file-msg (format "Orgist [%s] %s"
                            (upcase (symbol-name level)) text))
