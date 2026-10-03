@@ -6,8 +6,12 @@
 #   ./test-run.sh Orgtest            # Replay one project
 #   ./test-run.sh ert                # Standalone ERT regression suites only
 #   ./test-run.sh record Orgtest     # Record API responses (needs token)
-#   ./test-run.sh live               # Live API test, all projects (needs token)
-#   ./test-run.sh live Orgtest       # Live API test, one project (needs token)
+#   ./test-run.sh live               # Live API pull, all projects (needs token)
+#   ./test-run.sh live Orgtest       # Live API pull, one project (needs token)
+#   ./test-run.sh live-writeback     # Live write-back checks on Orgtest (needs token, pandoc)
+#
+# Live modes run in a throwaway orgist-base-dir, never the mirror
+# directory; live-writeback creates and deletes its own Orgtest tasks.
 #   ORGIST_TEST_TASK_ID=<id> ./test-run.sh live-attachments
 #                                      # Live attachment CRUD (needs token)
 #
@@ -88,6 +92,9 @@ require_token() {
 run_ert() {
     # Standalone ERT regression suites (exit code is the failure count)
     local file rc=0
+    if ! command -v pandoc >/dev/null 2>&1; then
+        echo "WARNING: pandoc not on PATH; Markdown conversion tests will be SKIPPED"
+    fi
     for file in test-due-string.el test-region-guard.el test-sync-token.el \
                 test-id-cache.el test-body-spacing.el test-new-item-order.el \
                 test-confirm.el test-local-links.el test-element-identity.el \
@@ -119,6 +126,13 @@ main() {
     elif [ "$1" = "live" ]; then
         require_token
         run_live "$2"
+    elif [ "$1" = "live-writeback" ]; then
+        require_token
+        TODOIST_API_TOKEN="$TODOIST_API_TOKEN" \
+            HOME="${HOME:-/c/Users/$USER}" \
+            timeout "$PROJECT_TIMEOUT" "$EMACS" --batch \
+            --chdir "$SCRIPT_DIR" \
+            -l "$SCRIPT_DIR/test-writeback-live.el"
     elif [ "$1" = "ert" ]; then
         run_ert
     elif [ "$1" = "move" ]; then

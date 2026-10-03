@@ -2,6 +2,11 @@
 
 ;; Usage: timeout 120 emacs --batch -l test-sync.el -- [PROJECT-NAME]
 ;; If PROJECT-NAME is provided, only sync that project.
+;;
+;; The sync runs in a throwaway `orgist-base-dir', never the user's
+;; mirror directory: a fresh directory has no snapshots, so no
+;; write-back can run, and the pull reads Todoist without changing
+;; it.  Pass --keep to leave the directory in place for inspection.
 
 ;; Add dependency paths (elpaca builds)
 (add-to-list 'load-path
@@ -30,32 +35,36 @@
 ;; Check for arguments (skip "--" separator)
 (setq command-line-args-left
       (seq-remove (lambda (a) (string= a "--")) command-line-args-left))
-;; Parse --full flag (forces full sync without deleting saved token)
-(defvar orgist-test-force-full nil)
-(when (member "--full" command-line-args-left)
-  (setq orgist-test-force-full t)
-  (setq command-line-args-left
-        (seq-remove (lambda (a) (string= a "--full")) command-line-args-left))
-  (message "=== Full sync forced (sync token ignored) ==="))
+;; --full is accepted for compatibility: a fresh directory always syncs fully.
+(setq command-line-args-left
+      (seq-remove (lambda (a) (string= a "--full")) command-line-args-left))
+(defvar orgist-test-keep-dir (member "--keep" command-line-args-left))
+(setq command-line-args-left
+      (seq-remove (lambda (a) (string= a "--keep")) command-line-args-left))
 (let ((project-filter (car command-line-args-left)))
   (setq command-line-args-left (cdr command-line-args-left))
   (when project-filter
     (setq orgist-sync-project-filter project-filter)
     (message "=== Project filter set to: %s ===" project-filter)))
 
+;; Isolate every file orgist reads or writes.
+(let ((dir (file-name-as-directory (make-temp-file "orgist-live-sync-" t))))
+  (setq orgist-base-dir dir
+        orgist-sync-token-filename (concat dir "sync_token")
+        orgist-snapshot-file (concat dir "snapshots.el")
+        orgist-labels-file (concat dir "labels.el")
+        orgist-log-file (concat dir "orgist.log")
+        orgist-auto-pull-interval nil
+        orgist-sync-completed-tasks nil
+        orgist-sync-comments nil))
+
 (message "=== Starting orgist sync test ===")
 (message "=== orgist-base-dir: %s ===" orgist-base-dir)
 (message "=== orgist-sync-project-filter: %s ===" orgist-sync-project-filter)
 
+(orgist)
 
-;; Run sync (override sync token when --full is used)
-(if orgist-test-force-full
-    (let ((orgist-sync-token-filename
-           (concat orgist-base-dir "sync_token_NONEXISTENT")))
-      (orgist))
-  (orgist))
-
-;; Wait for async request to complete (poll for up to 90 seconds)
+;; Wait for async request to complete
 (let ((waited 0)
       (max-wait 300))
   (while (and orgist-sync-mutex (< waited max-wait))
@@ -87,6 +96,15 @@
       (message "  (log has %d total lines)" total)
       (dolist (line tail-lines)
         (message "  %s" line)))))
+
+(if orgist-test-keep-dir
+    (message "=== Kept %s ===" orgist-base-dir)
+  (dolist (buf (buffer-list))
+    (when-let* ((file (buffer-file-name buf)))
+      (when (string-prefix-p (expand-file-name orgist-base-dir) (expand-file-name file))
+        (with-current-buffer buf (set-buffer-modified-p nil))
+        (kill-buffer buf))))
+  (delete-directory orgist-base-dir t))
 
 (message "=== Test complete ===")
 (kill-emacs 0)

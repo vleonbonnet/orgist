@@ -17,10 +17,13 @@ Orgist is an Emacs Lisp package for bidirectional sync between Todoist and Org-M
 # Record fresh API responses (needs TODOIST_API_TOKEN or `pass`)
 ./test-run.sh record Orgtest
 
-# Live API tests (needs TODOIST_API_TOKEN or `pass`)
-./test-run.sh live                # All projects
-./test-run.sh live Orgtest        # One project
+# Live API tests (needs TODOIST_API_TOKEN or `pass`), in a throwaway base dir
+./test-run.sh live                # Pull all projects
+./test-run.sh live Orgtest        # Pull one project
+./test-run.sh live-writeback      # Write-back round trips on Orgtest (also needs pandoc)
 ```
+
+Never run orgist batch code against the real `orgist-base-dir`: in batch, write-back executes without the review buffer for every file there.
 
 ## File Structure
 
@@ -29,7 +32,8 @@ Orgist is an Emacs Lisp package for bidirectional sync between Todoist and Org-M
 - `README.org` — Project documentation, architecture, configuration reference
 - `test-harness.el` — Offline test infrastructure (request mock, isolation, lifecycle runner)
 - `test-run.sh` — Shell wrapper for replay, record, and live test modes
-- `test-sync.el` — Live API sync test script
+- `test-sync.el` — Live API pull test script (throwaway base dir)
+- `test-writeback-live.el` — Live write-back round trips on the Orgtest project (identity, description sub-headings); cleans up its tasks
 - `test-due-string.el` — ERT regression tests for hand-edited `TODOIST_DUE_STRING` write-back
 - `test-region-guard.el` — ERT regression tests for pull-side org command guards (active-region smear, todo-dependency blocking, done-keyword preservation)
 - `test-sync-token.el` — ERT regression tests ensuring command-only writes cannot advance the read sync cursor

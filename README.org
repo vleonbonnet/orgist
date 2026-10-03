@@ -391,8 +391,9 @@ commands with a =project_id= target.
 | =CLAUDE.md=         | Claude Code (AI assistant) instructions              |
 | =test-harness.el=   | Offline test infrastructure (request mock, runner)   |
 | =test-run.sh=       | Shell wrapper for test-harness and live tests        |
-| =test-sync.el=      | Live API sync test script                            |
+| =test-sync.el=      | Live API pull test script (throwaway base dir)       |
 | =test-attachments-live.el= | Live attachment CRUD test (needs token)        |
+| =test-writeback-live.el= | Live write-back round trips on Orgtest (needs token) |
 | =test-*.el= (others) | Standalone ERT regression suites (=./test-run.sh ert=) |
 | =test-data/=        | Shared cached API responses (committed)              |
 | =screenshots/=      | Synthetic Org, Todoist, and confirmation views      |
@@ -416,6 +417,7 @@ commands with a =project_id= target.
 | New features      | =./test-run.sh features=          |   100 | Timezone, duration, labels, etc.     |
 | Attachments       | =./test-run.sh attachments=       |    52 | ATTACH tag, pull/push, diff, confirm |
 | ERT regression    | =./test-run.sh ert=               |    63 | Identity, ordering, spacing, guards, review |
+| Live write-back   | =./test-run.sh live-writeback=    |    21 | Real API identity and description round trips (needs token) |
 | Live attachments  | =./test-run.sh live-attachments=  |    19 | Real API attachment CRUD (needs token) |
 
 ** Offline Replay (no API token needed)
@@ -448,11 +450,12 @@ only during recording.
 
 ** Live API Tests
 
-Runs a real sync against the Todoist API without caching.
+Runs against the real Todoist API without caching.  The live modes work in a throwaway =orgist-base-dir=, never the mirror directory: =live= only pulls, and =live-writeback= creates its own tasks in the Orgtest project, checks element identity and description sync through pushes and pulls, and deletes the tasks again.
 
 #+begin_src bash
-  ./test-run.sh live             # All projects (needs token)
-  ./test-run.sh live Orgtest     # Single project (needs token)
+  ./test-run.sh live             # Pull all projects (needs token)
+  ./test-run.sh live Orgtest     # Pull a single project (needs token)
+  ./test-run.sh live-writeback   # Write-back round trips on Orgtest (needs token, pandoc)
   ORGIST_TEST_TASK_ID=<id> ./test-run.sh live-attachments  # Needs token + disposable task
 #+end_src
 
