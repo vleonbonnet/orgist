@@ -10,8 +10,9 @@ Orgist is an Emacs Lisp package for bidirectional sync between Todoist and Org-M
 
 ```bash
 # Offline replay tests (primary — no API token needed)
-./test-run.sh                     # All projects
+./test-run.sh                     # All projects, then ERT suites
 ./test-run.sh Orgtest             # One project
+./test-run.sh ert                 # Standalone ERT regression suites only
 
 # Record fresh API responses (needs TODOIST_API_TOKEN or `pass`)
 ./test-run.sh record Orgtest
@@ -36,6 +37,7 @@ Orgist is an Emacs Lisp package for bidirectional sync between Todoist and Org-M
 - `test-body-spacing.el` — ERT regression tests for body spacing normalization (blank line after a LOGBOOK drawer)
 - `test-new-item-order.el` — ERT regression tests for new-task ordering (item_add child_order, sibling reorder in the same batch)
 - `test-confirm.el` — ERT regression tests for the review adapter (tree building, live remote values, partial selection)
+- `test-local-links.el` — ERT regression tests for local Org links across Markdown conversion
 - `test-capture.el` — Batch-output capture shim (works around the Emacs 30.2 Windows `--batch` stderr bug; see `test-run.sh`)
 - `test-data/` — Shared cached API responses (`full-sync.json`, `incremental-sync.json`)
 - `test-data-move/` — Synthetic fixture for the cross-project `move` test (invented projects/tasks, no live data)

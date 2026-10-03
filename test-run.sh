@@ -2,8 +2,9 @@
 # Test runner for orgist.
 #
 # Usage:
-#   ./test-run.sh                    # Replay all cached projects
+#   ./test-run.sh                    # Replay all cached projects, then ERT suites
 #   ./test-run.sh Orgtest            # Replay one project
+#   ./test-run.sh ert                # Standalone ERT regression suites only
 #   ./test-run.sh record Orgtest     # Record API responses (needs token)
 #   ./test-run.sh live               # Live API test, all projects (needs token)
 #   ./test-run.sh live Orgtest       # Live API test, one project (needs token)
@@ -89,7 +90,7 @@ run_ert() {
     local file rc=0
     for file in test-due-string.el test-region-guard.el test-sync-token.el \
                 test-id-cache.el test-body-spacing.el test-new-item-order.el \
-                test-confirm.el; do
+                test-confirm.el test-local-links.el; do
         echo "Running ERT suite $file..."
         if ! timeout "$PROJECT_TIMEOUT" "$EMACS" --batch \
              --chdir "$SCRIPT_DIR" -L "$SCRIPT_DIR" \
@@ -117,6 +118,8 @@ main() {
     elif [ "$1" = "live" ]; then
         require_token
         run_live "$2"
+    elif [ "$1" = "ert" ]; then
+        run_ert
     elif [ "$1" = "move" ]; then
         run_harness move
     elif [ "$1" = "state-log" ]; then
