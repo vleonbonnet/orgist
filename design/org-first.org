@@ -381,9 +381,13 @@ Exit: a pre-existing org-id survives a push; an edit below a task's first child 
 
 Delivered in =org-sync-safety.el= and orgist's =;;; Safety net= section.  The journal records removed subtrees, replaced descriptions and removed files; a remote value overwriting an unpushed local field is not journaled separately, because the pull's "before" history record holds it.  =orgist-undo-cycle= moved to [[id:4299b593-37f9-4f85-a99c-afbdaff627eb][M2 — Rebuild-and-validate from remote]], which it depends on.  Found on the way: deleting a Todoist sub-project deleted its parent project's whole file.
 
-** TODO M1 — Seams refactor
+** DONE M1 — Seams refactor
+CLOSED: [2026-10-03 Sat 16:24]
 :PROPERTIES:
 :ID:       c6b4f748-2dab-4955-bdc9-34154b4b5268
+:END:
+:LOGBOOK:
+- [2026-10-03 Sat 16:24] From "TODO"     to "DONE"
 :END:
 
 Replace the ~22 base-dir listings with a file registry, the ~40 ="ID"= literals with an identity accessor, and add a per-file policy (mode, destructive operations allowed, description policy, projection rules), and put Todoist behind a backend interface (see Backend independence). Route all buffer mutation through guarded primitives with an in-process apply path.
@@ -398,6 +402,8 @@ Delivered in steps, each a commit with every suite green:
 5. Row 10: a large pull never overwrites a buffer edited while it runs.  Found while scoping it: the sync, completed-tasks and comments subprocesses all save org files behind Emacs (with the "changed on disk" check disabled), so a file saved while one runs is overwritten, and a write-back made meanwhile loses its snapshot updates when the subprocess's snapshot file is reloaded.  The user chose Emacs as the only writer, to be tried in daily use before it becomes the default:
    - Subprocesses return the snapshot entries they changed; Emacs merges them field by field instead of reloading the file (all modes).
    - =orgist-sole-writer= (default off): a subprocess works on a staged copy of the project files.  Emacs then compares, per file, the copy, the subprocess's result and the live buffer or file.  A file nobody touched takes the result; a file edited or saved meanwhile is left alone, with its snapshot changes dropped and the sync cursors (sync token, completed-tasks timestamp, comments flags) held back, so the next sync redoes those changes against the edited text.  Emacs never re-applies a sync on the spot, which keeps it responsive; the log reports what was swapped, what was deferred and how long Emacs was busy.
+
+Verified: a full sync response fetched once from the real account and replayed offline into two copies of the real mirror, with the code before and after M1, produced byte-identical files, snapshots and labels.  =orgist-sole-writer= stays off until it has been tried in daily use: on the real data a run that changes nothing keeps Emacs busy about 95 ms, and taking over the largest file about 135 ms.
 
 ** TODO M2 — Rebuild-and-validate from remote
 :PROPERTIES:
