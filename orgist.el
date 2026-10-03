@@ -424,6 +424,51 @@ Created lazily by `orgist--pandoc-lua-filter'.")
                     nil orgist-log-file t 'silent))
     (setq orgist--log-buffer nil)))
 
+;;; Project files
+
+;; The one place that knows which Org files orgist manages.  In mirror
+;; mode they are the .org files directly in `orgist-base-dir'.
+
+(defun orgist--project-files ()
+  "Return the Org files orgist manages, as absolute names in file order."
+  (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
+
+(defun orgist--project-buffer (file &optional visit)
+  "Return the buffer visiting project FILE, or nil.
+With VISIT, visit FILE when no buffer does."
+  (or (find-buffer-visiting file)
+      (and visit (find-file-noselect file))))
+
+(defun orgist--project-buffers (&optional visit)
+  "Return the buffers of `orgist--project-files', in file order.
+Only files already visited, unless VISIT is non-nil."
+  (delq nil (mapcar (lambda (file) (orgist--project-buffer file visit))
+                    (orgist--project-files))))
+
+(defun orgist--element-location (id &optional visit)
+  "Return (BUFFER . POSITION) of the heading of element ID, or nil.
+Searches the project buffers in file order and stops at the first
+holding ID.  With VISIT, files are visited one at a time as the
+search reaches them; otherwise only already visited files count."
+  (catch 'found
+    (dolist (file (orgist--project-files))
+      (when-let* ((buffer (orgist--project-buffer file visit))
+                  (pos (with-current-buffer buffer (orgist-find-element-by-id id))))
+        (throw 'found (cons buffer pos))))))
+
+(defmacro orgist--at-element (id visit &rest body)
+  "Evaluate BODY at the heading of element ID and return its value.
+BODY runs in the project buffer `orgist--element-location' finds for
+ID and VISIT, inside `save-excursion' with point on the heading.
+Returns nil without evaluating BODY when no project buffer holds ID."
+  (declare (indent 2) (debug t))
+  (let ((location (make-symbol "location")))
+    `(when-let* ((,location (orgist--element-location ,id ,visit)))
+       (with-current-buffer (car ,location)
+         (save-excursion
+           (goto-char (cdr ,location))
+           ,@body)))))
+
 ;;; Auto-pull
 
 (defun orgist--auto-pull-due-p ()
@@ -1105,7 +1150,7 @@ PLIST is a property list with these keys:
                      ;; Open org files and build id-caches
                      ,@(when open-org-files
                          `((orgist-load-snapshots t)
-                           (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
+                           (dolist (file (orgist--project-files))
                              (find-file file)
                              (org-mode)
                              (orgist-build-id-cache))))
@@ -1262,7 +1307,7 @@ on disk — reverting wipes the org-element cache and forces a full
 re-parse, which blocks Emacs when run from a process sentinel.
 Suppresses confirmation prompts, rebuilds ID caches, and re-folds
 drawers."
-  (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
+  (dolist (file (orgist--project-files))
     (when-let* ((buf (find-buffer-visiting file)))
       (cond
        ((buffer-modified-p buf)
@@ -1314,7 +1359,7 @@ pull in a subprocess."
   ;; Buffers opened by the agenda before the token was set, or
   ;; opened by find-file-noselect during sync, may not have the
   ;; mode active because org-mode-hook only fires on first activation.
-  (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
+  (dolist (file (orgist--project-files))
     (when-let* ((buf (find-buffer-visiting file)))
       (with-current-buffer buf
         (when (and (not orgist-mode)
@@ -1632,7 +1677,7 @@ SIZES maps each file name to its buffer size."
   (let ((ids (make-hash-table :test 'equal))
         (sizes (make-hash-table :test 'equal))
         (id-line "^[ \t]*:\\(?:TODOIST_\\)?ID:[ \t]+\\S-"))
-    (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
+    (dolist (file (orgist--project-files))
       (let ((name (file-name-nondirectory file))
             (seen (make-hash-table :test 'eql)))
         (with-current-buffer (or (find-buffer-visiting file) (find-file-noselect file))
@@ -1755,7 +1800,7 @@ with the current file,
                     (file-name-nondirectory current))))
     (completing-read (format-prompt "History of" default)
                      (mapcar #'file-name-nondirectory
-                             (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
+                             (orgist--project-files))
                      nil nil nil nil default)))
 
 ;;;###autoload
@@ -2505,7 +2550,7 @@ heading levels."
           (let ((transplanted nil)
                 (in-target (with-current-buffer project-buffer
                              (orgist-find-element-by-id element-id))))
-            (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
+            (dolist (file (orgist--project-files))
               (when-let* ((buf (find-buffer-visiting file)))
                 (unless (eq buf project-buffer)
                   (with-current-buffer buf
@@ -3974,14 +4019,7 @@ Caches opened buffers for subsequent calls."
       (orgist-log 'debug "Cache miss - %s" project-id)
       (setq orgist-project-buffer-cache
             (assoc-delete-all project-id orgist-project-buffer-cache))
-      (when-let* ((project-buffer (catch 'found
-                                    (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
-                                      (when-let* ((buffer (or (find-buffer-visiting file)
-                                                              (find-file-noselect file))))
-                                        (with-current-buffer buffer
-                                          (when (orgist-find-element-by-id project-id)
-                                            (throw 'found buffer)))))
-                                    nil)))
+      (when-let* ((project-buffer (car (orgist--element-location project-id t))))
         (orgist-log 'debug "Cache - adding %s" project-buffer)
         (push (cons project-id project-buffer) orgist-project-buffer-cache)
         project-buffer))))
@@ -4684,24 +4722,15 @@ search every project file under `orgist-base-dir' for the heading that
 carries ELEMENT-ID and delete its subtree there.  LABEL is used only for
 logging.  Also drops the element's write-back snapshot so the now-removed
 heading is not later mistaken for a local deletion to push back."
-  (let ((deleted nil))
-    (catch 'done
-      (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
-        (when-let* ((buffer (or (find-buffer-visiting file)
-                                (find-file-noselect file))))
-          (with-current-buffer buffer
-            (save-excursion
-              (when-let* ((point (orgist-find-element-by-id element-id)))
-                (goto-char point)
-                (orgist--remove-subtree (format "Deleted %s" (org-get-heading t t t t))
-                                        "Deleted in Todoist" t)
-                ;; Drop the now-stale cache entry; surviving markers track
-                ;; the deletion automatically and self-heal on next lookup.
-                (when orgist-id-cache
-                  (remhash element-id orgist-id-cache))
-                (orgist--save-buffer)
-                (setq deleted t)
-                (throw 'done nil)))))))
+  (let ((deleted (orgist--at-element element-id t
+                   (orgist--remove-subtree (format "Deleted %s" (org-get-heading t t t t))
+                                           "Deleted in Todoist" t)
+                   ;; Drop the now-stale cache entry; surviving markers track
+                   ;; the deletion automatically and self-heal on next lookup.
+                   (when orgist-id-cache
+                     (remhash element-id orgist-id-cache))
+                   (orgist--save-buffer)
+                   t)))
     (when orgist-snapshots
       (remhash element-id orgist-snapshots))
     (if deleted
@@ -5019,7 +5048,7 @@ Useful after a sync error that left snapshots stale."
   (orgist-load-snapshots t)
   (let ((count 0)
         (seen-ids (make-hash-table :test 'equal)))
-    (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
+    (dolist (file (orgist--project-files))
       (let ((buf (or (find-buffer-visiting file)
                      (find-file-noselect file))))
         (with-current-buffer buf
@@ -5111,7 +5140,7 @@ and offers to rebuild when problems are found."
         (total-org 0)
         (total-snap (hash-table-count orgist-snapshots)))
     ;; Collect all task/section IDs from org files.
-    (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
+    (dolist (file (orgist--project-files))
       (let ((buf (or (find-buffer-visiting file)
                      (find-file-noselect file))))
         (with-current-buffer buf
@@ -5739,7 +5768,7 @@ Returns an alist of (FILE . HASH) so the scan can stamp the exact
 content it verified; HASH is nil when only the buffer is modified."
   (orgist--load-stamps)
   (let ((due '()))
-    (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
+    (dolist (file (orgist--project-files))
       (let* ((buf (find-buffer-visiting file))
              (buffer-dirty (and buf (buffer-modified-p buf)))
              (hash (unless buffer-dirty (orgist--file-content-hash file))))
@@ -5765,7 +5794,7 @@ and every other element and file is still processed."
     (orgist-load-snapshots))
   (setq orgist--pending-stamps nil)
   (let* ((due-files (orgist--modified-org-files))
-         (all-org-files (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
+         (all-org-files (orgist--project-files))
          (all-count (length all-org-files))
          (mod-count (length due-files))
          (skipped (- all-count mod-count))
@@ -5963,118 +5992,103 @@ Returns a list of command alists with keys `type', `uuid', `args'."
          ;; as section_id and Todoist resolves the temp_id to the real
          ;; section ID server-side.
          ((eq diff 'new-section)
-          (catch 'built-section
-            (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
-              (when-let* ((buf (find-buffer-visiting file)))
-                (with-current-buffer buf
-                  (when-let* ((pos (orgist-find-element-by-id id)))
-                    (save-excursion
-                      (goto-char pos)
-                      (let ((name (car (orgist-extract-heading-and-tags)))
-                            (project-id (orgist--element-id (point-min))))
-                        (push (list (cons 'type "section_add")
-                                    (cons 'uuid (org-id-uuid))
-                                    (cons 'temp_id id)
-                                    (cons 'args (list (cons 'name name)
-                                                      (cons 'project_id project-id))))
-                              commands)
-                        (throw 'built-section nil)))))))))
+          (orgist--at-element id nil
+            (let ((name (car (orgist-extract-heading-and-tags)))
+                  (project-id (orgist--element-id (point-min))))
+              (push (list (cons 'type "section_add")
+                          (cons 'uuid (org-id-uuid))
+                          (cons 'temp_id id)
+                          (cons 'args (list (cons 'name name)
+                                            (cons 'project_id project-id))))
+                    commands))))
          ;; New element — build item_add command
          ((eq diff 'new)
-          (catch 'built
-            (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
-              (let ((buf (find-buffer-visiting file)))
-                (when buf
-                  (with-current-buffer buf
-                    (when-let* ((pos (orgist-find-element-by-id id)))
-                      (save-excursion
-                        (goto-char pos)
-                        (let* ((local (orgist-element-local-state))
-                               (project-id (orgist--element-id (point-min)))
-                               (parent-id (plist-get local :parent-id))
-                               (parent-snap (when parent-id
-                                              (gethash parent-id orgist-snapshots)))
-                               (add-args
-                                (list (cons 'content (orgist-convert-content-to-markdown
-                                                      (plist-get local :content)))
-                                      (cons 'project_id project-id)))
-                               ;; Determine parent placement from what the
-                               ;; parent heading actually is: SECTION
-                               ;; property → section, TODO keyword → task,
-                               ;; no TODO keyword → sub-project (API rejects
-                               ;; parent_id pointing to a project).
-                               ;; TODOIST-ORDER / snapshot :order presence
-                               ;; is not a reliable task-vs-project signal:
-                               ;; locally created tasks have neither until
-                               ;; the item round-trips through a pull.
-                               (place-key (cond
-                                           ((or (null parent-id)
-                                                (equal parent-id project-id))
-                                            nil)
-                                           ;; Classify by the parent heading
-                                           ((save-excursion
-                                              (when-let* ((ppos (orgist-find-element-by-id parent-id)))
-                                                (goto-char ppos)
-                                                (cond
-                                                 ((org-entry-get (point) "SECTION")
-                                                  'section_id)
-                                                 ((org-get-todo-state)
-                                                  'parent_id)
-                                                 (t 'project_id)))))
-                                           ;; Heading not found — fall back
-                                           ;; to the snapshot.
-                                           ((and parent-snap
-                                                 (plist-get parent-snap :section-p))
-                                            'section_id)
-                                           ((and parent-snap
-                                                 (plist-get parent-snap :order))
-                                            'parent_id)
-                                           (parent-snap 'project_id)
-                                           (t nil))))
-                          (if (eq place-key 'project_id)
-                              ;; Sub-project: replace the root project_id
-                              (setf (alist-get 'project_id add-args) parent-id)
-                            (when (and place-key parent-id)
-                              (push (cons place-key parent-id) add-args)))
-                          (let ((pri (plist-get local :priority)))
-                            (when (and pri (> pri 1))
-                              (push (cons 'priority pri) add-args)))
-                          (when-let* ((labels (plist-get local :labels)))
-                            (push (cons 'labels (vconcat (mapcar #'orgist--tag-to-label labels)))
-                                  add-args))
-                          (when-let* ((due (plist-get local :due)))
-                            (push (cons 'due (orgist-org-timestamp-to-todoist-due due))
-                                  add-args))
-                          (when-let* ((deadline (plist-get local :deadline)))
-                            (push (cons 'deadline (orgist-org-timestamp-to-todoist-due deadline))
-                                  add-args))
-                          (when-let* ((dur (plist-get local :duration)))
-                            (push (cons 'duration dur) add-args))
-                          (let ((desc (plist-get local :description)))
-                            (when (and desc (not (string-empty-p desc)))
-                              (push (cons 'description
-                                          (orgist-convert-description-to-markdown desc))
-                                    add-args)))
-                          ;; Place the task where the heading sits among
-                          ;; its siblings (assigned by
-                          ;; `orgist--assign-new-heading-order' during the
-                          ;; scan); Todoist would otherwise append it.
-                          (when-let* ((order (plist-get local :order)))
-                            (push (cons 'child_order order) add-args))
-                          (push (list (cons 'type "item_add")
-                                      (cons 'uuid (org-id-uuid))
-                                      (cons 'temp_id id)
-                                      (cons 'args add-args))
-                                commands)
-                          ;; If the new task is DONE, also complete it.
-                          ;; item_add creates tasks as active; a separate
-                          ;; item_complete is needed to mark them done.
-                          (when (plist-get local :checked)
-                            (push (list (cons 'type "item_complete")
-                                        (cons 'uuid (org-id-uuid))
-                                        (cons 'args (list (cons 'id id))))
-                                  commands))
-                          (throw 'built nil))))))))))
+          (orgist--at-element id nil
+            (let* ((local (orgist-element-local-state))
+                   (project-id (orgist--element-id (point-min)))
+                   (parent-id (plist-get local :parent-id))
+                   (parent-snap (when parent-id
+                                  (gethash parent-id orgist-snapshots)))
+                   (add-args
+                    (list (cons 'content (orgist-convert-content-to-markdown
+                                          (plist-get local :content)))
+                          (cons 'project_id project-id)))
+                   ;; Determine parent placement from what the
+                   ;; parent heading actually is: SECTION
+                   ;; property → section, TODO keyword → task,
+                   ;; no TODO keyword → sub-project (API rejects
+                   ;; parent_id pointing to a project).
+                   ;; TODOIST-ORDER / snapshot :order presence
+                   ;; is not a reliable task-vs-project signal:
+                   ;; locally created tasks have neither until
+                   ;; the item round-trips through a pull.
+                   (place-key (cond
+                               ((or (null parent-id)
+                                    (equal parent-id project-id))
+                                nil)
+                               ;; Classify by the parent heading
+                               ((save-excursion
+                                  (when-let* ((ppos (orgist-find-element-by-id parent-id)))
+                                    (goto-char ppos)
+                                    (cond
+                                     ((org-entry-get (point) "SECTION")
+                                      'section_id)
+                                     ((org-get-todo-state)
+                                      'parent_id)
+                                     (t 'project_id)))))
+                               ;; Heading not found — fall back
+                               ;; to the snapshot.
+                               ((and parent-snap
+                                     (plist-get parent-snap :section-p))
+                                'section_id)
+                               ((and parent-snap
+                                     (plist-get parent-snap :order))
+                                'parent_id)
+                               (parent-snap 'project_id)
+                               (t nil))))
+              (if (eq place-key 'project_id)
+                  ;; Sub-project: replace the root project_id
+                  (setf (alist-get 'project_id add-args) parent-id)
+                (when (and place-key parent-id)
+                  (push (cons place-key parent-id) add-args)))
+              (let ((pri (plist-get local :priority)))
+                (when (and pri (> pri 1))
+                  (push (cons 'priority pri) add-args)))
+              (when-let* ((labels (plist-get local :labels)))
+                (push (cons 'labels (vconcat (mapcar #'orgist--tag-to-label labels)))
+                      add-args))
+              (when-let* ((due (plist-get local :due)))
+                (push (cons 'due (orgist-org-timestamp-to-todoist-due due))
+                      add-args))
+              (when-let* ((deadline (plist-get local :deadline)))
+                (push (cons 'deadline (orgist-org-timestamp-to-todoist-due deadline))
+                      add-args))
+              (when-let* ((dur (plist-get local :duration)))
+                (push (cons 'duration dur) add-args))
+              (let ((desc (plist-get local :description)))
+                (when (and desc (not (string-empty-p desc)))
+                  (push (cons 'description
+                              (orgist-convert-description-to-markdown desc))
+                        add-args)))
+              ;; Place the task where the heading sits among
+              ;; its siblings (assigned by
+              ;; `orgist--assign-new-heading-order' during the
+              ;; scan); Todoist would otherwise append it.
+              (when-let* ((order (plist-get local :order)))
+                (push (cons 'child_order order) add-args))
+              (push (list (cons 'type "item_add")
+                          (cons 'uuid (org-id-uuid))
+                          (cons 'temp_id id)
+                          (cons 'args add-args))
+                    commands)
+              ;; If the new task is DONE, also complete it.
+              ;; item_add creates tasks as active; a separate
+              ;; item_complete is needed to mark them done.
+              (when (plist-get local :checked)
+                (push (list (cons 'type "item_complete")
+                            (cons 'uuid (org-id-uuid))
+                            (cons 'args (list (cons 'id id))))
+                      commands)))))
          ;; Modified element — build update commands
          (t
           (let ((snapshot (gethash id orgist-snapshots))
@@ -6278,18 +6292,8 @@ Returns a list of command alists with keys `type', `uuid', `args'."
                      ;; seq-uniq mirrors the diff detection — stale
                      ;; duplicate notes are never pushed.
                      (all-notes
-                      (catch 'found-notes
-                        (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
-                          (when-let* ((buf (find-buffer-visiting file)))
-                            (with-current-buffer buf
-                              (when-let* ((pos (orgist-find-element-by-id id)))
-                                (save-excursion
-                                  (goto-char pos)
-                                  (throw 'found-notes
-                                         (seq-uniq
-                                          (orgist-extract-logbook-notes)
-                                          #'equal)))))))
-                        nil))
+                      (orgist--at-element id nil
+                        (seq-uniq (orgist-extract-logbook-notes) #'equal)))
                      (new-notes (nthcdr known-count all-notes)))
                 (dolist (note new-notes)
                   (let ((note-text (cdr note)))
@@ -6338,22 +6342,14 @@ Returns a list of command alists with keys `type', `uuid', `args'."
                      ;; task-vs-project signal: locally created tasks have
                      ;; neither until the item round-trips through a pull.
                      (move-key (or
-                                (catch 'found-type
-                                  (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
-                                    (when-let* ((buf (find-buffer-visiting file)))
-                                      (with-current-buffer buf
-                                        (when-let* ((pos (orgist-find-element-by-id new-parent)))
-                                          (save-excursion
-                                            (goto-char pos)
-                                            (throw 'found-type
-                                                   (cond
-                                                    ;; File-level ID = root project
-                                                    ((= pos (point-min)) 'project_id)
-                                                    ((org-entry-get (point) "SECTION") 'section_id)
-                                                    ((org-get-todo-state) 'parent_id)
-                                                    ;; No TODO keyword = sub-project
-                                                    (t 'project_id))))))))
-                                  nil)
+                                (orgist--at-element new-parent nil
+                                  (cond
+                                   ;; File-level ID = root project
+                                   ((= (point) (point-min)) 'project_id)
+                                   ((org-entry-get (point) "SECTION") 'section_id)
+                                   ((org-get-todo-state) 'parent_id)
+                                   ;; No TODO keyword = sub-project
+                                   (t 'project_id)))
                                 ;; Heading not found — fall back to the
                                 ;; snapshot, then to a project-level move.
                                 (cond
@@ -6494,37 +6490,29 @@ Todoist's authoritative next occurrence."
       (when task
         (let ((due (alist-get 'due task))
               (duration (alist-get 'duration task)))
-          (catch 'done
-            (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
-              (let ((buf (find-buffer-visiting file)))
-                (when buf
-                  (with-current-buffer buf
-                    (when-let* ((pos (orgist-find-element-by-id id)))
-                      ;; Keep `org-schedule'/`org-todo' from looping over an
-                      ;; active user region.
-                      (let ((org-loop-over-headlines-in-active-region nil))
-                        (save-excursion
-                          (goto-char pos)
-                          ;; Apply Todoist's authoritative next date
-                          (if due
-                              (let ((org-ts (orgist-parse-todoist-date-with-duration due duration))
-                                    (due-string (alist-get 'string due)))
-                                (when org-ts
-                                  (org-schedule nil org-ts))
-                                (if due-string
-                                    (org-entry-put (point) "TODOIST_DUE_STRING" due-string)
-                                  (org-entry-delete (point) "TODOIST_DUE_STRING")))
-                            ;; No due date returned — clear schedule
-                            (org-schedule '(4))
-                            (org-entry-delete (point) "TODOIST_DUE_STRING"))
-                          ;; Reset TODO state (org set it to DONE on completion)
-                          (let ((org-inhibit-logging t))
-                            (org-todo "TODO"))
-                          ;; Clear LAST_REPEAT so write-back doesn't re-detect
-                          (org-entry-delete (point) "LAST_REPEAT")
-                          (orgist-log 'debug "Refreshed recurring date for %s from Todoist"
-                                      id)))
-                      (throw 'done nil))))))))))))
+          (orgist--at-element id nil
+            ;; Keep `org-schedule'/`org-todo' from looping over an
+            ;; active user region.
+            (let ((org-loop-over-headlines-in-active-region nil))
+              ;; Apply Todoist's authoritative next date
+              (if due
+                  (let ((org-ts (orgist-parse-todoist-date-with-duration due duration))
+                        (due-string (alist-get 'string due)))
+                    (when org-ts
+                      (org-schedule nil org-ts))
+                    (if due-string
+                        (org-entry-put (point) "TODOIST_DUE_STRING" due-string)
+                      (org-entry-delete (point) "TODOIST_DUE_STRING")))
+                ;; No due date returned — clear schedule
+                (org-schedule '(4))
+                (org-entry-delete (point) "TODOIST_DUE_STRING"))
+              ;; Reset TODO state (org set it to DONE on completion)
+              (let ((org-inhibit-logging t))
+                (org-todo "TODO"))
+              ;; Clear LAST_REPEAT so write-back doesn't re-detect
+              (org-entry-delete (point) "LAST_REPEAT")
+              (orgist-log 'debug "Refreshed recurring date for %s from Todoist"
+                          id))))))))
 
 (defun orgist--command-summary (commands)
   "Return one line per command type in COMMANDS, with its count and IDs."
@@ -6625,7 +6613,7 @@ detected again on the next write-back cycle."
         ;; doesn't end up with unsaved buffers.  Inhibit `after-save' to
         ;; avoid re-triggering the orgist write-back cycle on these saves.
         (let ((orgist--inhibit-after-save t))
-          (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
+          (dolist (file (orgist--project-files))
             (when-let* ((buf (find-buffer-visiting file)))
               (with-current-buffer buf
                 (when (and orgist-mode (buffer-modified-p))
@@ -6664,7 +6652,7 @@ Updates snapshots with the new attachment-files entries."
                     (file-name (alist-get 'file_name args))
                     (file-path
                      (catch 'found
-                       (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
+                       (dolist (file (orgist--project-files))
                          (when-let* ((buf (find-buffer-visiting file)))
                            (with-current-buffer buf
                              (when-let* ((pos (orgist-find-element-by-id item-id)))
@@ -6739,31 +6727,24 @@ directories that depend on it (see `orgist--set-element-id')."
         (when real-id
           (orgist-log 'debug "Remapping temp ID %s -> %s" temp-id real-id)
           ;; Update heading :ID: property, id-cache, and snapshots
-          (catch 'done
-            (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
-              (when-let* ((buf (find-buffer-visiting file)))
-                (with-current-buffer buf
-                  (when-let* ((pos (orgist-find-element-by-id temp-id)))
-                    (save-excursion
-                      (goto-char pos)
-                      (if (equal (org-entry-get (point) orgist-todoist-id-property)
-                                 temp-id)
-                          (progn
-                            (org-entry-delete (point) orgist-todoist-id-property)
-                            (orgist--set-element-id real-id))
-                        ;; Temporary ID minted into :ID: by an older orgist.
-                        (org-entry-put (point) "ID" real-id))
-                      ;; Re-key id-cache while point is at the heading
-                      ;; so orgist-id-cache-put records the correct position.
-                      (remhash temp-id orgist-id-cache)
-                      (orgist-id-cache-put real-id))
-                    ;; Re-key snapshots
-                    (when-let* ((snap (gethash temp-id orgist-snapshots)))
-                      (remhash temp-id orgist-snapshots)
-                      (puthash real-id snap orgist-snapshots))
-                    ;; Update the command's temp_id so snapshot-update finds it
-                    (setcdr (assq 'temp_id cmd) real-id)
-                    (throw 'done nil)))))))))))
+          (orgist--at-element temp-id nil
+            (if (equal (org-entry-get (point) orgist-todoist-id-property)
+                       temp-id)
+                (progn
+                  (org-entry-delete (point) orgist-todoist-id-property)
+                  (orgist--set-element-id real-id))
+              ;; Temporary ID minted into :ID: by an older orgist.
+              (org-entry-put (point) "ID" real-id))
+            ;; Re-key id-cache while point is at the heading
+            ;; so orgist-id-cache-put records the correct position.
+            (remhash temp-id orgist-id-cache)
+            (orgist-id-cache-put real-id)
+            ;; Re-key snapshots
+            (when-let* ((snap (gethash temp-id orgist-snapshots)))
+              (remhash temp-id orgist-snapshots)
+              (puthash real-id snap orgist-snapshots))
+            ;; Update the command's temp_id so snapshot-update finds it
+            (setcdr (assq 'temp_id cmd) real-id)))))))
 
 (defun orgist--command-snapshot-keys (cmd-type args)
   "Return the snapshot keys that CMD-TYPE with ARGS actually synced.
@@ -6865,58 +6846,50 @@ for note_add commands instead of a content fingerprint."
           nil)
          ;; Update/add/move — sync snapshot to current local state
          (t
-          (catch 'found
-            (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
-              (let ((buf (find-buffer-visiting file)))
-                (when buf
-                  (with-current-buffer buf
-                    (when-let* ((pos (orgist-find-element-by-id id)))
-                      (save-excursion
-                        (goto-char pos)
-                        ;; The command may carry a freshly synthesized
-                        ;; `due.string' (e.g. switching `+3d' to `.+3d'
-                        ;; emits "every! 3 days").  Reflect that in the
-                        ;; buffer's TODOIST_DUE_STRING so the property
-                        ;; matches what Todoist now has, without waiting
-                        ;; for the next pull.  An item_update with a
-                        ;; non-nil `due' field but no `string' means the
-                        ;; task became non-recurring — drop the property.
-                        (when (assq 'due args)
-                          (let* ((due (alist-get 'due args))
-                                 (new-string (and due (alist-get 'string due))))
-                            (cond
-                             (new-string
-                              (org-entry-put (point) "TODOIST_DUE_STRING"
-                                             new-string))
-                             ((null due)
-                              (org-entry-delete (point) "TODOIST_DUE_STRING")))))
-                        (let ((local (orgist-element-local-state))
-                              (old (gethash id orgist-snapshots))
-                              (keys (orgist--command-snapshot-keys
-                                     cmd-type args))
-                              (sent-description (assq 'description args)))
-                          (if (and old (not (eq keys 'all)))
-                              ;; Existing snapshot — advance ONLY the
-                              ;; fields this command carried.  Local
-                              ;; edits that were not sent must keep
-                              ;; diffing on the next cycle.  Preserves
-                              ;; :comment-ids / :activity-ids (only set
-                              ;; by comment/activity pull).
-                              (let ((updated (copy-sequence old)))
-                                (dolist (key keys)
-                                  (setq updated (plist-put updated key (plist-get local key))))
-                                (when sent-description
-                                  (setq updated (plist-put updated :remote-description
-                                                           (cdr sent-description))))
-                                (puthash id updated orgist-snapshots))
-                            ;; New element — full local state is the
-                            ;; baseline.  An item_add without a
-                            ;; description leaves Todoist's empty.
-                            (when (equal cmd-type "item_add")
-                              (setq local (plist-put local :remote-description
-                                                     (or (cdr sent-description) ""))))
-                            (puthash id local orgist-snapshots))))
-                      (throw 'found nil))))))))))))
+          (orgist--at-element id nil
+            ;; The command may carry a freshly synthesized
+            ;; `due.string' (e.g. switching `+3d' to `.+3d'
+            ;; emits "every! 3 days").  Reflect that in the
+            ;; buffer's TODOIST_DUE_STRING so the property
+            ;; matches what Todoist now has, without waiting
+            ;; for the next pull.  An item_update with a
+            ;; non-nil `due' field but no `string' means the
+            ;; task became non-recurring — drop the property.
+            (when (assq 'due args)
+              (let* ((due (alist-get 'due args))
+                     (new-string (and due (alist-get 'string due))))
+                (cond
+                 (new-string
+                  (org-entry-put (point) "TODOIST_DUE_STRING"
+                                 new-string))
+                 ((null due)
+                  (org-entry-delete (point) "TODOIST_DUE_STRING")))))
+            (let ((local (orgist-element-local-state))
+                  (old (gethash id orgist-snapshots))
+                  (keys (orgist--command-snapshot-keys
+                         cmd-type args))
+                  (sent-description (assq 'description args)))
+              (if (and old (not (eq keys 'all)))
+                  ;; Existing snapshot — advance ONLY the
+                  ;; fields this command carried.  Local
+                  ;; edits that were not sent must keep
+                  ;; diffing on the next cycle.  Preserves
+                  ;; :comment-ids / :activity-ids (only set
+                  ;; by comment/activity pull).
+                  (let ((updated (copy-sequence old)))
+                    (dolist (key keys)
+                      (setq updated (plist-put updated key (plist-get local key))))
+                    (when sent-description
+                      (setq updated (plist-put updated :remote-description
+                                               (cdr sent-description))))
+                    (puthash id updated orgist-snapshots))
+                ;; New element — full local state is the
+                ;; baseline.  An item_add without a
+                ;; description leaves Todoist's empty.
+                (when (equal cmd-type "item_add")
+                  (setq local (plist-put local :remote-description
+                                         (or (cdr sent-description) ""))))
+                (puthash id local orgist-snapshots)))))))))
   (orgist-log 'debug "Updated snapshots from local state for %d command(s)"
               (length commands)))
 
@@ -7454,7 +7427,7 @@ that has a buffer in `orgist-base-dir'.  Returns a flat list of
 section alists."
   (let ((all-sections '())
         (seen-projects (make-hash-table :test 'equal)))
-    (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
+    (dolist (file (orgist--project-files))
       (when-let* ((buf (find-buffer-visiting file)))
         (with-current-buffer buf
           (when-let* ((project-id (orgist--element-id (point-min))))
@@ -8242,38 +8215,31 @@ Skipped in dry-run mode."
                        (alist-get (intern cmd-id) temp-id-mapping))
                      cmd-id)))
         (when id
-          (catch 'found
-            (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
-              (when-let* ((buf (find-buffer-visiting file)))
-                (with-current-buffer buf
-                  (when-let* ((pos (orgist-find-element-by-id id)))
-                    (save-excursion
-                      (goto-char pos)
-                      ;; Only process items (not sections)
-                      (unless (org-entry-get (point) "SECTION")
-                        (let* ((metadata (orgist-extract-metadata))
-                               (snap (gethash id orgist-snapshots))
-                               (existing-id (when snap
-                                              (plist-get snap :metadata-comment-id))))
-                          (cond
-                           ;; Has metadata + existing comment → update
-                           ((and metadata existing-id)
-                            (orgist-log 'debug "Updating metadata comment for %s" id)
-                            (orgist-update-metadata-comment existing-id metadata))
-                           ;; Has metadata + no comment → create
-                           ((and metadata (not existing-id))
-                            (orgist-log 'debug "Creating metadata comment for %s" id)
-                            (let ((result (orgist-create-metadata-comment id metadata)))
-                              (when (and result snap)
-                                (plist-put snap :metadata-comment-id
-                                           (alist-get 'id result)))))
-                           ;; No metadata + existing comment → delete
-                           ((and (not metadata) existing-id)
-                            (orgist-log 'debug "Deleting stale metadata comment for %s" id)
-                            (orgist-delete-comment existing-id)
-                            (when snap
-                              (plist-put snap :metadata-comment-id nil)))))))
-                    (throw 'found nil)))))))))))
+          (orgist--at-element id nil
+            ;; Only process items (not sections)
+            (unless (org-entry-get (point) "SECTION")
+              (let* ((metadata (orgist-extract-metadata))
+                     (snap (gethash id orgist-snapshots))
+                     (existing-id (when snap
+                                    (plist-get snap :metadata-comment-id))))
+                (cond
+                 ;; Has metadata + existing comment → update
+                 ((and metadata existing-id)
+                  (orgist-log 'debug "Updating metadata comment for %s" id)
+                  (orgist-update-metadata-comment existing-id metadata))
+                 ;; Has metadata + no comment → create
+                 ((and metadata (not existing-id))
+                  (orgist-log 'debug "Creating metadata comment for %s" id)
+                  (let ((result (orgist-create-metadata-comment id metadata)))
+                    (when (and result snap)
+                      (plist-put snap :metadata-comment-id
+                                 (alist-get 'id result)))))
+                 ;; No metadata + existing comment → delete
+                 ((and (not metadata) existing-id)
+                  (orgist-log 'debug "Deleting stale metadata comment for %s" id)
+                  (orgist-delete-comment existing-id)
+                  (when snap
+                    (plist-put snap :metadata-comment-id nil))))))))))))
 
 (defun orgist-sync-task-attachments (task-id comments known-attachments)
   "Sync file attachments for TASK-ID from COMMENTS.
@@ -8823,7 +8789,7 @@ When DRY-RUN is non-nil, reports findings without modifying any state.
 After fixing, saves snapshots and triggers a forced comment pull."
   (unless orgist-snapshots (orgist-load-snapshots))
   ;; Open any unvisited org files so find-element-by-id works.
-  (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
+  (dolist (file (orgist--project-files))
     (unless (find-buffer-visiting file)
       (find-file-noselect file t)))
   (let ((total-tasks 0)

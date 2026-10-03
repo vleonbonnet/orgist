@@ -99,7 +99,7 @@ run_ert() {
                 test-id-cache.el test-body-spacing.el test-new-item-order.el \
                 test-confirm.el test-local-links.el test-element-identity.el \
                 test-description-subtree.el test-log-notes.el test-safety.el \
-                test-safety-orgist.el; do
+                test-safety-orgist.el test-seams.el; do
         echo "Running ERT suite $file..."
         if ! timeout "$PROJECT_TIMEOUT" "$EMACS" --batch \
              --chdir "$SCRIPT_DIR" -L "$SCRIPT_DIR" \
