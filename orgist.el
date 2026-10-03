@@ -53,6 +53,7 @@
 (require 'json)
 (require 'calendar)
 (require 'org-attach)
+(require 'org-sync-safety)
 (require 'orgist-confirm)
 
 ;; Loaded lazily; call site is guarded by `featurep'.
@@ -244,6 +245,25 @@ found, otherwise \"https://app.todoist.com/app/task/%%s\"."
   :group 'orgist
   :type '(choice (const :tag "Auto-detect" nil)
                  (string :tag "URL template")))
+
+(defcustom orgist-history t
+  "When non-nil, record orgist's files before and after every sync.
+The project files and orgist's state go to a shadow git repository
+in `orgist-history-directory', separate from any repository of
+yours (content-addressed copies when git is missing).  Each pull or
+write-back that changes something leaves two records: the local
+state it started from, and its result.  Browse them with
+\\[orgist-history]."
+  :group 'orgist
+  :type 'boolean)
+
+(defcustom orgist-history-directory nil
+  "Directory for orgist's history, journal and trash.
+nil means \".history\" inside `orgist-base-dir'.  The journal
+\(journal.org) receives every piece of text a sync removes, and the
+trash every file it removes; see \\[orgist-journal]."
+  :group 'orgist
+  :type '(choice (const :tag "Inside orgist-base-dir" nil) directory))
 
 ;;; Local vars
 (defvar orgist-project-buffer-cache nil
@@ -895,10 +915,9 @@ errors (curl SSL, timeout, HTTP 429/5xx) are retried up to
                               (orgist--batch-save-pending (make-hash-table :test 'eq))
                               (gc-cons-threshold (* 100 1024 1024))
                               (gc-cons-percentage 0.6))
-                          (orgist-update-projects (orgist-sort-hierarchically projects))
-                          (orgist-update-elements sections 'section)
-                          (orgist-update-elements
-                           (orgist-sort-hierarchically items) 'item)
+                          (unless (equal orgist--pull-counts '(0 0 0))
+                            (orgist--history-checkpoint "Before pull: local state"))
+                          (orgist--apply-pull projects sections items)
                           (orgist--flush-pending-saves)
                           ;; Save sync token only after successful processing.
                           ;; Don't save when filtering, as we skip other
@@ -1038,6 +1057,10 @@ PLIST is a property list with these keys:
                      (setq orgist-sync-token-filename ,orgist-sync-token-filename)
                      (setq orgist-snapshot-file ,orgist-snapshot-file)
                      (setq orgist-labels-file ,orgist-labels-file)
+                     ;; Journal and trash go where the parent's do; the
+                     ;; parent records history around the subprocess.
+                     (setq orgist-history-directory ,(orgist--safety-directory))
+                     (setq orgist-history nil)
                      ;; No log file in subprocess — output goes to
                      ;; stdout/stderr, captured by parent's process filter.
                      (setq orgist-log-file nil)
@@ -1143,6 +1166,8 @@ PLIST is a property list with these keys:
                (when (length> line 0)
                  (orgist-log 'debug "%s: %s" name line))
                (cond
+                ((string-match "\\`Orgist \\[ERROR\\] \\(.*\\)" line)
+                 (message "Orgist [ERROR] %s" (match-string 1 line)))
                 ((string-match "\\`Orgist \\[WARN\\] \\(.*\\)" line)
                  (message "Orgist [WARN] %s" (match-string 1 line)))
                 ((string-match "\\`Orgist \\[INFO\\] \\(.*\\)" line)
@@ -1165,6 +1190,7 @@ buffers and reloads snapshots when the subprocess finishes."
                 (length (alist-get 'items data)))
     (orgist-log 'debug "Orgist: syncing %d items in background..."
                 (length (alist-get 'items data)))
+    (orgist--history-checkpoint "Before pull: local state")
     (orgist--run-subprocess
      (list
       :name "orgist-sync"
@@ -1205,12 +1231,9 @@ buffers and reloads snapshots when the subprocess finishes."
                              (lambda (i)
                                (member (alist-get 'project_id i) filter-ids))
                              items)))
-                    ;; Process everything
-                    (orgist-update-projects
-                     (orgist-sort-hierarchically projects))
-                    (orgist-update-elements sections 'section)
-                    (orgist-update-elements
-                     (orgist-sort-hierarchically items) 'item)
+                    ;; Process everything, guarded: a violation leaves
+                    ;; the files unsaved and fails the subprocess.
+                    (orgist--apply-pull projects sections items)
                     (orgist--flush-pending-saves)
                     ;; Save snapshots
                     (orgist-save-snapshots)
@@ -1281,6 +1304,9 @@ pull in a subprocess."
              orgist--pull-counts
              (not (equal orgist--pull-counts '(0 0 0))))
     (orgist-save-snapshots))
+  (when (and orgist--pull-counts (not (equal orgist--pull-counts '(0 0 0))))
+    (orgist--history-checkpoint
+     (apply #'format "Pull: %d projects, %d sections, %d items" orgist--pull-counts)))
   (setq orgist--last-pull-time (current-time))
   (setq orgist-sync-mutex nil)
   (orgist--flush-log-buffer)
@@ -1311,44 +1337,564 @@ pull in a subprocess."
   (with-temp-file orgist-sync-token-filename
     (insert sync-token)))
 
+(defvar orgist--snapshot-count-on-disk)
+
+(defun orgist--mirror-file-p (file)
+  "Return non-nil if FILE carries orgist's project marker.
+Orgist creates project files with a file-level TODOIST-PROJECT
+property; a file without it is not orgist's to move or remove."
+  (with-temp-buffer
+    (insert-file-contents file nil 0 4096)
+    (goto-char (point-min))
+    (let ((first-heading (or (re-search-forward org-outline-regexp-bol nil t)
+                             (point-max))))
+      (goto-char (point-min))
+      (re-search-forward "^[ \t]*:TODOIST-PROJECT:" first-heading t))))
+
+(defun orgist--reset-refusal ()
+  "Return why `orgist-reset' must not touch `orgist-base-dir', or nil."
+  (let ((dir (file-name-as-directory (expand-file-name orgist-base-dir))))
+    (cond
+     ((not (file-directory-p dir)) nil)
+     ((member dir (list (file-name-as-directory (expand-file-name "~"))
+                        (file-name-as-directory (expand-file-name "/"))))
+      (format "%s is your home or a root directory" dir))
+     ((file-exists-p (expand-file-name ".git" dir))
+      (format "%s is a version-controlled directory" dir))
+     ((when-let* ((foreign (seq-remove #'orgist--mirror-file-p
+                                       (directory-files dir t "\\`[^.].*\\.org\\'"))))
+        (format "%s holds .org files orgist did not create: %s" dir
+                (string-join (mapcar #'file-name-nondirectory (seq-take foreign 5)) ", "))))
+     ((when-let* ((buf (seq-find (lambda (b) (and (buffer-modified-p b)
+                                                  (orgist--project-file-p (buffer-file-name b))))
+                                 (buffer-list))))
+        (format "%s has unsaved changes" (buffer-name buf)))))))
+
+(defun orgist--reset-files ()
+  "Return the files and directories orgist owns in `orgist-base-dir'.
+Project files (and their Emacs backups), state, logs, subprocess
+scratch files and the attachment directory."
+  (let ((dir (file-name-as-directory (expand-file-name orgist-base-dir))))
+    (seq-filter
+     #'file-exists-p
+     (delete-dups
+      (append
+       (directory-files dir t "\\`[^.].*\\.org~?\\'")
+       (mapcar (lambda (f) (expand-file-name f dir))
+               '("comments-done" "comments-task-ids.json" "completed_pull_timestamp"
+                 "completed-config.json" "completed-done" "completed-retry.json"
+                 "subprocess-data.json" "subprocess-done"))
+       (list orgist-snapshot-file orgist-sync-token-filename orgist-labels-file
+             (orgist--stamps-path))
+       (when orgist-log-file
+         (list orgist-log-file (concat orgist-log-file ".old")))
+       (let ((attachments (file-name-as-directory
+                           (expand-file-name org-attach-id-dir dir))))
+         (when (string-prefix-p dir attachments)
+           (list (directory-file-name attachments)))))))))
+
 (defun orgist-reset ()
-  "Delete all orgist data, caches, and internal state."
+  "Start over from Todoist: set orgist's files aside and sync afresh.
+Nothing is deleted.  After a history record, the project files,
+orgist's state, its logs and the attachments move to a dated folder
+under `orgist--safety-directory', and a full sync rebuilds the
+project files from Todoist.  Local changes not yet pushed stay in
+that folder, unsent.
+Refuses when `orgist-base-dir' is your home directory or under
+version control, holds an .org file orgist did not create, or has a
+project buffer with unsaved changes."
   (interactive)
-  (when (y-or-n-p "Delete all orgist data?")
-    ;; Kill any running subprocesses
-    (dolist (name '("orgist-sync" "orgist-comments" "orgist-completed"))
-      (when-let* ((proc (get-process name)))
-        (when (process-live-p proc)
-          (delete-process proc))))
-    ;; Kill every buffer visiting a file inside orgist-base-dir.
-    ;; Use `set-buffer-modified-p' to avoid "save?" prompts, and
-    ;; clear `buffer-file-name' to prevent Emacs lock-file warnings.
-    (let ((dir (expand-file-name orgist-base-dir)))
+  (when-let* ((problem (orgist--reset-refusal)))
+    (user-error "Orgist reset refused: %s" problem))
+  (let* ((files (orgist--reset-files))
+         (aside (expand-file-name (format-time-string "reset-%Y%m%dT%H%M%S")
+                                  (orgist--safety-directory))))
+    (when (y-or-n-p (format "Move %d orgist file(s) to %s and sync afresh from Todoist? "
+                            (length files) aside))
+      ;; Kill any running subprocesses
+      (dolist (name '("orgist-sync" "orgist-comments" "orgist-completed"))
+        (when-let* ((proc (get-process name)))
+          (when (process-live-p proc)
+            (delete-process proc))))
+      (orgist--history-checkpoint "Before reset")
+      ;; Kill the buffers visiting the files being moved.  None has
+      ;; unsaved changes (see `orgist--reset-refusal').
       (dolist (buf (buffer-list))
         (when-let* ((file (buffer-file-name buf)))
-          (when (string-prefix-p dir (expand-file-name file))
+          (when (seq-find (lambda (f) (or (equal (expand-file-name file) f)
+                                          (string-prefix-p (file-name-as-directory f)
+                                                           (expand-file-name file))))
+                          files)
+            (kill-buffer buf))))
+      (make-directory aside t)
+      (dolist (file files)
+        (rename-file file (expand-file-name (file-name-nondirectory file) aside)))
+      (orgist-log 'warn "Reset: moved %d file(s) to %s" (length files) aside)
+      (setq orgist-project-buffer-cache nil)
+      (setq orgist-snapshots nil)
+      (setq orgist--snapshot-count-on-disk nil)
+      (setq orgist-labels nil)
+      (setq orgist-sync-mutex nil)
+      (setq orgist--last-pull-time nil)
+      (setq orgist--write-back-stamps nil)
+      (setq orgist--write-back-stamps-path nil)
+      (setq orgist--pending-stamps nil)
+      (setq orgist--auto-pull-deferred nil)
+      (orgist--stop-auto-pull)
+      (orgist))))
+
+;;; Safety net
+;;
+;; A sync that changes the project files is bracketed by two history
+;; records (see `org-sync-safety'): the local state it started from,
+;; and its result.  Text a pull removes goes to the journal and files
+;; it removes to the trash, both in `orgist--safety-directory'.  A
+;; pull is applied under guards: a task update may only change its
+;; own subtree, and the whole pull may only remove the elements
+;; Todoist deleted.  On a violation, or any error, the project
+;; buffers return to their state before the pull and the sync token
+;; is not advanced, so the next pull retries from the same point.
+
+(defvar orgist--cycle-removals nil
+  "During a guarded pull, a hash table of element IDs it may remove.
+Filled by the code removing elements on Todoist's behalf; any other
+ID that disappears makes `orgist--check-cycle' abort the pull.")
+
+(defvar orgist--cycle-removed-files nil
+  "During a guarded pull, project files it removed on Todoist's behalf.")
+
+(defvar orgist--cycle-file-moves nil
+  "During a guarded pull, the (FROM . TO) renames it made, newest first.
+A rollback reverses them.")
+
+(defvar orgist--history-cache nil
+  "(KEY . HISTORY) for the current base and history directories.")
+
+(defun orgist--safety-directory ()
+  "Return the directory holding orgist's history, journal and trash."
+  (file-name-as-directory
+   (expand-file-name (or orgist-history-directory ".history") orgist-base-dir)))
+
+(defun orgist--journal-file ()
+  "Return the journal file, where removed text is recorded."
+  (expand-file-name "journal.org" (orgist--safety-directory)))
+
+(defun orgist--trash-directory ()
+  "Return the trash directory, where removed files are moved."
+  (expand-file-name "trash" (orgist--safety-directory)))
+
+(defun orgist--project-file-p (file)
+  "Return non-nil if FILE is a project file of `orgist-base-dir'."
+  (and file
+       (string-match-p "\\`[^.].*\\.org\\'" (file-name-nondirectory file))
+       (equal (file-name-directory (expand-file-name file))
+              (file-name-as-directory (expand-file-name orgist-base-dir)))))
+
+(defun orgist--history-paths ()
+  "Return the glob patterns of the files history records.
+The project files, plus each state file living in `orgist-base-dir'."
+  (let ((base (file-name-as-directory (expand-file-name orgist-base-dir))))
+    (cons "*.org"
+          (delq nil
+                (mapcar (lambda (file)
+                          (let ((file (expand-file-name file)))
+                            (when (equal (file-name-directory file) base)
+                              (file-name-nondirectory file))))
+                        (list orgist-snapshot-file orgist-sync-token-filename
+                              orgist-labels-file (orgist--stamps-path)
+                              (expand-file-name "completed-retry.json" orgist-base-dir)
+                              (expand-file-name "completed_pull_timestamp" orgist-base-dir)))))))
+
+(defun orgist--history ()
+  "Return the history of `orgist-base-dir', or nil when it is off."
+  (when (and orgist-history orgist-base-dir)
+    (let ((key (list (expand-file-name orgist-base-dir) (orgist--safety-directory)
+                     (orgist--history-paths))))
+      (unless (equal key (car orgist--history-cache))
+        (setq orgist--history-cache
+              (cons key (org-sync-safety-history
+                         orgist-base-dir
+                         (expand-file-name "records" (orgist--safety-directory))
+                         (orgist--history-paths)))))
+      (cdr orgist--history-cache))))
+
+(defun orgist--history-checkpoint (subject &optional body)
+  "Record orgist's files in history with SUBJECT and BODY.
+Returns the revision, or nil when nothing changed or history is off.
+A failure is logged, never raised: history is one layer of several
+and must not stop a sync."
+  (when-let* ((history (orgist--history)))
+    (condition-case err
+        (org-sync-safety-history-commit history subject body)
+      (error
+       (orgist-log 'warn "History not recorded (%s): %s" subject
+                   (error-message-string err))
+       nil))))
+
+(defun orgist--journal (title text &rest props)
+  "Record TEXT, which a sync removes from the project files, in the journal.
+TITLE describes the removal; PROPS are further journal properties
+\(see `org-sync-safety-journal-record').  A failure is logged."
+  (condition-case err
+      (apply #'org-sync-safety-journal-record (orgist--journal-file)
+             :title title :text text props)
+    (error
+     (orgist-log 'warn "Journal entry not written (%s): %s" title
+                 (error-message-string err)))))
+
+(defun orgist--subtree-element-ids ()
+  "Return the Todoist IDs of the elements in the subtree at point."
+  (save-excursion
+    (org-back-to-heading t)
+    (let ((end (orgist--subtree-end))
+          (ids nil))
+      (while (and (< (point) end) (org-at-heading-p))
+        (when-let* (((orgist--element-heading-p))
+                    (id (orgist--element-id)))
+          (push id ids))
+        (unless (outline-next-heading)
+          (goto-char end)))
+      ids)))
+
+(defun orgist--cycle-allow-removal (ids &optional file)
+  "Let the current guarded pull remove the elements IDS, and FILE."
+  (when orgist--cycle-removals
+    (dolist (id ids)
+      (puthash id t orgist--cycle-removals))
+    (when file
+      (push file orgist--cycle-removed-files))))
+
+(defun orgist--remove-subtree (title reason &optional deleted-remotely)
+  "Delete the subtree at point, recording it in the journal first.
+TITLE and REASON describe the removal.  With DELETED-REMOTELY, Todoist
+deleted the element and the tasks under it, so they may disappear
+from the current guarded pull; otherwise each of them must still
+exist elsewhere when the pull ends."
+  (org-back-to-heading t)
+  (let ((ids (orgist--subtree-element-ids)))
+    (orgist--journal title
+                     (buffer-substring-no-properties (point) (orgist--subtree-end))
+                     :kind "deleted-subtree"
+                     :file (file-name-nondirectory (or (buffer-file-name) (buffer-name)))
+                     :outline (org-get-outline-path t)
+                     :id (orgist--element-id)
+                     :reason reason)
+    (when deleted-remotely
+      (orgist--cycle-allow-removal ids))
+    (orgist-delete-subtree)))
+
+(defun orgist--move-file-aside (file new-name)
+  "Rename FILE to NEW-NAME as part of the current sync.
+A rolled-back pull renames it back."
+  (rename-file file new-name)
+  (when orgist--cycle-removals
+    (push (cons file new-name) orgist--cycle-file-moves)))
+
+(defun orgist--trash-project-file (buffer reason)
+  "Remove the project file of BUFFER: journal it, then move it to the trash.
+REASON is recorded in the journal.  The buffer is killed."
+  (let ((file (buffer-file-name buffer)))
+    (with-current-buffer buffer
+      (let ((ids nil))
+        (org-with-wide-buffer
+         (goto-char (point-min))
+         (when-let* ((id (orgist--element-id (point-min))))
+           (push id ids))
+         (while (outline-next-heading)
+           (when-let* (((orgist--element-heading-p))
+                       (id (orgist--element-id)))
+             (push id ids))))
+        (orgist--journal (format "Removed project file %s" (file-name-nondirectory file))
+                         (buffer-substring-no-properties (point-min) (point-max))
+                         :kind "removed-file" :file (file-name-nondirectory file)
+                         :id (orgist--element-id (point-min)) :reason reason)
+        (orgist--cycle-allow-removal ids (file-name-nondirectory file))
+        (set-buffer-modified-p nil)))
+    (kill-buffer buffer)
+    (when (file-exists-p file)
+      (orgist-log 'warn "Moved project file %s to %s" file (orgist--trash-file file)))))
+
+(defun orgist--trash-file (file)
+  "Move FILE to the trash as part of the current sync; return its new name.
+A rolled-back pull moves it back."
+  (let* ((dir (expand-file-name (format-time-string "%Y-%m-%d") (orgist--trash-directory)))
+         (target (expand-file-name (file-name-nondirectory file) dir)))
+    (make-directory dir t)
+    (while (file-exists-p target)
+      (setq target (concat target ".old")))
+    (orgist--move-file-aside file target)
+    target))
+
+(defun orgist--inventory ()
+  "Return (IDS . SIZES) across the project files.
+IDS maps each Todoist element ID to the list of files holding it;
+SIZES maps each file name to its buffer size."
+  (let ((ids (make-hash-table :test 'equal))
+        (sizes (make-hash-table :test 'equal))
+        (id-line "^[ \t]*:\\(?:TODOIST_\\)?ID:[ \t]+\\S-"))
+    (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
+      (let ((name (file-name-nondirectory file))
+            (seen (make-hash-table :test 'eql)))
+        (with-current-buffer (or (find-buffer-visiting file) (find-file-noselect file))
+          (puthash name (buffer-size) sizes)
+          (org-with-wide-buffer
+           (goto-char (point-min))
+           (while (re-search-forward id-line nil t)
+             (save-excursion
+               (org-back-to-heading-or-point-min t)
+               (unless (gethash (point) seen)
+                 (puthash (point) t seen)
+                 (when-let* (((or (not (org-at-heading-p)) (orgist--element-heading-p)))
+                             (id (orgist--element-id)))
+                   (puthash id (cons name (gethash id ids)) ids)))))))))
+    (cons ids sizes)))
+
+(defun orgist--check-cycle (before after)
+  "Signal `org-sync-safety-violation' if a pull did more than it should.
+BEFORE and AFTER are `orgist--inventory' results.  Elements may only
+disappear when Todoist deleted them, no element may be held twice,
+and no file may lose most of its content unless it was removed."
+  (let ((problems (append (org-sync-safety-compare-ids
+                           (car before) (car after) orgist--cycle-removals)
+                          (org-sync-safety-shrunk-files
+                           (cdr before) (cdr after) orgist--cycle-removed-files))))
+    (when problems
+      (signal 'org-sync-safety-violation
+              (list (format "%d problem(s): %s" (length problems)
+                            (string-join (seq-take problems 10) "; ")))))))
+
+(defun orgist--buffer-states ()
+  "Return (BUFFER . TEXT) for every buffer visiting a project file.
+TEXT is the buffer's content when it has unsaved changes, nil
+otherwise, so that a rollback can restore what the disk lacks."
+  (cl-loop for buf in (buffer-list)
+           when (orgist--project-file-p (buffer-file-name buf))
+           collect (cons buf (with-current-buffer buf
+                               (when (buffer-modified-p) (buffer-string))))))
+
+(defun orgist--rollback-buffers (states)
+  "Return the project files and buffers to STATES after a failed pull.
+Renames the pull made are reversed.  Buffers it opened are killed;
+the others get their unsaved text back, or are reverted from disk,
+which the pull has not written yet (saves are deferred)."
+  (dolist (move orgist--cycle-file-moves)
+    (condition-case err
+        (when (file-exists-p (cdr move))
+          (rename-file (cdr move) (car move))
+          (when-let* ((buf (find-buffer-visiting (cdr move))))
             (with-current-buffer buf
-              (set-buffer-modified-p nil)
-              (setq buffer-file-name nil))
-            (kill-buffer buf)))))
-    (setq orgist-project-buffer-cache nil)
-    (setq orgist-snapshots nil)
-    (setq orgist-sync-mutex nil)
-    (setq orgist--last-pull-time nil)
-    (setq orgist--write-back-stamps nil)
-    (setq orgist--write-back-stamps-path nil)
-    (setq orgist--pending-stamps nil)
-    (setq orgist--auto-pull-deferred nil)
-    (orgist--stop-auto-pull)
-    (when (file-directory-p orgist-base-dir)
-      (condition-case err
-          (delete-directory orgist-base-dir t)
-        (file-error
-         ;; On Windows, reserved names like NUL can't be deleted.
-         ;; Delete what we can and warn about the rest.
-         (orgist-log 'warn "Could not fully delete %s: %s"
-                     orgist-base-dir (error-message-string err)))))
-    (orgist)))
+              (set-visited-file-name (car move) t t))))
+      (error (orgist-log 'error "Rollback could not move %s back to %s: %s"
+                         (cdr move) (car move) (error-message-string err)))))
+  (dolist (buf (buffer-list))
+    (when (orgist--project-file-p (buffer-file-name buf))
+      (let ((state (assq buf states)))
+        (cond
+         ((null state)
+          (with-current-buffer buf (set-buffer-modified-p nil))
+          (kill-buffer buf))
+         ((cdr state)
+          (with-current-buffer buf
+            (let ((inhibit-read-only t))
+              (erase-buffer)
+              (insert (cdr state)))
+            (orgist-build-id-cache)))
+         ((buffer-modified-p buf)
+          (with-current-buffer buf
+            (let ((revert-without-query '(".*")))
+              (revert-buffer t t t))
+            (orgist-build-id-cache)))))))
+  (setq orgist-project-buffer-cache
+        (seq-filter (lambda (entry) (buffer-live-p (cdr entry)))
+                    orgist-project-buffer-cache)))
+
+(defun orgist--apply-pull (projects sections items)
+  "Apply pulled PROJECTS, SECTIONS and ITEMS to the project buffers, guarded.
+Saves are deferred by the caller (`orgist--batch-save-pending').
+When the pull removes more than Todoist deleted, or anything fails,
+the buffers are rolled back and the error is signaled again, so the
+caller neither saves nor advances the sync token."
+  (let ((states (orgist--buffer-states))
+        (orgist--cycle-removals (make-hash-table :test 'equal))
+        (orgist--cycle-removed-files nil)
+        (orgist--cycle-file-moves nil)
+        (done nil))
+    (unwind-protect
+        (let ((before (orgist--inventory)))
+          (orgist-update-projects (orgist-sort-hierarchically projects))
+          (orgist-update-elements sections 'section)
+          (orgist-update-elements (orgist-sort-hierarchically items) 'item)
+          (orgist--check-cycle before (orgist--inventory))
+          (setq done t))
+      (unless done
+        (orgist-log 'error "Pull rolled back: the project files are as before this pull")
+        (orgist--rollback-buffers states)))))
+
+;;;; History and journal commands
+
+(defvar-local orgist-history--file nil
+  "The file whose history the current `orgist-history-mode' buffer lists.")
+
+(define-derived-mode orgist-history-mode tabulated-list-mode "Orgist-History"
+  "List the history records of one of orgist's files.
+\\<orgist-history-mode-map>\\[orgist-history-ediff] compares the file at the record \
+with the current file,
+\\[orgist-history-view] shows it, \\[orgist-history-restore] restores it."
+  (setq tabulated-list-format [("Time" 17 t) ("Record" 12 nil) ("Change" 0 nil)])
+  (setq tabulated-list-padding 1)
+  (tabulated-list-init-header))
+
+(define-key orgist-history-mode-map (kbd "RET") #'orgist-history-ediff)
+(define-key orgist-history-mode-map (kbd "v") #'orgist-history-view)
+(define-key orgist-history-mode-map (kbd "r") #'orgist-history-restore)
+
+(defun orgist--read-history-file ()
+  "Read the name of a file orgist's history records."
+  (let* ((current (buffer-file-name))
+         (default (when (orgist--project-file-p current)
+                    (file-name-nondirectory current))))
+    (completing-read (format-prompt "History of" default)
+                     (mapcar #'file-name-nondirectory
+                             (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
+                     nil nil nil nil default)))
+
+;;;###autoload
+(defun orgist-history (file)
+  "List the history records of FILE, relative to `orgist-base-dir'.
+Every sync that changed orgist's files left a record of the state it
+started from and one of its result.  A file removed by a sync can be
+named too: its records remain."
+  (interactive (list (orgist--read-history-file)))
+  (let ((history (or (orgist--history) (user-error "Orgist history is off (`orgist-history')")))
+        (buffer (get-buffer-create (format "*orgist history: %s*" file))))
+    (with-current-buffer buffer
+      (orgist-history-mode)
+      (setq orgist-history--file file)
+      (setq tabulated-list-entries
+            (mapcar (lambda (entry)
+                      (pcase-let ((`(,rev ,time ,subject) entry))
+                        (list rev (vector (format-time-string "%Y-%m-%d %H:%M" time)
+                                          (substring rev 0 (min 10 (length rev)))
+                                          subject))))
+                    (org-sync-safety-history-log history file)))
+      (tabulated-list-print))
+    (pop-to-buffer buffer)))
+
+(defun orgist-history--revision-buffer (rev)
+  "Return a read-only buffer with the history file at REV."
+  (let* ((file orgist-history--file)
+         (bytes (or (org-sync-safety-history-file-at (orgist--history) rev file)
+                    (user-error "%s does not exist at this record" file)))
+         (buffer (get-buffer-create (format "*%s @ %s*" file (substring rev 0 (min 10 (length rev)))))))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert (decode-coding-string bytes 'utf-8)))
+      (delay-mode-hooks (org-mode))
+      (set-buffer-modified-p nil)
+      (read-only-mode 1))
+    buffer))
+
+(defun orgist-history-view ()
+  "Show the file as it was at the record at point."
+  (interactive)
+  (pop-to-buffer (orgist-history--revision-buffer (tabulated-list-get-id))))
+
+(defun orgist-history-ediff ()
+  "Compare the file at the record at point with the current file."
+  (interactive)
+  (let ((old (orgist-history--revision-buffer (tabulated-list-get-id)))
+        (current (find-file-noselect (expand-file-name orgist-history--file orgist-base-dir))))
+    (ediff-buffers old current)))
+
+(defun orgist-history-restore ()
+  "Restore the file to the record at point, after recording its current state."
+  (interactive)
+  (let* ((rev (tabulated-list-get-id))
+         (file orgist-history--file)
+         (path (expand-file-name file orgist-base-dir)))
+    (when-let* ((buf (find-buffer-visiting path)))
+      (when (buffer-modified-p buf)
+        (user-error "%s has unsaved changes; save or revert it first" (buffer-name buf))))
+    (when (y-or-n-p (format "Restore %s to record %s? " file
+                            (substring rev 0 (min 10 (length rev)))))
+      (org-sync-safety-history-restore (orgist--history) rev file)
+      (when-let* ((buf (find-buffer-visiting path)))
+        (with-current-buffer buf
+          (let ((revert-without-query '(".*")))
+            (revert-buffer t t t))
+          (orgist-build-id-cache)))
+      (orgist-history file)
+      (message "Restored %s; your next write-back pushes the differences to Todoist" file))))
+
+;;;###autoload
+(defun orgist-journal ()
+  "Open the journal of text orgist's syncs removed.
+Each entry holds the removed text verbatim, where it came from and
+why; \\[orgist-journal-restore] on an entry puts it back."
+  (interactive)
+  (let ((journal (orgist--journal-file)))
+    (unless (file-exists-p journal)
+      (user-error "No journal yet: no sync has removed anything"))
+    (find-file journal)))
+
+(defun orgist--unbind-from-todoist (text)
+  "Return subtree TEXT without its Todoist binding.
+Todoist IDs (in TODOIST_ID, or dash-free in :ID:), orders and
+recurrence strings go; an org-id stays.  Restored this way, the
+tasks are new to write-back, which offers to create them again."
+  (with-temp-buffer
+    (insert text)
+    (goto-char (point-min))
+    (while (re-search-forward
+            "^[ \t]*:\\(?:TODOIST_ID\\|TODOIST-ORDER\\|TODOIST_DUE_STRING\\|SECTION\\):.*\n" nil t)
+      (replace-match ""))
+    (goto-char (point-min))
+    (while (re-search-forward "^[ \t]*:ID:[ \t]+[^- \t\n]+[ \t]*\n" nil t)
+      (replace-match ""))
+    (goto-char (point-min))
+    (while (re-search-forward "^[ \t]*:PROPERTIES:[ \t]*\n[ \t]*:END:[ \t]*\n" nil t)
+      (replace-match ""))
+    (buffer-string)))
+
+(defun orgist-journal-restore ()
+  "Put the text of the journal entry at point back.
+A removed subtree returns to its project file, under its former
+parent when that heading still exists, at the end of the file
+otherwise.  It comes back without its Todoist binding, so your next
+write-back offers to create it again; the buffer is left unsaved for
+you to review.  Other entries (a replaced description, a removed
+project file) are copied to the kill ring."
+  (interactive)
+  (let* ((entry (or (org-sync-safety-journal-entry)
+                    (user-error "Not on a journal entry")))
+         (text (plist-get entry :text))
+         (file (plist-get entry :file))
+         (path (and file (expand-file-name file orgist-base-dir))))
+    (if (not (and (equal (plist-get entry :kind) "deleted-subtree")
+                  path (file-exists-p path)))
+        (progn
+          (kill-new text)
+          (message "Journal text copied to the kill ring"))
+      (let* ((outline (when-let* ((o (plist-get entry :outline)))
+                        (split-string o " / ")))
+             (buffer (find-file-noselect path))
+             (restored (orgist--unbind-from-todoist text)))
+        (with-current-buffer buffer
+          (let* ((parent (when (cdr outline)
+                           (ignore-errors (org-find-olp (butlast outline) t))))
+                 (level (if parent
+                            (save-excursion (goto-char parent) (1+ (org-current-level)))
+                          1)))
+            (goto-char (if parent
+                           (save-excursion (goto-char parent) (orgist--subtree-end))
+                         (point-max)))
+            (unless (bolp) (insert "\n"))
+            (let ((start (point)))
+              (insert (orgist--shift-subtree-text restored level))
+              (goto-char start))))
+        (pop-to-buffer buffer)
+        (message "Restored; review and save to push it to Todoist as a new task")))))
 
 ;;; Sync resource storage
 
@@ -1610,14 +2156,30 @@ projects."
        (t (orgist-create-root-project project))))))
 
 (defun orgist-delete-project (project-id)
-  "Delete the org file associated with PROJECT-ID."
+  "Remove project PROJECT-ID, deleted in Todoist.
+A root project's file is journaled and moved to the trash.  A
+sub-project is a heading in its parent's file, whose buffer
+`orgist-get-project-buffer' returns: only that heading's subtree is
+removed, never the parent's file."
   (if-let* ((project-buffer (orgist-get-project-buffer project-id)))
-      (let ((file-path (buffer-file-name project-buffer)))
-        (kill-buffer project-buffer)
+      (progn
         (setq orgist-project-buffer-cache
               (assoc-delete-all project-id orgist-project-buffer-cache))
-        (when file-path (delete-file file-path))
-        (orgist-log 'warn "Deleted project file: %s" file-path))
+        (if (with-current-buffer project-buffer
+              (equal (orgist--element-id (point-min)) project-id))
+            (orgist--trash-project-file project-buffer "Project deleted in Todoist")
+          (with-current-buffer project-buffer
+            (save-excursion
+              (when-let* ((pos (orgist-find-element-by-id project-id)))
+                (goto-char pos)
+                (orgist--remove-subtree
+                 (format "Deleted sub-project %s" (org-get-heading t t t t))
+                 "Sub-project deleted in Todoist" t)
+                (when orgist-id-cache
+                  (remhash project-id orgist-id-cache))
+                (orgist--save-buffer)
+                (orgist-log 'warn "Deleted sub-project %s from %s"
+                            project-id (buffer-name)))))))
     (orgist-log 'warn "Cannot delete project %s: buffer not found" project-id)))
 
 (defun orgist-create-subproject (project)
@@ -1723,11 +2285,13 @@ A root project has its ID as the file-level ID property."
               (insert adjusted-content)))
           (orgist--save-buffer))))
 
-    ;; Remove from cache and delete original file
+    ;; Remove from cache; the original file's content now lives in the
+    ;; parent's, so the file goes to the trash.
     (setq orgist-project-buffer-cache
           (assoc-delete-all project-id orgist-project-buffer-cache))
+    (with-current-buffer project-buffer (set-buffer-modified-p nil))
     (kill-buffer project-buffer)
-    (delete-file current-file-path)
+    (orgist--trash-file current-file-path)
 
     ;; Update cache to point to parent buffer
     (push (cons project-id parent-buffer) orgist-project-buffer-cache)))
@@ -1826,7 +2390,7 @@ parent changed, or updates name in place."
 
     ;; Rename file if name changed
     (unless (string= current-file-path new-file-path)
-      (rename-file current-file-path new-file-path)
+      (orgist--move-file-aside current-file-path new-file-path)
       (with-current-buffer project-buffer
         (set-visited-file-name new-file-path)
         (orgist--save-buffer)))))
@@ -1952,7 +2516,10 @@ heading levels."
                             (progn
                               (orgist-log 'debug "Removing duplicate %s %s from %s"
                                           (symbol-name element-type) label (buffer-name buf))
-                              (orgist-delete-subtree))
+                              (orgist--remove-subtree
+                               (format "Removed stale copy of %s" label)
+                               (format "Moved in Todoist; the copy in %s is current"
+                                       (buffer-name project-buffer))))
                           (orgist-log 'debug "Transplanting moved %s %s from %s to %s"
                                       (symbol-name element-type) label
                                       (buffer-name buf) (buffer-name project-buffer))
@@ -2064,12 +2631,35 @@ Content is filled in by `orgist-update-element'."
     (orgist--set-element-id id)
     (orgist-id-cache-put id)))
 
+(defconst orgist--user-hooks
+  '(org-trigger-hook org-after-todo-state-change-hook org-todo-repeat-hook
+    org-after-tags-change-hook org-property-changed-functions)
+  "Org hooks whose user functions may legitimately change other entries.
+A dependency trigger completing the next task is one.  Their changes
+are exempt from the guard of `orgist-update-element'.")
+
 (defun orgist-update-element (element &optional skip-clear-body)
   "Update org-mode node at point with Todoist ELEMENT.
-Point should be at or near the heading.  This function navigates to
-the heading before making changes.  When SKIP-CLEAR-BODY is non-nil,
-skip the `orgist-clear-body' call (useful for newly created elements
-that have no body to clear)."
+Point should be at or near the heading.  When SKIP-CLEAR-BODY is
+non-nil, skip the `orgist-clear-body' call (useful for newly created
+elements that have no body to clear).
+The update may only change the element's own subtree: a change
+anywhere else (an Org command acting on more than this entry, as
+in the 2026-08-16 region smear) signals `org-sync-safety-violation',
+which rolls the pull back.  Changes made by user functions on
+`orgist--user-hooks' are exempt."
+  (org-back-to-heading-or-point-min t)
+  (org-sync-safety-with-region-guard
+      (point) (orgist--subtree-end)
+      (format "Updating %s" (orgist--id-label (alist-get 'id element)
+                                              (or (alist-get 'content element)
+                                                  (alist-get 'name element))))
+    (org-sync-safety-with-unguarded-hooks orgist--user-hooks
+      (orgist--update-element-content element skip-clear-body))))
+
+(defun orgist--update-element-content (element &optional skip-clear-body)
+  "Write Todoist ELEMENT into the heading at point.
+See `orgist-update-element', which guards this."
   (org-back-to-heading-or-point-min t)
   (let* (;; `org-todo'/`org-schedule'/`org-deadline' loop over all headlines
          ;; in the active region; a user selection at pull time must never
@@ -2612,43 +3202,58 @@ that is not a Todoist element (see `orgist--element-heading-p').
 Element subtrees are preserved; one nested under a description
 heading is first moved up to be a direct child of the task (see
 `orgist--hoist-nested-elements'), so replacing a description never
-deletes a Todoist task."
+deletes a Todoist task.  The removed text goes to the journal."
   (save-excursion
     (org-back-to-heading-or-point-min t)
     (orgist--hoist-nested-elements)
-    (org-end-of-meta-data t)
-    (let ((pos (point))
-          (subtree-end (orgist--subtree-end)))
-      ;; Walk through the region, deleting gaps between ID subtrees.
-      (while (< pos subtree-end)
-        (goto-char pos)
-        (if (not (re-search-forward org-outline-regexp-bol subtree-end t))
-            ;; No more headings — delete trailing body text.
-            (progn
-              (when (< pos subtree-end)
-                (delete-region pos subtree-end)
-                (setq subtree-end pos))
-              (setq pos subtree-end))
-          ;; Found a heading — keep it when it is a Todoist element.
-          (goto-char (line-beginning-position))
-          (if (orgist--element-heading-p)
-              ;; Element heading: delete gap before it, skip past its subtree.
-              (progn
-                (when (< pos (point))
-                  (let ((gap (- (point) pos)))
-                    (delete-region pos (point))
-                    (setq subtree-end (- subtree-end gap))))
-                ;; Skip past this ID subtree (it's preserved).
-                (setq pos (orgist--subtree-end)))
-            ;; Non-ID heading: delete its entire subtree.
-            (let* ((heading-start (point))
-                   (heading-end (orgist--subtree-end))
-                   ;; But first, delete the gap before it too.
-                   (del-start (min pos heading-start))
-                   (del-len (- heading-end del-start)))
-              (delete-region del-start heading-end)
-              (setq subtree-end (- subtree-end del-len))
-              (setq pos del-start))))))))
+    (let ((label (when (org-at-heading-p) (org-get-heading t t t t)))
+          (id (orgist--element-id))
+          (outline (when (org-at-heading-p) (org-get-outline-path t)))
+          (removed nil))
+      (org-end-of-meta-data t)
+      (cl-flet ((kill (beg end)
+                  (push (buffer-substring-no-properties beg end) removed)
+                  (delete-region beg end)))
+        (let ((pos (point))
+              (subtree-end (orgist--subtree-end)))
+          ;; Walk through the region, deleting gaps between element subtrees.
+          (while (< pos subtree-end)
+            (goto-char pos)
+            (if (not (re-search-forward org-outline-regexp-bol subtree-end t))
+                ;; No more headings — delete trailing body text.
+                (progn
+                  (when (< pos subtree-end)
+                    (kill pos subtree-end)
+                    (setq subtree-end pos))
+                  (setq pos subtree-end))
+              ;; Found a heading — keep it when it is a Todoist element.
+              (goto-char (line-beginning-position))
+              (if (orgist--element-heading-p)
+                  ;; Element heading: delete gap before it, skip past its subtree.
+                  (progn
+                    (when (< pos (point))
+                      (let ((gap (- (point) pos)))
+                        (kill pos (point))
+                        (setq subtree-end (- subtree-end gap))))
+                    ;; Skip past this element subtree (it's preserved).
+                    (setq pos (orgist--subtree-end)))
+                ;; Description heading: delete its entire subtree.
+                (let* ((heading-start (point))
+                       (heading-end (orgist--subtree-end))
+                       ;; But first, delete the gap before it too.
+                       (del-start (min pos heading-start))
+                       (del-len (- heading-end del-start)))
+                  (kill del-start heading-end)
+                  (setq subtree-end (- subtree-end del-len))
+                  (setq pos del-start)))))))
+      (let ((text (apply #'concat (nreverse removed))))
+        (unless (string-blank-p text)
+          (orgist--journal (format "Replaced description of %s" (or label id))
+                           text
+                           :kind "replaced-description"
+                           :file (file-name-nondirectory (or (buffer-file-name) (buffer-name)))
+                           :outline outline :id id
+                           :reason "Description changed in Todoist"))))))
 
 (defun orgist-has-logbook-p (&optional state)
   "Check if the current heading has a state log entry.
@@ -3922,7 +4527,8 @@ heading is not later mistaken for a local deletion to push back."
             (save-excursion
               (when-let* ((point (orgist-find-element-by-id element-id)))
                 (goto-char point)
-                (orgist-delete-subtree)
+                (orgist--remove-subtree (format "Deleted %s" (org-get-heading t t t t))
+                                        "Deleted in Todoist" t)
                 ;; Drop the now-stale cache entry; surviving markers track
                 ;; the deletion automatically and self-heal on next lookup.
                 (when orgist-id-cache
@@ -5760,6 +6366,21 @@ Todoist's authoritative next occurrence."
                                       id)))
                       (throw 'done nil))))))))))))
 
+(defun orgist--command-summary (commands)
+  "Return one line per command type in COMMANDS, with its count and IDs."
+  (let ((by-type nil))
+    (dolist (cmd commands)
+      (let* ((type (alist-get 'type cmd))
+             (args (alist-get 'args cmd))
+             (id (or (alist-get 'id args) (alist-get 'item_id args)
+                     (alist-get 'temp_id cmd))))
+        (push id (alist-get type by-type nil nil #'equal))))
+    (mapconcat (lambda (entry)
+                 (format "%s ×%d: %s" (car entry) (length (cdr entry))
+                         (string-join (seq-take (delq nil (reverse (cdr entry))) 20) " ")))
+               (sort by-type (lambda (a b) (string< (car a) (car b))))
+               "\n")))
+
 (defun orgist-execute-write-back (commands)
   "Execute COMMANDS: dry-run log or send to API.
 After execution, update snapshots so the same changes are not
@@ -5782,6 +6403,7 @@ detected again on the next write-back cycle."
           ;; Snapshots advanced, so these changes won't re-detect;
           ;; stamp the scanned files as verified.
           (orgist--commit-pending-stamps))
+      (orgist--history-checkpoint "Before write-back: local edits")
       ;; Execute attachment commands first (REST API)
       (when attach-commands
         (orgist-log-commands attach-commands "[ATTACH]")
@@ -5849,6 +6471,10 @@ detected again on the next write-back cycle."
                 (when (and orgist-mode (buffer-modified-p))
                   (save-buffer))))))
         (orgist-save-snapshots)
+        (orgist--history-checkpoint
+         (format "Write-back: %d of %d command(s) succeeded"
+                 (length succeeded-sync-commands) (length sync-commands))
+         (orgist--command-summary (append attach-commands sync-commands)))
         ;; Advance write-back stamps only when every sync command was
         ;; confirmed "ok".  On any failure the scanned files keep their
         ;; old stamps, so the next save or sync re-detects and retries
@@ -7555,9 +8181,11 @@ attachment-files alist."
                (comment-id (car entry))
                (dir (org-attach-dir)))
           (when (and dir (file-exists-p (expand-file-name file-name dir)))
-            (orgist-log 'info "Removing stale attachment %s for task %s"
-                        file-name task-id)
-            (delete-file (expand-file-name file-name dir)))
+            (orgist-log 'info "Moving stale attachment %s for task %s to %s"
+                        file-name task-id
+                        (org-sync-safety-trash-file (expand-file-name file-name dir)
+                                                    (orgist--trash-directory)
+                                                    orgist-base-dir)))
           (setq updated (assoc-delete-all comment-id updated))))
       ;; Update ATTACH tag based on remaining files
       (let ((dir (org-attach-dir)))
@@ -7616,6 +8244,7 @@ that haven't been pulled yet.  When FORCE is non-nil (manual
     (orgist-log 'debug "Spawning comments subprocess for %d tasks" (length task-ids))
     (orgist-log 'debug "Orgist: pulling comments for %d tasks in background..."
                 (length task-ids))
+    (orgist--history-checkpoint "Before comments pull: local state")
     (orgist--run-subprocess
      (list
       :name "orgist-comments"
@@ -7697,6 +8326,8 @@ that haven't been pulled yet.  When FORCE is non-nil (manual
                                total minutes seconds skipped errors))))
       :on-success (lambda (count)
                     (when (and count (> count 0))
+                      (orgist--history-checkpoint
+                       (format "Comments pull: %d task(s)" count))
                       (message "Orgist: comments: %d tasks synced" count)))
       :on-failure (lambda (event)
                     (message "Orgist: comments sync failed — %s"
@@ -7817,6 +8448,7 @@ uses the full lookback window instead of last pull timestamp."
       (insert (json-encode `((since . ,since-time) (until . ,until-time)))))
     (orgist-log 'debug "Spawning completed-tasks subprocess (since %s)" since-time)
     (orgist-log 'debug "Orgist: pulling completed tasks in background...")
+    (orgist--history-checkpoint "Before completed-tasks pull: local state")
     (orgist--run-subprocess
      (list
       :name "orgist-completed"
@@ -7880,6 +8512,8 @@ uses the full lookback window instead of last pull timestamp."
                                    minutes seconds))))))
       :on-success (lambda (count)
                     (when (and count (> count 0))
+                      (orgist--history-checkpoint
+                       (format "Completed-tasks pull: %d task(s)" count))
                       (message "Orgist: completed tasks: %d synced" count))
                     ;; Chain comments pull if enabled (covers both active
                     ;; and newly-inserted completed tasks in one pass)

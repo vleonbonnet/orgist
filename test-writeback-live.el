@@ -222,7 +222,27 @@ success, or nil on error."
                           "changed description replaces the body")
       (orgist-live--check (and sub (string-match-p "^\\*\\* Notes$" sub))
                           "sub-heading rebuilt from the Markdown heading"))
-    (orgist-live--check (null (orgist-live--pending id)) "nothing pending after the replacement")))
+    (orgist-live--check (null (orgist-live--pending id)) "nothing pending after the replacement")
+    (let ((journal (with-temp-buffer
+                     (when (file-exists-p (orgist--journal-file))
+                       (insert-file-contents (orgist--journal-file)))
+                     (buffer-string))))
+      (orgist-live--check (string-match-p (concat "Replaced description of " (regexp-quote title))
+                                          journal)
+                          "the replaced description is in the journal")
+      (orgist-live--check (string-match-p "Edited note\\." journal)
+                          "the journal holds the replaced text verbatim"))))
+
+(defun orgist-live--history ()
+  (message "--- History ---")
+  (let ((subjects (mapcar #'caddr (org-sync-safety-history-log (orgist--history)))))
+    (orgist-live--check (member "Before pull: local state" subjects) "pulls record the state they start from")
+    (orgist-live--check (seq-find (lambda (s) (string-prefix-p "Pull: " s)) subjects)
+                        "pulls record their result")
+    (orgist-live--check (member "Before write-back: local edits" subjects)
+                        "write-backs record the local edits they push")
+    (orgist-live--check (seq-find (lambda (s) (string-prefix-p "Write-back: " s)) subjects)
+                        "write-backs record their result")))
 
 ;;; Run
 
@@ -232,7 +252,8 @@ success, or nil on error."
         (orgist-live--pull)
         (orgist-live--check (orgist-live--buffer) "initial pull created Orgtest.org")
         (orgist-live--identity stamp)
-        (orgist-live--description stamp))
+        (orgist-live--description stamp)
+        (orgist-live--history))
     (dolist (id orgist-live--created)
       (when (consp (orgist-live--api "GET" id))
         (message "cleanup: deleting task %s" id)

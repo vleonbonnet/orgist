@@ -87,6 +87,8 @@ All settings live in the =orgist= customize group.
 | =orgist-async-chunk-size=         | =30=                           | Item count threshold for subprocess sync      |
 | =orgist-snapshot-file=            | =orgist-base-dir/snapshots.el= | Persisted snapshot store                      |
 | =orgist-tag=                      | ="todoist"=                    | File tag for orgist-managed files             |
+| =orgist-history=                  | =t=                            | Record files before and after every sync      |
+| =orgist-history-directory=        | =nil= (=.history= in base dir) | History, journal and trash location           |
 
 * Interactive Commands
 
@@ -94,7 +96,9 @@ All settings live in the =orgist= customize group.
 |---------------------------+-------------------------------------------------------|
 | =M-x orgist=               | Write-back + sync (shows confirm buffer in ='ask= mode) |
 | =M-x orgist-mode=          | Toggle orgist minor mode in current buffer            |
-| =M-x orgist-reset=         | Delete all orgist data and caches                     |
+| =M-x orgist-reset=         | Set orgist's files aside and sync afresh from Todoist  |
+| =M-x orgist-history=       | Browse, compare and restore a file's sync history     |
+| =M-x orgist-journal=       | Browse text syncs removed; restore an entry          |
 | =M-x orgist-write-back=    | Detect local changes and push to Todoist (dry-run)    |
 | =M-x orgist-pull-comments= | Manually pull comments and activity for all tasks     |
 | =M-x orgist-quick-add=     | Add a task via Todoist's natural language quick-add    |
@@ -326,6 +330,16 @@ C-c C-c  Confirm    C-c C-k  Cancel    TAB  Toggle    S-TAB  Cycle all    RET  C
 =orgist-confirm.el= builds the review tree and executes the confirmed
 subset; the buffer itself is =org-sync-confirm-mode=.
 
+** Safety Net
+
+Syncs rewrite files you also edit.  Implemented in =org-sync-safety.el=, a library with no knowledge of Todoist, the safety net makes every change a sync makes recorded, explainable and reversible.
+
+- *History.*  Each pull or write-back that changes something leaves two records in a shadow git repository under =orgist-history-directory= (=.history/records=), separate from any repository of yours: the state it started from, which captures your own edits since the previous sync, and its result.  The project files and orgist's state files are recorded; attachments are not.  Without git, content-addressed copies take its place (every copy for two weeks, one a day for a year).  =M-x orgist-history= lists a file's records; =RET= compares one with the current file in ediff, =r= restores it.
+- *Journal.*  Text a pull removes is appended verbatim to =.history/journal.org=, with what removed it and why: a task or sub-project deleted in Todoist, a description replaced from Todoist, a stale copy left by a cross-project move, a project file removed.  =M-x orgist-journal-restore= on an entry puts a removed task back under its former parent without its Todoist binding, so the next write-back offers to create it again.
+- *Trash.*  Files a sync removes (a deleted project's file, attachments of deleted comments) move to =.history/trash/= instead of being deleted.
+- *Guards.*  A task update may only change that task's own subtree; changes made by your Org hooks during the update, such as an org-edna trigger completing the next task, are exempt.  When the pull is done, every element present before must still exist unless Todoist deleted it, no element may appear twice, and no file may lose most of its content.  On a violation, or any error, the project buffers return to their state before the pull (unsaved edits included), nothing is saved, and the sync token is not advanced: the next pull retries from the same point, and the error says what went wrong.
+- *Reset.*  =M-x orgist-reset= moves the project files, state, logs and attachments to a dated folder under =.history/= and syncs afresh; nothing is deleted.  It refuses a base directory that is your home, under version control, holds an =.org= file orgist did not create, or has a project buffer with unsaved changes.
+
 ** Labels
 
 Label definitions are fetched from the sync API and stored in =orgist-labels=
@@ -387,6 +401,7 @@ commands with a =project_id= target.
 |-------------------+------------------------------------------------------|
 | =orgist.el=         | Main source — all functionality in one file          |
 | =orgist-confirm.el= | Write-back review adapter for =org-sync-confirm=      |
+| =org-sync-safety.el= | Safety net library: history, journal, trash, guards |
 | =README.org=        | This file — project documentation                    |
 | =CLAUDE.md=         | Claude Code (AI assistant) instructions              |
 | =test-harness.el=   | Offline test infrastructure (request mock, runner)   |
@@ -416,8 +431,8 @@ commands with a =project_id= target.
 | Metadata          | =./test-run.sh metadata=          |    18 | Non-Todoist property preservation    |
 | New features      | =./test-run.sh features=          |   100 | Timezone, duration, labels, etc.     |
 | Attachments       | =./test-run.sh attachments=       |    52 | ATTACH tag, pull/push, diff, confirm |
-| ERT regression    | =./test-run.sh ert=               |    63 | Identity, ordering, spacing, guards, review |
-| Live write-back   | =./test-run.sh live-writeback=    |    21 | Real API identity and description round trips (needs token) |
+| ERT regression    | =./test-run.sh ert=               |    85 | Identity, ordering, spacing, guards, review |
+| Live write-back   | =./test-run.sh live-writeback=    |    27 | Real API identity, description and safety-net round trips (needs token) |
 | Live attachments  | =./test-run.sh live-attachments=  |    19 | Real API attachment CRUD (needs token) |
 
 ** Offline Replay (no API token needed)

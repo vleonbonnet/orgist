@@ -366,14 +366,20 @@ Each with the current recommendation.
 
 * Roadmap
 
-** TODO M0 — Safety net
+** DONE M0 — Safety net
+CLOSED: [2026-10-03 Sat 14:40]
 :PROPERTIES:
 :ID:       b07d5ba5-76ed-4069-8058-c02f3806a57b
+:END:
+:LOGBOOK:
+- [2026-10-03 Sat 14:40] From "TODO"     to "DONE"
 :END:
 
 Fixes for the live mirror-mode loss paths (rows 16 and 17), then file history, destruction journal, blast-radius guards, safe reset, history browsing.  Ships in mirror mode.
 
 Exit: a pre-existing org-id survives a push; an edit below a task's first child heading reaches Todoist; every sync cycle is reconstructible from history; an injected smear (one update touching many headings) aborts and restores; reset cannot delete an unmarked file.
+
+Delivered in =org-sync-safety.el= and orgist's =;;; Safety net= section.  The journal records removed subtrees, replaced descriptions and removed files; a remote value overwriting an unpushed local field is not journaled separately, because the pull's "before" history record holds it.  =orgist-undo-cycle= moved to [[id:4299b593-37f9-4f85-a99c-afbdaff627eb][M2 — Rebuild-and-validate from remote]], which it depends on.  Found on the way: deleting a Todoist sub-project deleted its parent project's whole file.
 
 ** TODO M1 — Seams refactor
 :PROPERTIES:
@@ -389,9 +395,9 @@ Exit: all suites green, no behaviour change in mirror mode.
 :ID:       4299b593-37f9-4f85-a99c-afbdaff627eb
 :END:
 
-Fetch full remote state, rebuild snapshots from it (never from local), run ID validation, then a normal diff so any drift appears as pending changes. Needed by =orgist-undo-cycle= and by adoption verification.
+Fetch full remote state, rebuild snapshots from it (never from local), run ID validation, then a normal diff so any drift appears as pending changes. Needed by adoption verification and by =orgist-undo-cycle=, which also lands here: restore the files of a sync cycle from history, then rebuild snapshots from remote so the changes that cycle applied reappear as pending diffs.
 
-Exit: an intentionally drifted fixture surfaces every drifted field as a pending diff.
+Exit: an intentionally drifted fixture surfaces every drifted field as a pending diff; undoing a pull's cycle leaves its remote changes pending, not lost.
 
 ** TODO M3 — Overlay, projection-only
 :PROPERTIES:
