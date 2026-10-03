@@ -150,14 +150,13 @@ A heading's Todoist ID lives in =:ID:=, which org-id also resolves, so =[[id:...
 
 A task's description is its body text plus every heading under it that is not a Todoist element: the sub-headings a Markdown description becomes on pull, and notes written in org under the task, travel in the Todoist description as Markdown headings, with levels relative to the task.  Tags and metadata (planning lines, property and logbook drawers) on those headings are org-only and never sent, so an org-id or attachment directory on a description sub-heading is not a change to push.
 
-A pull leaves the body untouched when Todoist's description and absolute reminders are unchanged since the last sync, so those org-only parts survive unrelated remote edits such as a new due date.  When the description did change, the body is rebuilt from Todoist.  A Todoist task written under a description heading is moved up to be a direct child of its task rather than deleted with the description.  Sections have no description in Todoist: their body is never cleared.
+A pull leaves the body untouched when Todoist's description and absolute reminders are unchanged since the last sync, so those org-only parts survive unrelated remote edits such as a new due date.  When the description did change, the body is rebuilt from Todoist.  A Todoist task written under a description heading is moved up to be a direct child of its task rather than deleted with the description.  Sections have no description in Todoist: their body is never cleared.  Log notes Org writes in the body itself (=org-log-into-drawer= nil) are not description: a pull puts the description below them, and neither write-back nor a rebuilt description touches them.
 
 Snapshots from versions that stopped the description at the first child heading make tasks with sub-headings diff once.  The first write-back after upgrading fetches those tasks' descriptions from Todoist: where the local description is exactly what a pull produces, the snapshot is completed from Todoist and nothing is sent; only descriptions with local edits are pushed.
 
 ** Body Spacing
 
-=orgist--normalize-body-spacing= enforces these rules after every element
-update:
+=orgist--normalize-body-spacing= enforces these rules after every element update; normalizing again changes nothing:
 
 - Exactly one blank line between =:END:= (or planning lines) and body content.
 - Exactly one blank line between logbook entries and description text.
@@ -166,7 +165,7 @@ update:
 - Elements with no body content have no trailing blank line.
 - Description sub-headings get one blank line around them; the one after a sub-heading goes after its planning line and drawers, which stay attached to it.
 - Description sub-headings and their content follow the same rules; child subtrees with an =ID= property (Todoist elements) are normalized by their own updates and skipped by the parent.
-- Logbook content means a =:LOGBOOK:= drawer or bare =- State= entries; a bullet-list description is body content and gets its blank line.
+- Logbook content means a =:LOGBOOK:= drawer, kept whole, or log notes in the body, recognized from =org-log-note-headings=; it follows the metadata without a blank line.  A bullet-list description is body content and gets its blank line.
 
 Example:
 
@@ -175,7 +174,6 @@ Example:
   :PROPERTIES:
   :ID:  abc123
   :END:
-
   - State "TODO"  from  [2025-01-01 Wed 12:00]
 
   Description paragraph here.
@@ -184,7 +182,6 @@ Example:
   :PROPERTIES:
   :ID:  def456
   :END:
-
   - State "TODO"  from  [2025-01-01 Wed 12:00]
 
   ,* TODO Another task
@@ -431,7 +428,7 @@ commands with a =project_id= target.
 | Metadata          | =./test-run.sh metadata=          |    18 | Non-Todoist property preservation    |
 | New features      | =./test-run.sh features=          |   100 | Timezone, duration, labels, etc.     |
 | Attachments       | =./test-run.sh attachments=       |    52 | ATTACH tag, pull/push, diff, confirm |
-| ERT regression    | =./test-run.sh ert=               |    85 | Identity, ordering, spacing, guards, review |
+| ERT regression    | =./test-run.sh ert=               |    95 | Identity, ordering, spacing, log notes, guards, review |
 | Live write-back   | =./test-run.sh live-writeback=    |    27 | Real API identity, description and safety-net round trips (needs token) |
 | Live attachments  | =./test-run.sh live-attachments=  |    19 | Real API attachment CRUD (needs token) |
 

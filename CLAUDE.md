@@ -39,7 +39,8 @@ Never run orgist batch code against the real `orgist-base-dir`: in batch, write-
 - `test-region-guard.el` — ERT regression tests for pull-side org command guards (active-region smear, todo-dependency blocking, done-keyword preservation)
 - `test-sync-token.el` — ERT regression tests ensuring command-only writes cannot advance the read sync cursor
 - `test-id-cache.el` — ERT regression tests for stale ID-cache markers (rescan instead of duplicating the heading on pull)
-- `test-body-spacing.el` — ERT regression tests for body spacing normalization (blank line after a LOGBOOK drawer)
+- `test-body-spacing.el` — ERT regression tests for body spacing normalization (blank line after a LOGBOOK drawer; stable under repeated passes)
+- `test-log-notes.el` — ERT regression tests for log notes written in the body (`org-log-into-drawer` nil): the description goes below them, extraction and clearing leave them out
 - `test-new-item-order.el` — ERT regression tests for new-task ordering (item_add child_order, sibling reorder in the same batch)
 - `test-confirm.el` — ERT regression tests for the review adapter (tree building, live remote values, partial selection)
 - `test-local-links.el` — ERT regression tests for local Org links across Markdown conversion

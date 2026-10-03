@@ -156,6 +156,23 @@ DIR is bound to the directory.  Saves are deferred, as during a pull."
     (should (directory-files-recursively (orgist--trash-directory) "\\`Other\\.org\\'"))
     (should (string-match-p ":KIND: removed-file" (orgist-test--journal)))))
 
+(ert-deftest orgist-safety/replaced-description-journaled-only-when-changed ()
+  "Rebuilding a description to the same text journals nothing; a real change does."
+  (skip-unless (executable-find "pandoc"))
+  (orgist-test--with-project
+    (orgist--apply-pull nil nil (list (orgist-test--task
+                                       "T2" "Doomed"
+                                       '(description . "Doomed description.\n\n# Notes\n\nOnly in org."))))
+    (should-not (orgist-test--journal))
+    (orgist--apply-pull nil nil (list (orgist-test--task
+                                       "T2" "Doomed"
+                                       '(description . "Rewritten in Todoist."))))
+    (let ((journal (orgist-test--journal)))
+      (should (string-match-p "Replaced description of Doomed" journal))
+      (should (string-match-p "Doomed description\\." journal))
+      (should (string-match-p ",\\*\\* Notes" journal)))
+    (should (string-match-p "Rewritten in Todoist\\." (orgist-test--text "Proj.org")))))
+
 (ert-deftest orgist-safety/update-touching-another-entry-rolls-back ()
   "A task update that changes text outside its subtree aborts and restores the buffers."
   (orgist-test--with-project

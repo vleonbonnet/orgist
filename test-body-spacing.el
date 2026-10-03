@@ -291,5 +291,70 @@ Glued child body.
 :END:
 ")))
 
+(ert-deftest orgist-body-spacing/description-subheading-shape-is-stable ()
+  "Normalizing again adds no blank line under a description sub-heading.
+The pass that puts a blank line after a sub-heading's metadata used
+to skip blank lines while looking for the end of that metadata, so
+every pull added one more."
+  (let ((shaped "* TODO Task
+:PROPERTIES:
+:ID:       T1
+:END:
+
+Description.
+
+** Detail
+
+Sub body.
+
+** Logged
+:LOGBOOK:
+- Note taken on [2026-09-12 Sat 05:06]
+:END:
+
+Logged body.
+* TODO Next
+:PROPERTIES:
+:ID:       T2
+:END:
+"))
+    (should (equal (orgist-test--normalize shaped) shaped))
+    (should (equal (orgist-test--normalize (orgist-test--normalize shaped)) shaped))))
+
+(ert-deftest orgist-body-spacing/logbook-drawer-entries-stay-glued-to-end ()
+  "No blank line goes inside a :LOGBOOK: drawer written in Org's default format.
+Bare \"- State\" lines got a blank line before whatever followed them,
+which in a drawer was its :END: line."
+  (let ((org-log-note-headings (eval (car (get 'org-log-note-headings 'standard-value)) t)))
+    (should (equal (orgist-test--normalize
+                    "* TODO Task
+:PROPERTIES:
+:ID:       T1
+:END:
+:LOGBOOK:
+- State \"TODO\"       from              [2026-09-12 Sat 05:06]
+:END:
+Description line.
+* TODO Next
+:PROPERTIES:
+:ID:       T2
+:END:
+")
+                   "* TODO Task
+:PROPERTIES:
+:ID:       T1
+:END:
+:LOGBOOK:
+- State \"TODO\"       from              [2026-09-12 Sat 05:06]
+:END:
+
+Description line.
+
+* TODO Next
+:PROPERTIES:
+:ID:       T2
+:END:
+"))))
+
 (provide 'test-body-spacing)
 ;;; test-body-spacing.el ends here

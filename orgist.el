@@ -2704,6 +2704,9 @@ See `orgist-update-element', which guards this."
                 (plist-get old-snap :remote-description) description)
                (equal (plist-get old-snap :reminder-stamps)
                       (orgist--absolute-reminder-stamps reminders))))
+         ;; The description text the rebuild removed, journaled below
+         ;; when what replaced it differs.
+         (removed-description nil)
          ;; Pre-update state, for synthesizing reopen/repeat log entries.
          (old-state (org-get-todo-state))
          (old-scheduled (org-entry-get (point) "SCHEDULED"))
@@ -2780,7 +2783,7 @@ See `orgist-update-element', which guards this."
     ;; new description.  Sections have no description in Todoist, so
     ;; their body is org-only and never cleared.
     (unless (or skip-clear-body (not content) keep-description)
-      (orgist-clear-body))
+      (setq removed-description (orgist-clear-body)))
     ;; Apply reminders to SCHEDULED/DEADLINE timestamps
     (when reminders
       (orgist-apply-reminders reminders))
@@ -2847,15 +2850,15 @@ See `orgist-update-element', which guards this."
                (org-element-property :closed (org-element-at-point)))
       (org-back-to-heading t)
       (org-add-planning-info nil nil 'closed))
-    ;; Insert description AFTER logbook entries.  `org-end-of-meta-data'
-    ;; with argument t skips past property drawers, planning, clocks,
-    ;; and bare logbook lines.  Blank-line spacing is fixed by
+    ;; Insert description AFTER logbook entries, in a drawer or in the
+    ;; body: a description sub-heading would otherwise take the bare log
+    ;; notes below it.  Blank-line spacing is fixed by
     ;; `orgist--normalize-body-spacing' below.
     (when (and description (not (string-empty-p description))
                (not keep-description))
       (orgist-log 'debug "Setting description (%d chars)" (length description))
       (save-excursion
-        (org-end-of-meta-data t)
+        (orgist--goto-description-start)
         (let ((converted-description (orgist-convert-description description level)))
           (insert converted-description "\n"))))
     ;; Normalize body spacing: ensure exactly one blank line between
@@ -2863,6 +2866,21 @@ See `orgist-update-element', which guards this."
     ;; end of subtree.  Never more than one blank line; never a
     ;; description stuck to adjacent content.
     (orgist--normalize-body-spacing)
+    ;; Journal the replaced description when the rebuild changed it.  An
+    ;; identical rebuild (a snapshot without `:remote-description', a
+    ;; full sync) removed nothing worth keeping.
+    (when (and removed-description
+               (not (string-blank-p removed-description)))
+      (save-excursion
+        (org-back-to-heading t)
+        (unless (orgist--same-text-p removed-description (orgist--description-text))
+          (orgist--journal (format "Replaced description of %s" (org-get-heading t t t t))
+                           removed-description
+                           :kind "replaced-description"
+                           :file (file-name-nondirectory (or (buffer-file-name) (buffer-name)))
+                           :outline (org-get-outline-path t)
+                           :id id
+                           :reason "Description changed in Todoist"))))
     ;; Snapshot this element's Todoist state for write-back diffing.
     (when orgist-enable-write-back
       (orgist-snapshot-element element keep-description))))
@@ -2997,7 +3015,16 @@ touched."
           ;; point to.
           (unless id-p
             (goto-char bol)
-            (org-end-of-meta-data 'logbook)
+            ;; Not `org-end-of-meta-data' with an argument: it also
+            ;; skips blank lines, and each pass would add one more.
+            (org-end-of-meta-data)
+            (while (cond ((looking-at org-logbook-drawer-re)
+                          (goto-char (match-end 0))
+                          (forward-line 1)
+                          t)
+                         ((looking-at org-clock-line-re)
+                          (forward-line 1)
+                          t)))
             (when (and (< (point) subtree-end)
                        (not (looking-at "^[ \t]*$"))
                        (not (looking-at org-outline-regexp-bol)))
@@ -3047,27 +3074,47 @@ or the end of the subtree; BODY-END is exclusive.  Implements the
           (delete-region (point) (1+ (line-end-position)))
           (cl-decf body-end))
          (t (forward-line 1)))))
-    ;; Step 2: Ensure blank line between logbook entries and
-    ;; description text.  Logbook lines match "^- State ".
-    ;; Handle both orderings: logbook-then-desc and desc-then-logbook.
-    (goto-char body-start)
-    (while (re-search-forward
-            "^\\(- State .+\\)\n\\([^- \n*]\\)" body-end t)
-      (goto-char (match-end 1))
-      (insert "\n")
-      (setq body-end (1+ body-end)))
-    (goto-char body-start)
-    (while (re-search-forward
-            "^\\([^- \n*:].*\\)\n\\(- State \\)" body-end t)
-      (goto-char (match-beginning 2))
-      (insert "\n")
-      (setq body-end (1+ body-end)))
+    ;; Step 2: Ensure one blank line between the log notes Org writes
+    ;; in the body (`org-log-into-drawer' nil) and description text, in
+    ;; either order.  A bullet description is content, not a log note:
+    ;; only lines `orgist--log-item-regexp' matches are.  Drawers and
+    ;; literal blocks are skipped whole, so a :LOGBOOK: drawer's last
+    ;; entry stays glued to its :END: line.
+    (let ((log-re (orgist--log-item-regexp))
+          ;; What the line above is: `log', `text', or nil (blank line,
+          ;; drawer or start of body).
+          (prev nil))
+      (goto-char body-start)
+      (while (< (point) body-end)
+        (cond
+         ((looking-at "[ \t]*$")
+          (setq prev nil)
+          (forward-line 1))
+         ((and (looking-at org-drawer-regexp)
+               (not (looking-at "[ \t]*:END:[ \t]*$")))
+          (setq prev nil)
+          (re-search-forward "^[ \t]*:END:[ \t]*$" body-end 'move)
+          (forward-line 1))
+         ((looking-at log-re)
+          (when (eq prev 'text)
+            (insert "\n")
+            (setq body-end (1+ body-end)))
+          (orgist--skip-log-item body-end)
+          (setq prev 'log))
+         (t
+          (when (eq prev 'log)
+            (insert "\n")
+            (setq body-end (1+ body-end)))
+          (if (looking-at "[ \t]*#\\+BEGIN_")
+              (progn
+                (re-search-forward "^[ \t]*#\\+END_" body-end 'move)
+                (forward-line 1))
+            (forward-line 1))
+          (setq prev 'text)))))
     ;; Step 2b: Fix spacing at start of body.
     ;; - Remove blank lines between :END:/planning and logbook content
-    ;;   (bare "- State ..." lines or :LOGBOOK: drawer).
+    ;;   (log notes or a :LOGBOOK: drawer).
     ;; - Ensure one blank line before description (non-logbook) content.
-    ;;   A bullet description is content, not a logbook entry: only bare
-    ;;   "- State" lines count as logbook here.
     (goto-char body-start)
     (when (< body-start body-end)
       (let ((first-nonblank
@@ -3080,7 +3127,8 @@ or the end of the subtree; BODY-END is exclusive.  Implements the
          ((and (< first-nonblank body-end)
                (save-excursion
                  (goto-char first-nonblank)
-                 (looking-at "[ \t]*\\(?:- State \\|:LOGBOOK:\\)")))
+                 (or (looking-at (orgist--log-item-regexp))
+                     (looking-at "[ \t]*:LOGBOOK:"))))
           (when (> first-nonblank body-start)
             (delete-region body-start first-nonblank)
             (setq body-end (- body-end (- first-nonblank body-start)))))
@@ -3195,65 +3243,181 @@ Every heading line keeps its depth relative to the top heading."
                          t t nil 1))))
     (buffer-string)))
 
+(defvar orgist--log-item-regexp-cache nil
+  "(HEADINGS . REGEXP) built by `orgist--log-item-regexp'.")
+
+(defun orgist--log-item-regexp ()
+  "Return a regexp matching the first line of a log note.
+Built from `org-log-note-headings', and from its standard value for
+notes written before it was customized, the way
+`org-skip-over-state-notes' matches state notes; also matches the
+Note entries comments become (see `orgist-insert-comment-as-note')."
+  (unless (equal (car orgist--log-item-regexp-cache) org-log-note-headings)
+    (let ((escapes `(("%d" . ,org-ts-regexp-inactive)
+                     ("%D" . ,org-ts-regexp)
+                     ;; A creation entry has no old state.
+                     ("%s" . "\\(?:\"\\S-+\"\\)?")
+                     ("%S" . "\\(?:\"\\S-+\"\\)?")
+                     ("%t" . ,org-ts-regexp-inactive)
+                     ("%T" . ,org-ts-regexp)
+                     ("%u" . ".*?")
+                     ("%U" . ".*?")))
+          (headings (delete-dups
+                     (delq nil
+                           (mapcar (lambda (entry)
+                                     (unless (string-empty-p (cdr entry))
+                                       (cdr entry)))
+                                   (append org-log-note-headings
+                                           (eval (car (get 'org-log-note-headings
+                                                           'standard-value))
+                                                 t)))))))
+      (setq orgist--log-item-regexp-cache
+            (cons org-log-note-headings
+                  (concat "^[ \t]*- +\\(?:"
+                          (mapconcat
+                           (lambda (heading)
+                             ;; Spaces first: the escapes' regexps hold
+                             ;; spaces of their own.
+                             (org-replace-escapes
+                              (replace-regexp-in-string " +" " +" (regexp-quote heading))
+                              escapes))
+                           headings "\\|")
+                          "\\|" org-ts-regexp-inactive " +Note"
+                          "\\)")))))
+  (cdr orgist--log-item-regexp-cache))
+
+(defun orgist--skip-log-item (bound)
+  "Move past the log note at point and its continuation lines, up to BOUND.
+Continuation lines are indented deeper than the note's bullet; blank
+lines belong to the note only when such a line follows them."
+  (let ((indent (current-indentation)))
+    (forward-line 1)
+    (while (and (< (point) bound)
+                (save-excursion
+                  (skip-chars-forward " \t\n" bound)
+                  (and (< (point) bound)
+                       (> (current-column) indent))))
+      (forward-line 1))))
+
+(defun orgist--goto-description-start ()
+  "Move point to where the description of the heading at point begins.
+That is past the metadata, as `org-end-of-meta-data' with argument t
+skips it, and past the log notes Org writes in the body itself when
+`org-log-into-drawer' is nil, with the drawers, clock and blank lines
+around them.  Returns point."
+  (org-back-to-heading-or-point-min t)
+  (org-end-of-meta-data t)
+  (let ((log-re (orgist--log-item-regexp))
+        (bound (save-excursion
+                 (if (re-search-forward org-outline-regexp-bol nil t)
+                     (line-beginning-position)
+                   (point-max)))))
+    (catch 'done
+      (while (< (point) bound)
+        (cond
+         ((looking-at log-re) (orgist--skip-log-item bound))
+         ((looking-at "[ \t]*$") (forward-line 1))
+         ((looking-at org-clock-line-re) (forward-line 1))
+         ((and (looking-at org-drawer-regexp)
+               (not (looking-at "[ \t]*:END:[ \t]*$"))
+               (re-search-forward "^[ \t]*:END:[ \t]*$" bound t))
+          (forward-line 1))
+         (t (throw 'done nil)))))
+    (point)))
+
+(defun orgist--trailing-log-start (start end)
+  "Return where the log notes ending the text between START and END begin.
+Pulls used to insert the description above the log notes in the body,
+leaving them after it; they are not description.  Returns END when
+the text does not end with log notes."
+  (save-excursion
+    (goto-char start)
+    (let ((log-re (orgist--log-item-regexp))
+          (tail nil))
+      (while (< (point) end)
+        (cond
+         ((looking-at "[ \t]*$") (forward-line 1))
+         ((looking-at log-re)
+          (unless tail (setq tail (point)))
+          (orgist--skip-log-item end))
+         (t
+          (setq tail nil)
+          (forward-line 1))))
+      (or tail end))))
+
+(defun orgist--description-regions ()
+  "Return the regions holding the description of the heading at point.
+A list of (BEG . END) in buffer order: the body after the heading's
+metadata and log notes (see `orgist--goto-description-start'), and
+every heading under it that is not a Todoist element (see
+`orgist--element-heading-p'), with what lies between them.  Log notes
+ending the body text are excluded too (see
+`orgist--trailing-log-start').  Element subtrees are excluded; one
+nested under a description heading counts as part of it, so hoist
+those first (see `orgist--hoist-nested-elements')."
+  (save-excursion
+    (org-back-to-heading-or-point-min t)
+    (let* ((subtree-end (orgist--subtree-end))
+           (pos (orgist--goto-description-start))
+           (body-end (if (re-search-forward org-outline-regexp-bol subtree-end t)
+                         (line-beginning-position)
+                       subtree-end))
+           (log-start (orgist--trailing-log-start pos body-end))
+           (regions nil))
+      (when (< log-start body-end)
+        (when (< pos log-start)
+          (push (cons pos log-start) regions))
+        (setq pos body-end))
+      (while (< pos subtree-end)
+        (goto-char pos)
+        (if (not (re-search-forward org-outline-regexp-bol subtree-end t))
+            ;; No more headings: trailing body text.
+            (progn
+              (push (cons pos subtree-end) regions)
+              (setq pos subtree-end))
+          (goto-char (line-beginning-position))
+          (if (orgist--element-heading-p)
+              ;; Element: the gap before it, then skip its subtree.
+              (progn
+                (when (< pos (point))
+                  (push (cons pos (point)) regions))
+                (setq pos (orgist--subtree-end)))
+            ;; Description heading: its subtree, with the gap before it.
+            (let ((end (orgist--subtree-end)))
+              (push (cons pos end) regions)
+              (setq pos end)))))
+      (nreverse regions))))
+
+(defun orgist--description-text ()
+  "Return the description of the heading at point, verbatim.
+See `orgist--description-regions'."
+  (mapconcat (lambda (region)
+               (buffer-substring-no-properties (car region) (cdr region)))
+             (orgist--description-regions) ""))
+
 (defun orgist-clear-body ()
-  "Delete the description of the task at point.
+  "Delete the description of the task at point; return the removed text.
 The description is the body text and every heading under the task
 that is not a Todoist element (see `orgist--element-heading-p').
 Element subtrees are preserved; one nested under a description
 heading is first moved up to be a direct child of the task (see
 `orgist--hoist-nested-elements'), so replacing a description never
-deletes a Todoist task.  The removed text goes to the journal."
+deletes a Todoist task."
   (save-excursion
     (org-back-to-heading-or-point-min t)
     (orgist--hoist-nested-elements)
-    (let ((label (when (org-at-heading-p) (org-get-heading t t t t)))
-          (id (orgist--element-id))
-          (outline (when (org-at-heading-p) (org-get-outline-path t)))
-          (removed nil))
-      (org-end-of-meta-data t)
-      (cl-flet ((kill (beg end)
-                  (push (buffer-substring-no-properties beg end) removed)
-                  (delete-region beg end)))
-        (let ((pos (point))
-              (subtree-end (orgist--subtree-end)))
-          ;; Walk through the region, deleting gaps between element subtrees.
-          (while (< pos subtree-end)
-            (goto-char pos)
-            (if (not (re-search-forward org-outline-regexp-bol subtree-end t))
-                ;; No more headings — delete trailing body text.
-                (progn
-                  (when (< pos subtree-end)
-                    (kill pos subtree-end)
-                    (setq subtree-end pos))
-                  (setq pos subtree-end))
-              ;; Found a heading — keep it when it is a Todoist element.
-              (goto-char (line-beginning-position))
-              (if (orgist--element-heading-p)
-                  ;; Element heading: delete gap before it, skip past its subtree.
-                  (progn
-                    (when (< pos (point))
-                      (let ((gap (- (point) pos)))
-                        (kill pos (point))
-                        (setq subtree-end (- subtree-end gap))))
-                    ;; Skip past this element subtree (it's preserved).
-                    (setq pos (orgist--subtree-end)))
-                ;; Description heading: delete its entire subtree.
-                (let* ((heading-start (point))
-                       (heading-end (orgist--subtree-end))
-                       ;; But first, delete the gap before it too.
-                       (del-start (min pos heading-start))
-                       (del-len (- heading-end del-start)))
-                  (kill del-start heading-end)
-                  (setq subtree-end (- subtree-end del-len))
-                  (setq pos del-start)))))))
-      (let ((text (apply #'concat (nreverse removed))))
-        (unless (string-blank-p text)
-          (orgist--journal (format "Replaced description of %s" (or label id))
-                           text
-                           :kind "replaced-description"
-                           :file (file-name-nondirectory (or (buffer-file-name) (buffer-name)))
-                           :outline outline :id id
-                           :reason "Description changed in Todoist"))))))
+    (let* ((regions (orgist--description-regions))
+           (removed (mapconcat (lambda (region)
+                                 (buffer-substring-no-properties (car region) (cdr region)))
+                               regions "")))
+      (dolist (region (reverse regions))
+        (delete-region (car region) (cdr region)))
+      removed)))
+
+(defun orgist--same-text-p (a b)
+  "Return non-nil if texts A and B differ at most in whitespace."
+  (cl-flet ((norm (s) (string-trim (replace-regexp-in-string "[ \t\r\n]+" " " (or s "")))))
+    (equal (norm a) (norm b))))
 
 (defun orgist-has-logbook-p (&optional state)
   "Check if the current heading has a state log entry.
@@ -3520,7 +3684,9 @@ REMINDERS is a list of reminder alists from the Todoist API.
                                       (line-beginning-position)
                                     (point-max)))))
                   (unless (search-forward org-ts body-end t)
-                    (org-end-of-meta-data t)
+                    ;; Below any log notes in the body, which a stamp
+                    ;; above them would pull into the description.
+                    (orgist--goto-description-start)
                     (insert org-ts "\n"))))))))
        ;; Location reminder: store as property
        ((string= type "location")
@@ -5441,23 +5607,17 @@ metadata.  Element subtrees are skipped whole."
 (defun orgist--entry-body-text ()
   "Return the body text of the heading at point, up to its first child.
 Text between the end of meta-data and the first child heading,
-trimmed, excluding state-change log entries at its start and end."
+trimmed, excluding the log notes at its start and end (see
+`orgist--goto-description-start' and `orgist--trailing-log-start')."
   (save-excursion
     (org-back-to-heading-or-point-min t)
-    (org-end-of-meta-data t)
-    (let ((start (point))
-          (end (save-excursion
-                 (let ((subtree-end (orgist--subtree-end)))
-                   (if (re-search-forward org-outline-regexp-bol subtree-end t)
-                       (line-beginning-position)
-                     subtree-end)))))
-      (let ((log-re "^[ \t]*- \\(?:State\\|to\\|From\\) .+\n"))
-        (thread-last (buffer-substring-no-properties start end)
-          ;; Strip bare logbook lines (not inside :LOGBOOK: drawer)
-          ;; from both the end and the start of the body text.
-          (replace-regexp-in-string (concat "\\(?:" log-re "\\)+\\'") "")
-          (replace-regexp-in-string (concat "\\`\\(?:" log-re "\\)+") "")
-          string-trim)))))
+    (let* ((subtree-end (orgist--subtree-end))
+           (start (orgist--goto-description-start))
+           (end (if (re-search-forward org-outline-regexp-bol subtree-end t)
+                    (line-beginning-position)
+                  subtree-end)))
+      (string-trim (buffer-substring-no-properties
+                    start (orgist--trailing-log-start start end))))))
 
 (defun orgist-diff-element (element-id)
   "Compare local state of ELEMENT-ID against its snapshot.
