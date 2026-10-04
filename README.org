@@ -430,7 +430,7 @@ commands with a =project_id= target.
 | Formatting        | =./test-run.sh format=            |    95 | Spacing, write-back, new/delete/move |
 | Comments          | =./test-run.sh comments=          |    17 | Comment pull, dedup, note push       |
 | Subprocess        | =./test-run.sh subprocess=        |    15 | Full + incremental subprocess sync   |
-| Rebuild           | =./test-run.sh rebuild=           |    30 | Snapshots rebuilt from Todoist; planted drift both ways; take Todoist's version; undo a pull |
+| Rebuild           | =./test-run.sh rebuild=           |    32 | Snapshots rebuilt from Todoist; planted drift both ways; take Todoist's version; undo a pull |
 | Sole writer       | =./test-run.sh sole-writer=       |    24 | Subprocess syncs on a staged copy; edit during a sync |
 | Cross-project     | =./test-run.sh move=              |    11 | Cross-project task moves             |
 | State log         | =./test-run.sh state-log=         |    12 | Completion timestamps, reopen, repeats |
@@ -439,7 +439,7 @@ commands with a =project_id= target.
 | Metadata          | =./test-run.sh metadata=          |    18 | Non-Todoist property preservation    |
 | New features      | =./test-run.sh features=          |   100 | Timezone, duration, labels, etc.     |
 | Attachments       | =./test-run.sh attachments=       |    52 | ATTACH tag, pull/push, diff, confirm |
-| ERT regression    | =./test-run.sh ert=               |   130 | Identity, ordering, spacing, log notes, guards, review, seams |
+| ERT regression    | =./test-run.sh ert=               |   131 | Identity, ordering, spacing, log notes, guards, review, seams |
 | Live write-back   | =./test-run.sh live-writeback=    |    27 | Real API identity, description and safety-net round trips (needs token) |
 | Live attachments  | =./test-run.sh live-attachments=  |    19 | Real API attachment CRUD (needs token) |
 

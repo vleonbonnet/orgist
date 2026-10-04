@@ -1271,6 +1271,9 @@ deleted."
       ;; 7. Completed here: absent from the active state, kept.
       (at f (lambda () (let ((org-inhibit-logging t)) (org-todo "DONE"))))
       ;; 8. Completed in Todoist, still open here.
+      ;; 9. A snapshot recorded for a project, by an older local rebuild.
+      (puthash (alist-get 'id (aref (vconcat projects) 0)) '(:content "Orgtest project")
+               orgist-snapshots)
       (with-current-buffer buffer
         (let ((orgist--inhibit-after-save t)) (save-buffer)))
       (let ((orgist--batch-save-pending nil))
@@ -1319,9 +1322,15 @@ deleted."
                             "The shadow pull wrote nothing to the journal")
         (orgist-test-assert (not (file-directory-p (expand-file-name "staging" (orgist--safety-directory))))
                             "The shadow copy is gone")
+        (orgist-test-assert (member (alist-get 'id (aref (vconcat projects) 0))
+                                    (plist-get outcome :dropped))
+                            "A snapshot recorded for a project is dropped")
         (with-current-buffer (get-buffer "*Orgist Rebuild*")
           (orgist-test-assert (string-match-p "Gone from Todoist (1)" (buffer-string))
-                              "The report lists what it found")))))
+                              "The report lists what it found")
+          (orgist-test-assert (string-match-p "Snapshots dropped (1)\\(?:.\\|\n\\)*Orgtest project.*, a project"
+                                              (buffer-string))
+                              "and names the snapshot it dropped")))))
   (message "=== Results: Rebuild ===")
   (message "=== Passed: %d  Failed: %d ===" orgist-test--passes orgist-test--failures)
   orgist-test--failures)

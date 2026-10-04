@@ -5513,7 +5513,10 @@ for an entry CURRENT lacks."
     (with-temp-buffer
       (let ((coding-system-for-read 'utf-8))
         (insert-file-contents file))
-      (orgist--snapshot-decode-tree (ignore-errors (read (current-buffer)))))))
+      ;; Entry by entry: decoding recurses down a list's tail.
+      (mapcar (lambda (change)
+                (cons (car change) (orgist--snapshot-decode-tree (cdr change))))
+              (ignore-errors (read (current-buffer)))))))
 
 (defun orgist--merge-snapshot-delta (delta base)
   "Merge DELTA, a subprocess's snapshot changes, into `orgist-snapshots'.
@@ -5909,8 +5912,9 @@ and offers to rebuild when problems are found."
     (with-temp-buffer
       (let ((coding-system-for-read 'utf-8))
         (insert-file-contents file))
-      (dolist (entry (orgist--snapshot-decode-tree (read (current-buffer))))
-        (puthash (car entry) (cdr entry) table)))
+      ;; Entry by entry: decoding recurses down a list's tail.
+      (dolist (entry (read (current-buffer)))
+        (puthash (car entry) (orgist--snapshot-decode-tree (cdr entry)) table)))
     table))
 
 (defun orgist--shadow-pull (data on-done)
@@ -5951,9 +5955,13 @@ failed.  The files, journal and trash it writes stay in the copy."
            orgist-snapshots (expand-file-name "shadow-snapshots.el" orgist-base-dir))
           (with-temp-file ,done-file (insert "done\n"))))
       :on-success (lambda (staging-dir)
-                    (let ((table (ignore-errors
-                                   (orgist--read-snapshot-table
-                                    (expand-file-name "shadow-snapshots.el" staging-dir)))))
+                    (let ((table (condition-case err
+                                     (orgist--read-snapshot-table
+                                      (expand-file-name "shadow-snapshots.el" staging-dir))
+                                   (error
+                                    (orgist-log 'error "Shadow pull: could not read its snapshots: %s"
+                                                (error-message-string err))
+                                    nil))))
                       (orgist--remove-staging staging-dir)
                       (funcall on-done table)))
       :on-failure (lambda (_event) (funcall on-done nil))))))
@@ -6006,7 +6014,10 @@ snapshots.  Returns a plist:
             here: reported, neither created nor deleted;
 :orphans    the IDs only the files hold, not done: gone from Todoist,
             or never fetched; reported, their snapshots dropped;
-:kept       how many done or archived elements kept their snapshot."
+:kept       how many done or archived elements kept their snapshot;
+:dropped    the IDs whose snapshot the new table lacks: orphans, and
+            entries for neither an element here nor in Todoist, such
+            as sub-project headings an older local rebuild recorded."
   (let ((table (make-hash-table :test 'equal :size (hash-table-count existing)))
         (rebuilt 0) (kept 0)
         (pending-deletions nil) (missing nil) (orphans nil))
@@ -6039,7 +6050,11 @@ snapshots.  Returns a plist:
        local))
     (list :table table :rebuilt rebuilt :kept kept
           :pending-deletions (nreverse pending-deletions)
-          :missing (nreverse missing) :orphans (nreverse orphans))))
+          :missing (nreverse missing) :orphans (nreverse orphans)
+          :dropped (let ((dropped nil))
+                     (maphash (lambda (id _) (unless (gethash id table) (push id dropped)))
+                              existing)
+                     dropped))))
 
 (defun orgist--fetch-element (id section-p)
   "Return Todoist's state of element ID, a section when SECTION-P, or nil.
@@ -6157,7 +6172,8 @@ OUTCOME is what `orgist--rebuild-from' passes, or nil when it failed.
 Opens the write-back review when REVIEW, or outside batch mode; with
 PREFER-REMOTE every change starts set to take Todoist's version.
 Returns the pending changes, or the symbol `failed'."
-  (let ((result 'failed))
+  (let ((result 'failed)
+        (old-snapshots nil))
     (unwind-protect
         (cond
          ((null outcome)
@@ -6170,7 +6186,8 @@ Returns the pending changes, or the symbol `failed'."
                       (hash-table-count (plist-get outcome :table))))
          (t
           (orgist--history-checkpoint "Before rebuild: snapshots")
-          (setq orgist-snapshots (plist-get outcome :table)
+          (setq old-snapshots orgist-snapshots
+                orgist-snapshots (plist-get outcome :table)
                 orgist--snapshot-count-on-disk nil)
           (orgist-save-snapshots)
           ;; Every file is compared with the new snapshots.
@@ -6179,7 +6196,7 @@ Returns the pending changes, or the symbol `failed'."
           (orgist--save-stamps)
           (orgist--history-checkpoint "Rebuilt snapshots from Todoist")
           (setq result (orgist--settle-descriptions (orgist-diff-all-elements)))
-          (orgist--rebuild-report outcome result)
+          (orgist--rebuild-report outcome result old-snapshots)
           (orgist-log 'info "Rebuild: %d snapshot(s) from Todoist, %d difference(s) with the files"
                       (plist-get outcome :rebuilt) (length result))))
       (setq orgist-sync-mutex nil))
@@ -6353,8 +6370,9 @@ records the files before and after."
           (orgist--history-checkpoint (format "Took Todoist's version of %s" label))
           (orgist-log 'info "Took Todoist's version of %s" label))))))
 
-(defun orgist--rebuild-report (outcome changes)
-  "Show the report of a rebuild OUTCOME, with CHANGES pending."
+(defun orgist--rebuild-report (outcome changes old-snapshots)
+  "Show the report of a rebuild OUTCOME, with CHANGES pending.
+OLD-SNAPSHOTS is the table the rebuild replaced."
   (let* ((data (plist-get outcome :data))
          (local (plist-get outcome :local))
          (by-id (make-hash-table :test 'equal))
@@ -6399,6 +6417,14 @@ records the files before and after."
                    #'local-line)
           (section "Under more than one heading" (plist-get outcome :duplicates)
                    "One Todoist element bound to several headings: keep one.\n" #'local-line)
+          (section "Snapshots dropped"
+                   (seq-remove (lambda (id) (member id (plist-get outcome :orphans)))
+                               (plist-get outcome :dropped))
+                   "Recorded for nothing that is a task or section here or in Todoist (a project heading, say); nothing changes in the files.\n"
+                   (lambda (id)
+                     (format "- %s (%s)%s\n"
+                             (or (plist-get (gethash id old-snapshots) :content) "?") id
+                             (if (gethash id projects) ", a project" ""))))
           (goto-char (point-min))
           (set-buffer-modified-p nil))
         (unless noninteractive

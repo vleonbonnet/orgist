@@ -321,6 +321,29 @@ Detection binds new headings to temporary IDs, which already edits files."
     (should-not (gethash "E" orgist-snapshots))
     (should (equal (gethash "N" orgist-snapshots) '(:content "new")))))
 
+(ert-deftest orgist-seams/large-snapshot-files-read-back ()
+  "Thousands of entries read back, as a table and as a delta.
+Decoding the whole list at once recursed down its tail and exceeded
+the evaluation depth: on real data (4555 snapshots) the rebuild read
+back nothing and reported that its shadow pull had failed."
+  (let* ((dir (make-temp-file "orgist-large-" t))
+         (file (expand-file-name "table.el" dir))
+         (table (make-hash-table :test 'equal)))
+    (unwind-protect
+        (progn
+          (dotimes (i 5000)
+            (puthash (format "T%d" i) (list :content (format "Tâche %d" i) :order i) table))
+          (orgist--write-snapshot-table table file)
+          (let ((back (orgist--read-snapshot-table file)))
+            (should (= (hash-table-count back) 5000))
+            (should (equal (gethash "T4999" back) '(:content "Tâche 4999" :order 4999))))
+          (let ((orgist--snapshot-delta-file file)
+                (orgist--snapshot-base (make-hash-table :test 'equal))
+                (orgist-snapshots table))
+            (orgist--write-snapshot-delta)
+            (should (= (length (orgist--read-snapshot-delta file)) 5000))))
+      (delete-directory dir t))))
+
 (ert-deftest orgist-seams/snapshot-delta-survives-the-file ()
   "A delta written by a subprocess reads back equal, with multibyte text."
   (let* ((dir (make-temp-file "orgist-delta-" t))
