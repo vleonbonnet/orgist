@@ -405,9 +405,13 @@ Delivered in steps, each a commit with every suite green:
 
 Verified: a full sync response fetched once from the real account and replayed offline into two copies of the real mirror, with the code before and after M1, produced byte-identical files, snapshots and labels.  =orgist-sole-writer= stays off until it has been tried in daily use: on the real data a run that changes nothing keeps Emacs busy about 95 ms, and taking over the largest file about 135 ms.
 
-** TODO M2 — Rebuild-and-validate from remote
+** DONE M2 — Rebuild-and-validate from remote
+CLOSED: [2026-10-04 Sun 15:50]
 :PROPERTIES:
 :ID:       4299b593-37f9-4f85-a99c-afbdaff627eb
+:END:
+:LOGBOOK:
+- [2026-10-04 Sun 15:50] From "TODO"     to "DONE"
 :END:
 
 Fetch full remote state, rebuild snapshots from it (never from local), run ID validation, then a normal diff so any drift appears as pending changes. Needed by adoption verification and by =orgist-undo-cycle=, which also lands here: restore the files of a sync cycle from history, then rebuild snapshots from remote so the changes that cycle applied reappear as pending diffs.
@@ -420,6 +424,8 @@ Plan:
 3. =orgist-rebuild-and-validate=: replaces the snapshots, reports, and opens the write-back review, where drift appears as pending changes.
 4. Take Todoist's version: per item in the review buffer, and =orgist-take-remote= for the heading at point, so drift can be resolved either way.
 5. =orgist-undo-cycle=: restores the project files a sync cycle started from, rebuilds from remote, and opens the review with Todoist's version preselected.
+
+Delivered as planned.  Found on the way: background syncs rendered without the reminders and collaborators the parent had (assignees as raw user IDs, lost reminder stamps), and snapshot tables read as one list overflowed the evaluation depth at real size.  On a read-only copy of the real mirror the rebuild took Todoist's values for 1280 elements, kept 3270 done or archived ones, dropped five sub-project snapshots an older local rebuild had recorded, and found no difference with the files.
 
 ** TODO M3 — Overlay, projection-only
 :PROPERTIES:
