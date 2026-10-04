@@ -1026,6 +1026,10 @@ responsive.  Batch mode always processes synchronously."
   :group 'orgist
   :type 'integer)
 
+(defconst orgist--sync-resource-types
+  "[\"projects\", \"sections\", \"items\", \"labels\", \"reminders\", \"collaborators\", \"user\", \"user_plan_limits\"]"
+  "The Sync API resources a pull reads, as the JSON array it sends.")
+
 (defun orgist-pull (&optional retries)
   "Pull latest state from Todoist Sync API.
 This is the read half of `orgist' — separated so it can be called
@@ -1046,7 +1050,7 @@ errors (curl SSL, timeout, HTTP 429/5xx) are retried up to
     (orgist-remote
       'sync
       :data `(("sync_token" . ,sync-token)
-              ("resource_types" . "[\"projects\", \"sections\", \"items\", \"labels\", \"reminders\", \"collaborators\", \"user\", \"user_plan_limits\"]"))
+              ("resource_types" . ,orgist--sync-resource-types))
       :parser 'json-read
       :error (cl-function (lambda (&key (data nil) error-thrown symbol-status
                                   response &allow-other-keys)
@@ -1443,10 +1447,7 @@ snapshot changes must not be merged."
                    (length (plist-get result :renamed)))))
     (unless deferred
       (orgist--commit-staged-state dir))
-    (delete-directory dir t)
-    (let ((parent (file-name-directory (directory-file-name dir))))
-      (when (null (directory-files parent nil directory-files-no-dot-files-regexp))
-        (delete-directory parent)))
+    (orgist--remove-staging dir)
     (cond
      (deferred
       (orgist-log 'warn "%s: took over %d file(s) in %.2fs; deferred %s, edited during the sync: its changes come with the next sync"
@@ -1457,6 +1458,15 @@ snapshot changes must not be merged."
      (t
       (orgist-log 'debug "%s: no file changed (%.2fs)" name (plist-get result :seconds))))
     (plist-get result :deferred-ids)))
+
+(defun orgist--remove-staging (dir)
+  "Delete staging directory DIR, and the staging area once empty."
+  (when (file-directory-p dir)
+    (delete-directory dir t))
+  (let ((parent (file-name-directory (directory-file-name dir))))
+    (when (and (file-directory-p parent)
+               (null (directory-files parent nil directory-files-no-dot-files-regexp)))
+      (delete-directory parent))))
 
 (defun orgist--commit-staged-state (dir)
   "Take over the state files the subprocess changed in staging DIR."
@@ -1502,8 +1512,11 @@ PLIST is a property list with these keys:
          (snapshot-base (progn (orgist-load-snapshots)
                                (orgist--copy-snapshots
                                 (or orgist-snapshots (make-hash-table :test 'equal)))))
+         ;; A shadow run works on a throwaway copy, whose result only
+         ;; feeds a computation; nothing it changes is taken over.
+         (shadow (plist-get plist :shadow))
          ;; With `orgist-sole-writer', the subprocess works on a copy.
-         (staging (when orgist-sole-writer
+         (staging (when (or orgist-sole-writer shadow)
                     (orgist--stage-project-files name)))
          (staging-dir (car staging))
          ;; Resolve paths
@@ -1586,6 +1599,13 @@ PLIST is a property list with these keys:
                                  ,(expand-file-name "labels.el" staging-dir))
                            (setq org-attach-id-dir
                                  ,(expand-file-name org-attach-id-dir orgist-base-dir))))
+                     ;; Shadow: journal, trash and attachments stay in
+                     ;; the copy too.
+                     ,@(when shadow
+                         `((setq orgist-history-directory ,staging-dir)
+                           (setq orgist-sync-attachments nil)
+                           (setq org-attach-id-dir
+                                 ,(expand-file-name "data/" staging-dir))))
                      ;; Enable write-back so snapshots are recorded
                      ;; during element updates; the subprocess never
                      ;; calls orgist-write-back itself.
@@ -1664,12 +1684,13 @@ PLIST is a property list with these keys:
                   (when (file-exists-p done-file)
                     (delete-file done-file))
                   ;; Take the subprocess's file changes: from its
-                  ;; staging copy, or by reverting what it saved.
+                  ;; staging copy, or by reverting what it saved.  A
+                  ;; shadow run's caller reads its copy instead.
                   (let ((deferred-ids
-                         (if staging-dir
-                             (orgist--finish-staged-run name staging)
-                           (orgist--revert-buffers-from-disk)
-                           nil)))
+                         (cond
+                          (shadow nil)
+                          (staging-dir (orgist--finish-staged-run name staging))
+                          (t (orgist--revert-buffers-from-disk) nil))))
                     ;; Merge the subprocess's snapshot changes, except
                     ;; for elements of deferred files.
                     (when-let* ((delta (orgist--read-snapshot-delta delta-file)))
@@ -1683,9 +1704,10 @@ PLIST is a property list with these keys:
                   (when (file-exists-p delta-file)
                     (delete-file delta-file))
                   (orgist--flush-log-buffer)
-                  ;; Call on-success
+                  ;; Call on-success; a shadow run's with its copy,
+                  ;; which the caller deletes.
                   (when on-success
-                    (funcall on-success count))))
+                    (funcall on-success (if shadow staging-dir count)))))
                (t
                 (orgist-log 'warn "%s subprocess failed: %s"
                             name (string-trim event))
@@ -1693,8 +1715,8 @@ PLIST is a property list with these keys:
                 (dolist (f (cons delta-file data-files))
                   (when (file-exists-p f)
                     (delete-file f)))
-                (when (and staging-dir (file-directory-p staging-dir))
-                  (delete-directory staging-dir t))
+                (when staging-dir
+                  (orgist--remove-staging staging-dir))
                 (orgist--flush-log-buffer)
                 (if on-failure
                     (funcall on-failure event)
@@ -5676,6 +5698,10 @@ Called after write-back commands were all executed successfully
 
 (defun orgist-rebuild-snapshots ()
   "Rebuild snapshots from current org buffer content.
+An offline fallback: it declares the files synced, so any edit not yet
+in Todoist, and any Todoist change not yet in the files, stops showing
+as a difference.  Prefer `orgist-rebuild-and-validate', which rebuilds
+from Todoist's state.
 Walk all orgist-managed buffers and capture the local state as the
 baseline for write-back diffing.  Metadata fields (note-count,
 comment-ids, etc.) are preserved from existing snapshots.  Snapshot
@@ -5850,6 +5876,356 @@ and offers to rebuild when problems are found."
                     (format "Orgist: %d task(s) missing from snapshots. Rebuild now? "
                             (length missing))))
           (orgist-rebuild-snapshots))))))
+
+;;; Rebuild from remote
+
+;; Snapshots mirror Todoist.  Rebuilding them from the files declares
+;; local state synced and hides every divergence for good, as the
+;; 2026-07 drift bug did.  A rebuild therefore takes Todoist's state,
+;; rendered by the pull code itself: the full state is applied, in a
+;; background Emacs, to a copy of the project files with no snapshots,
+;; and the snapshots that pull records are Todoist's values exactly as a
+;; pull writes them.  Comparing the files with them then shows any
+;; drift as pending changes.
+
+(defconst orgist--snapshot-bookkeeping
+  '(:comment-ids :activity-ids :comments-pulled :activity-note-count
+    :reminder-ids :attachment-files :metadata-comment-id)
+  "Snapshot fields orgist keeps for itself, which Todoist's state lacks.")
+
+(defun orgist--write-snapshot-table (table file)
+  "Write snapshot TABLE to FILE, as `orgist--read-snapshot-table' reads it."
+  (let ((entries nil)
+        (print-length nil)
+        (print-level nil)
+        (coding-system-for-write 'utf-8-unix))
+    (maphash (lambda (id plist) (push (cons id plist) entries)) table)
+    (with-temp-file file
+      (prin1 entries (current-buffer)))))
+
+(defun orgist--read-snapshot-table (file)
+  "Return the snapshot table written to FILE by `orgist--write-snapshot-table'."
+  (let ((table (make-hash-table :test 'equal)))
+    (with-temp-buffer
+      (let ((coding-system-for-read 'utf-8))
+        (insert-file-contents file))
+      (dolist (entry (orgist--snapshot-decode-tree (read (current-buffer))))
+        (puthash (car entry) (cdr entry) table)))
+    table))
+
+(defun orgist--shadow-pull (data on-done)
+  "Apply sync DATA to a copy of the project files, with no snapshots.
+Runs in a subprocess; calls ON-DONE with the snapshot table that pull
+recorded, Todoist's values as a pull writes them, or with nil when it
+failed.  The files, journal and trash it writes stay in the copy."
+  (let ((json-file (expand-file-name "shadow-data.json" orgist-base-dir))
+        (done-file (expand-file-name "shadow-done" orgist-base-dir)))
+    (with-temp-file json-file
+      (let ((json-encoding-pretty-print nil))
+        (insert (json-encode data))))
+    (orgist--run-subprocess
+     (list
+      :name "orgist-shadow"
+      :shadow t
+      :data-files (list json-file)
+      :done-file done-file
+      :needs-http nil
+      :extra-settings '((setq orgist-sync-project-filter nil))
+      :open-org-files nil
+      :job-body
+      `((let* ((json-object-type 'alist)
+               (json-array-type 'vector)
+               (json-key-type 'symbol)
+               (data (json-read-file ,json-file))
+               (inhibit-redisplay t)
+               (orgist--batch-save-pending (make-hash-table :test 'eq))
+               (gc-cons-threshold (* 100 1024 1024)))
+          ;; Without snapshots no pull keeps local text: every value is
+          ;; Todoist's.
+          (setq orgist-snapshots (make-hash-table :test 'equal)
+                orgist--snapshot-delta-file nil)
+          (orgist--apply-pull (alist-get 'projects data) (alist-get 'sections data)
+                              (alist-get 'items data))
+          (orgist--flush-pending-saves)
+          (orgist--write-snapshot-table
+           orgist-snapshots (expand-file-name "shadow-snapshots.el" orgist-base-dir))
+          (with-temp-file ,done-file (insert "done\n"))))
+      :on-success (lambda (staging-dir)
+                    (let ((table (ignore-errors
+                                   (orgist--read-snapshot-table
+                                    (expand-file-name "shadow-snapshots.el" staging-dir)))))
+                      (orgist--remove-staging staging-dir)
+                      (funcall on-done table)))
+      :on-failure (lambda (_event) (funcall on-done nil))))))
+
+(defun orgist--local-elements ()
+  "Return the elements the project files hold, bound to Todoist IDs.
+A hash table from element ID to a plist: :file (name), :label (the
+heading), :section (a section), :done (in a done state), :archived
+\(an archived section).
+Temporary IDs of pending creations are left out.  Also returns, as a
+second value in a cons, the IDs found under more than one heading."
+  (let ((elements (make-hash-table :test 'equal))
+        (duplicates nil))
+    (dolist (buffer (orgist--project-buffers t))
+      (with-current-buffer buffer
+        (org-with-wide-buffer
+         (goto-char (point-min))
+         (while (outline-next-heading)
+           (when-let* (((orgist--element-heading-p))
+                       (id (orgist--element-id))
+                       ((not (orgist--temp-id-p id))))
+             (if (gethash id elements)
+                 (push id duplicates)
+               (let ((section (and (org-entry-get (point) "SECTION") t)))
+                 (puthash id
+                          (list :file (file-name-nondirectory (buffer-file-name))
+                                :label (substring-no-properties (org-get-heading t t t t))
+                                :section section
+                                :done (and (member (org-get-todo-state) org-done-keywords) t)
+                                :archived (and section (member "ARCHIVE" (org-get-tags nil t)) t))
+                          elements))))))))
+    (cons elements (delete-dups duplicates))))
+
+(defun orgist--rebuild-from-remote (remote local existing)
+  "Return the snapshots rebuilt from Todoist, and what the rebuild found.
+REMOTE is the table a shadow pull recorded (see `orgist--shadow-pull'),
+LOCAL the table of `orgist--local-elements', EXISTING the current
+snapshots.  Returns a plist:
+:table      the new snapshot table.  An element in both the files and
+            Todoist gets Todoist's values, with orgist's own
+            bookkeeping (`orgist--snapshot-bookkeeping') carried over.
+            One Todoist holds but the files lack keeps a snapshot only
+            if it had one: a deletion made in org, which write-back
+            still proposes.  One only the files hold, done or an
+            archived section, keeps its snapshot: a full sync carries
+            only active elements.
+:rebuilt    how many elements got Todoist's values;
+:pending-deletions  the IDs deleted in org but not yet in Todoist;
+:missing    the IDs Todoist holds that the files lack, never synced
+            here: reported, neither created nor deleted;
+:orphans    the IDs only the files hold, not done: gone from Todoist,
+            or never fetched; reported, their snapshots dropped;
+:kept       how many done or archived elements kept their snapshot."
+  (let ((table (make-hash-table :test 'equal :size (hash-table-count existing)))
+        (rebuilt 0) (kept 0)
+        (pending-deletions nil) (missing nil) (orphans nil))
+    (cl-flet ((with-bookkeeping (remote-entry old)
+                (let ((entry (copy-sequence remote-entry)))
+                  (dolist (key orgist--snapshot-bookkeeping)
+                    (when (plist-member old key)
+                      (setq entry (plist-put entry key (plist-get old key)))))
+                  entry)))
+      (maphash
+       (lambda (id remote-entry)
+         (let ((old (gethash id existing)))
+           (cond
+            ((gethash id local)
+             (puthash id (with-bookkeeping remote-entry old) table)
+             (cl-incf rebuilt))
+            (old
+             (puthash id (with-bookkeeping remote-entry old) table)
+             (push id pending-deletions))
+            (t (push id missing)))))
+       remote)
+      (maphash
+       (lambda (id info)
+         (unless (gethash id remote)
+           (if (or (plist-get info :done) (plist-get info :archived))
+               (when-let* ((old (gethash id existing)))
+                 (puthash id old table)
+                 (cl-incf kept))
+             (push id orphans))))
+       local))
+    (list :table table :rebuilt rebuilt :kept kept
+          :pending-deletions (nreverse pending-deletions)
+          :missing (nreverse missing) :orphans (nreverse orphans))))
+
+(defun orgist--fetch-element (id section-p)
+  "Return Todoist's state of element ID, a section when SECTION-P, or nil.
+A completed task, which a full sync leaves out, is returned too."
+  (let ((result nil))
+    (orgist-remote (if section-p 'get-section 'get-task)
+                   :path (list id)
+                   :retry t
+                   :parser 'json-read
+                   :sync t
+                   :error (cl-function
+                           (lambda (&key error-thrown &allow-other-keys)
+                             (unless (memq (orgist--http-error-code error-thrown) '(404 410))
+                               (orgist-log 'warn "Could not fetch %s: %S" id error-thrown))))
+                   :success (cl-function
+                             (lambda (&key data &allow-other-keys)
+                               (setq result data))))
+    result))
+
+(defun orgist--rebuild-from (data on-done)
+  "Rebuild snapshots from full sync DATA; call ON-DONE with the outcome.
+Stores DATA's resources, fetches each local element the full state
+lacks and that is not done (a task completed in Todoist, or one
+gone), runs the shadow pull, and calls ON-DONE with the plist of
+`orgist--rebuild-from-remote' plus :duplicates, or with nil when the
+shadow pull failed."
+  (orgist-store-user-profile data)
+  (orgist-store-labels data)
+  ;; A full state is complete: no reminder from an earlier sync stays.
+  (setq orgist-reminders nil)
+  (orgist-store-reminders data)
+  (orgist-store-collaborators data)
+  (let* ((projects (append (alist-get 'projects data) nil))
+         (sections (append (alist-get 'sections data) nil))
+         (items (append (alist-get 'items data) nil))
+         (filter-ids (orgist-resolve-project-filter (alist-get 'projects data)))
+         (inventory (orgist--local-elements))
+         (local (car inventory))
+         (remote-ids (make-hash-table :test 'equal)))
+    (when filter-ids
+      (setq projects (seq-filter (lambda (p) (member (alist-get 'id p) filter-ids)) projects)
+            sections (seq-filter (lambda (s) (member (alist-get 'project_id s) filter-ids)) sections)
+            items (seq-filter (lambda (i) (member (alist-get 'project_id i) filter-ids)) items)))
+    ;; Projects are not snapshot elements; sub-project headings carry
+    ;; their IDs.
+    (dolist (project (append (alist-get 'projects data) nil))
+      (remhash (alist-get 'id project) local))
+    (dolist (element (append sections items))
+      (puthash (alist-get 'id element) t remote-ids))
+    ;; Local elements the active state lacks: completed in Todoist
+    ;; (fetched, then rebuilt like the rest), or gone.
+    (maphash (lambda (id info)
+               (unless (or (gethash id remote-ids)
+                           (plist-get info :done)
+                           (plist-get info :archived))
+                 (when-let* ((element (orgist--fetch-element id (plist-get info :section))))
+                   (if (plist-get info :section)
+                       (setq sections (append sections (list element)))
+                     (setq items (append items (list element)))))))
+             local)
+    (orgist--shadow-pull
+     `((projects . ,(vconcat projects)) (sections . ,(vconcat sections))
+       (items . ,(vconcat items)))
+     (lambda (remote)
+       (funcall on-done
+                (when remote
+                  (append (orgist--rebuild-from-remote remote local orgist-snapshots)
+                          (list :duplicates (cdr inventory) :local local
+                                :data data))))))))
+
+;;;###autoload
+(defun orgist-rebuild-and-validate ()
+  "Rebuild snapshots from Todoist's state and show where the files differ.
+Snapshots record what Todoist held at the last sync; when they drift,
+local edits go unpushed or remote changes look like local ones.  This
+fetches Todoist's full state, rebuilds every snapshot from it (never
+from the files; see `orgist--rebuild-from-remote'), reports elements
+missing on either side, and opens the write-back review, where any
+difference between the files and Todoist is a pending change.  The
+snapshots before and after are recorded in the history."
+  (interactive)
+  (when orgist-sync-mutex
+    (user-error "Orgist: a sync is running; try again when it ends"))
+  (setq orgist-sync-mutex (current-time))
+  (orgist-log 'info "Rebuild: fetching Todoist's full state...")
+  (orgist-remote
+   'sync
+   :data `(("sync_token" . "*") ("resource_types" . ,orgist--sync-resource-types))
+   :parser 'json-read
+   :error (cl-function
+           (lambda (&key error-thrown &allow-other-keys)
+             (setq orgist-sync-mutex nil)
+             (orgist-log 'error "Rebuild: could not fetch Todoist's state: %S" error-thrown)))
+   :success (cl-function
+             (lambda (&key data &allow-other-keys)
+               (condition-case err
+                   (orgist--rebuild-from data #'orgist--finish-rebuild)
+                 (error
+                  (setq orgist-sync-mutex nil)
+                  (orgist-log 'error "Rebuild failed: %s" (error-message-string err))))))))
+
+(defun orgist--finish-rebuild (outcome &optional review)
+  "Install the snapshots of a rebuild OUTCOME, report, then review drift.
+OUTCOME is what `orgist--rebuild-from' passes, or nil when it failed.
+Opens the write-back review when REVIEW, or outside batch mode.
+Returns the pending changes, or the symbol `failed'."
+  (let ((result 'failed))
+    (unwind-protect
+        (cond
+         ((null outcome)
+          (orgist-log 'error "Rebuild failed: the shadow pull did not finish; snapshots unchanged"))
+         ((and (> (hash-table-count orgist-snapshots) 20)
+               (< (hash-table-count (plist-get outcome :table))
+                  (/ (hash-table-count orgist-snapshots) 2)))
+          (orgist-log 'error "Rebuild refused: it would drop the snapshots from %d to %d; snapshots unchanged"
+                      (hash-table-count orgist-snapshots)
+                      (hash-table-count (plist-get outcome :table))))
+         (t
+          (orgist--history-checkpoint "Before rebuild: snapshots")
+          (setq orgist-snapshots (plist-get outcome :table)
+                orgist--snapshot-count-on-disk nil)
+          (orgist-save-snapshots)
+          ;; Every file is compared with the new snapshots.
+          (orgist--load-stamps)
+          (clrhash orgist--write-back-stamps)
+          (orgist--save-stamps)
+          (orgist--history-checkpoint "Rebuilt snapshots from Todoist")
+          (setq result (orgist--settle-descriptions (orgist-diff-all-elements)))
+          (orgist--rebuild-report outcome result)
+          (orgist-log 'info "Rebuild: %d snapshot(s) from Todoist, %d difference(s) with the files"
+                      (plist-get outcome :rebuilt) (length result))))
+      (setq orgist-sync-mutex nil))
+    (when (and (listp result) result (or review (not noninteractive)))
+      (orgist-write-back))
+    result))
+
+(defun orgist--rebuild-report (outcome changes)
+  "Show the report of a rebuild OUTCOME, with CHANGES pending."
+  (let* ((data (plist-get outcome :data))
+         (local (plist-get outcome :local))
+         (by-id (make-hash-table :test 'equal))
+         (projects (make-hash-table :test 'equal)))
+    (dolist (element (append (append (alist-get 'items data) nil)
+                             (append (alist-get 'sections data) nil)))
+      (puthash (alist-get 'id element) element by-id))
+    (dolist (project (append (alist-get 'projects data) nil))
+      (puthash (alist-get 'id project) (alist-get 'name project) projects))
+    (cl-flet ((remote-line (id)
+                (let ((element (gethash id by-id)))
+                  (format "- %s — %s (%s)\n"
+                          (or (alist-get 'content element) (alist-get 'name element) "?")
+                          (or (gethash (alist-get 'project_id element) projects) "?")
+                          id)))
+              (local-line (id)
+                (let ((info (gethash id local)))
+                  (format "- [[id:%s][%s]] in %s\n" id (plist-get info :label) (plist-get info :file))))
+              (section (title ids explanation line)
+                (when ids
+                  (insert (format "* %s (%d)\n%s\n" title (length ids) explanation))
+                  (dolist (id ids) (insert (funcall line id)))
+                  (insert "\n"))))
+      (with-current-buffer (get-buffer-create "*Orgist Rebuild*")
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (org-mode)
+          (insert (format "#+TITLE: Snapshots rebuilt from Todoist — %s\n\n"
+                          (format-time-string "%Y-%m-%d %H:%M")))
+          (insert (format "- %d element(s) took Todoist's values; %d done or archived kept their snapshot.\n"
+                          (plist-get outcome :rebuilt) (plist-get outcome :kept)))
+          (insert (format "- %d element(s) differ between the files and Todoist: %s\n\n"
+                          (length changes)
+                          (if changes "they are pending changes in the write-back review."
+                            "nothing to review.")))
+          (section "Deleted here, not yet in Todoist" (plist-get outcome :pending-deletions)
+                   "The write-back review proposes deleting them in Todoist.\n" #'remote-line)
+          (section "In Todoist, not in these files" (plist-get outcome :missing)
+                   "Never synced here; nothing was created or deleted.\n" #'remote-line)
+          (section "Gone from Todoist" (plist-get outcome :orphans)
+                   "Not in Todoist, active or completed: delete the heading, or remove its ID to create it again.\n"
+                   #'local-line)
+          (section "Under more than one heading" (plist-get outcome :duplicates)
+                   "One Todoist element bound to several headings: keep one.\n" #'local-line)
+          (goto-char (point-min))
+          (set-buffer-modified-p nil))
+        (unless noninteractive
+          (display-buffer (current-buffer)))))))
 
 (defun orgist-extract-heading-and-tags ()
   "Parse heading text and trailing tags from the current line.

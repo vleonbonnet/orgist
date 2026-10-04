@@ -101,6 +101,7 @@ All settings live in the =orgist= customize group.
 | =M-x orgist-reset=         | Set orgist's files aside and sync afresh from Todoist  |
 | =M-x orgist-history=       | Browse, compare and restore a file's sync history     |
 | =M-x orgist-journal=       | Browse text syncs removed; restore an entry          |
+| =M-x orgist-rebuild-and-validate= | Rebuild snapshots from Todoist; review where the files differ |
 | =M-x orgist-write-back=    | Detect local changes and push to Todoist (dry-run)    |
 | =M-x orgist-pull-comments= | Manually pull comments and activity for all tasks     |
 | =M-x orgist-quick-add=     | Add a task via Todoist's natural language quick-add    |
@@ -338,6 +339,7 @@ Syncs rewrite files you also edit.  Implemented in =org-sync-safety.el=, a libra
 - *Trash.*  Files a sync removes (a deleted project's file, attachments of deleted comments) move to =.history/trash/= instead of being deleted.
 - *Guards.*  A task update may only change that task's own subtree; changes made by your Org hooks during the update, such as an org-edna trigger completing the next task, are exempt.  When the pull is done, every element present before must still exist unless Todoist deleted it, no element may appear twice, and no file may lose most of its content.  On a violation, or any error, the project buffers return to their state before the pull (unsaved edits included), nothing is saved, and the sync token is not advanced: the next pull retries from the same point, and the error says what went wrong.
 - *Background syncs.*  Large pulls, completed tasks and comments run in a background Emacs, which saves the project files itself: a file you edit while one runs can lose either your edit or the sync's changes.  With =orgist-sole-writer= (experimental), the background Emacs works on a staged copy instead, and Emacs takes over its result for each file nobody touched meanwhile.  A file you edited or saved during the sync keeps your text and gets that sync's changes from the next one: its snapshots and the sync cursors are not advanced.  Each run logs what it took over, what it deferred and how long Emacs was busy (=took over N file(s) in 0.05s=).  Its snapshot changes are merged field by field in either mode, so a write-back made during a background sync keeps its own.
+- *Rebuild.*  Snapshots record what Todoist held at the last sync.  If they drift, an edit can go unpushed with nothing to show it, or a stale snapshot can make a correct file look edited.  =M-x orgist-rebuild-and-validate= fetches Todoist's full state, applies it in a background Emacs to a copy of the project files with no snapshots, and takes the snapshots that pull records: Todoist's values exactly as a pull writes them, never the files'.  The write-back review then shows every real difference.  A report lists what deserves a look: deletions made here and not yet sent, elements Todoist holds that were never synced here, headings whose element is gone from Todoist, and elements bound to more than one heading.  Nothing is created or deleted, and the snapshots before and after are in the history.
 - *Reset.*  =M-x orgist-reset= moves the project files, state, logs and attachments to a dated folder under =.history/= and syncs afresh; nothing is deleted.  It refuses a base directory that is your home, under version control, holds an =.org= file orgist did not create, or has a project buffer with unsaved changes.
 
 ** Labels
@@ -425,6 +427,7 @@ commands with a =project_id= target.
 | Formatting        | =./test-run.sh format=            |    95 | Spacing, write-back, new/delete/move |
 | Comments          | =./test-run.sh comments=          |    17 | Comment pull, dedup, note push       |
 | Subprocess        | =./test-run.sh subprocess=        |    15 | Full + incremental subprocess sync   |
+| Rebuild           | =./test-run.sh rebuild=           |    14 | Snapshots rebuilt from Todoist; planted drift both ways |
 | Sole writer       | =./test-run.sh sole-writer=       |    24 | Subprocess syncs on a staged copy; edit during a sync |
 | Cross-project     | =./test-run.sh move=              |    11 | Cross-project task moves             |
 | State log         | =./test-run.sh state-log=         |    12 | Completion timestamps, reopen, repeats |

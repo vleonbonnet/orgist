@@ -6,6 +6,7 @@
 #   ./test-run.sh Orgtest            # Replay one project
 #   ./test-run.sh ert                # Standalone ERT regression suites only
 #   ./test-run.sh sole-writer        # Background syncs with orgist-sole-writer
+#   ./test-run.sh rebuild            # Snapshots rebuilt from Todoist, with planted drift
 #   ./test-run.sh record Orgtest     # Record API responses (needs token)
 #   ./test-run.sh live               # Live API pull, all projects (needs token)
 #   ./test-run.sh live Orgtest       # Live API pull, one project (needs token)
@@ -145,6 +146,8 @@ main() {
         run_harness subprocess
     elif [ "$1" = "sole-writer" ]; then
         run_harness sole-writer
+    elif [ "$1" = "rebuild" ]; then
+        run_harness rebuild
     elif [ "$1" = "format" ]; then
         run_harness format
     elif [ "$1" = "comments" ]; then

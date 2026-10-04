@@ -14,6 +14,7 @@ Orgist is an Emacs Lisp package for bidirectional sync between Todoist and Org-M
 ./test-run.sh Orgtest             # One project
 ./test-run.sh ert                 # Standalone ERT regression suites only
 ./test-run.sh sole-writer         # Background syncs with orgist-sole-writer, incl. an edit during a sync
+./test-run.sh rebuild             # Snapshots rebuilt from Todoist, with planted drift both ways
 
 # Record fresh API responses (needs TODOIST_API_TOKEN or `pass`)
 ./test-run.sh record Orgtest

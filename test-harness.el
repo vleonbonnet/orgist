@@ -1208,6 +1208,124 @@ rebuilt bodies without their reminder stamps."
   (message "=== Passed: %d  Failed: %d ===" orgist-test--passes orgist-test--failures)
   orgist-test--failures)
 
+(defun orgist-test-run-rebuild ()
+  "Rebuilding snapshots from Todoist surfaces every drifted field.
+Snapshots hold what Todoist held at the last sync.  Drift is planted
+both ways: local edits baked into snapshots (never pushed, invisible
+to write-back) and snapshots gone wrong over correct files (phantom
+changes).  After the rebuild only real differences are pending, and
+elements missing on either side are reported, never created or
+deleted."
+  (setq orgist-test--failures 0)
+  (setq orgist-test--passes 0)
+  (message "")
+  (message "=== Rebuild snapshots from Todoist ===")
+  (let* ((orgist-sync-on-save nil)
+         (items (orgist-test--orgtest-baseline))
+         (json-object-type 'alist)
+         (json-array-type 'vector)
+         (json-key-type 'symbol)
+         (full (json-read-file (expand-file-name "full-sync.json" orgist-test-cache-dir)))
+         (filter-ids (orgist-resolve-project-filter (alist-get 'projects full)))
+         (projects (seq-filter (lambda (p) (member (alist-get 'id p) filter-ids))
+                               (alist-get 'projects full)))
+         (sections (seq-filter (lambda (e) (member (alist-get 'project_id e) filter-ids))
+                               (alist-get 'sections full)))
+         (tasks (seq-filter (lambda (i) (and (alist-get 'content i)
+                                             (not (alist-get 'parent_id i))))
+                            items))
+         (ids (mapcar (lambda (i) (alist-get 'id i)) tasks))
+         (a (nth 0 ids)) (b (nth 1 ids)) (c (nth 2 ids)) (d (nth 3 ids))
+         (e (nth 4 ids)) (f (nth 5 ids)) (g (nth 6 ids))
+         (file (expand-file-name "Orgtest.org" orgist-base-dir))
+         (buffer (find-file-noselect file))
+         (ghost "9999999999999999")
+         (outcome nil))
+    (cl-flet ((at (id fn) (with-current-buffer buffer
+                            (save-excursion (goto-char (orgist-find-element-by-id id))
+                                            (funcall fn))))
+              (snap-put (id key value)
+                (puthash id (plist-put (copy-sequence (gethash id orgist-snapshots)) key value)
+                         orgist-snapshots)))
+      ;; 1. A local title edit baked into the snapshot: never pushed.
+      (at a (lambda () (org-edit-headline "Edited here, never pushed")))
+      (snap-put a :content "Edited here, never pushed")
+      (snap-put a :comment-ids '("c1"))
+      ;; 2. A wrong snapshot over a correct file: a phantom change.
+      (snap-put b :content "Stale snapshot title")
+      ;; 3. A local description edit baked into the snapshot.
+      (at c (lambda ()
+              (org-end-of-meta-data t)
+              (insert "Notes written here.\n")))
+      (snap-put c :description (at c (lambda () (orgist-extract-body-text))))
+      ;; 4. Deleted here, not yet in Todoist.
+      (at d (lambda () (org-cut-subtree)))
+      ;; 5. In Todoist, never synced here.
+      (at e (lambda () (org-cut-subtree)))
+      (remhash e orgist-snapshots)
+      ;; 6. Gone from Todoist.
+      (with-current-buffer buffer
+        (goto-char (point-max))
+        (insert "* TODO Ghost\n:PROPERTIES:\n:ID:       " ghost "\n:END:\n"))
+      (puthash ghost '(:content "Ghost" :checked nil) orgist-snapshots)
+      ;; 7. Completed here: absent from the active state, kept.
+      (at f (lambda () (let ((org-inhibit-logging t)) (org-todo "DONE"))))
+      ;; 8. Completed in Todoist, still open here.
+      (with-current-buffer buffer
+        (let ((orgist--inhibit-after-save t)) (save-buffer)))
+      (let ((orgist--batch-save-pending nil))
+        (cl-letf (((symbol-function 'orgist--fetch-element)
+                   (lambda (id _section-p)
+                     (when (equal id g)
+                       (cons '(checked . t)
+                             (assq-delete-all 'checked
+                                              (copy-sequence
+                                               (seq-find (lambda (i) (equal (alist-get 'id i) g))
+                                                         items))))))))
+          (orgist--rebuild-from
+           `((projects . ,(vconcat projects)) (sections . ,(vconcat sections))
+             (items . ,(vconcat (seq-remove (lambda (i) (member (alist-get 'id i) (list f g)))
+                                            items))))
+           (lambda (o) (setq outcome o)))
+          (orgist-test--wait-for-process "orgist-shadow")))
+      (orgist-test-assert outcome "The shadow pull finished")
+      (let* ((changes (orgist--finish-rebuild outcome))
+             (fields (lambda (id) (mapcar #'car (let ((c (cdr (assoc id changes))))
+                                                  (if (listp c) c nil))))))
+        (orgist-test-assert (memq :content (funcall fields a))
+                            "A local edit baked into a snapshot is pending again")
+        (orgist-test-assert-equal '("c1") (plist-get (gethash a orgist-snapshots) :comment-ids)
+                                  "Orgist's own bookkeeping survives the rebuild")
+        (orgist-test-assert (not (assoc b changes))
+                            "A wrong snapshot over a correct file is no change")
+        (orgist-test-assert (memq :description (funcall fields c))
+                            "A baked description edit is pending again")
+        (orgist-test-assert (eq (cdr (assoc d changes)) 'deleted)
+                            "A deletion made here is still proposed")
+        (orgist-test-assert (member d (plist-get outcome :pending-deletions))
+                            "and reported as such")
+        (orgist-test-assert (and (member e (plist-get outcome :missing))
+                                 (not (assoc e changes)))
+                            "An element never synced here is reported, not deleted")
+        (orgist-test-assert (and (member ghost (plist-get outcome :orphans))
+                                 (not (gethash ghost orgist-snapshots))
+                                 (not (assoc ghost changes)))
+                            "An element gone from Todoist is reported and its snapshot dropped")
+        (orgist-test-assert (gethash f orgist-snapshots)
+                            "A task completed here keeps its snapshot")
+        (orgist-test-assert (memq :checked (funcall fields g))
+                            "A task completed in Todoist but open here is pending")
+        (orgist-test-assert (not (file-exists-p (orgist--journal-file)))
+                            "The shadow pull wrote nothing to the journal")
+        (orgist-test-assert (not (file-directory-p (expand-file-name "staging" (orgist--safety-directory))))
+                            "The shadow copy is gone")
+        (with-current-buffer (get-buffer "*Orgist Rebuild*")
+          (orgist-test-assert (string-match-p "Gone from Todoist (1)" (buffer-string))
+                              "The report lists what it found")))))
+  (message "=== Results: Rebuild ===")
+  (message "=== Passed: %d  Failed: %d ===" orgist-test--passes orgist-test--failures)
+  orgist-test--failures)
+
 (defun orgist-test-run-sole-writer-race ()
   "An edit made while a background sync runs is kept, and the sync deferred.
 With `orgist-sole-writer', the subprocess works on a staged copy: the
@@ -6080,6 +6198,9 @@ CLOSED: [2026-03-17 Tue 12:43]
                                 (orgist-test-run-subprocess-incremental)
                                 (orgist-test-run-subprocess-state)
                                 (orgist-test-run-sole-writer-race)))))
+    ("rebuild"
+     (setq orgist-test-record-mode 'replay)
+     (setq total-failures (orgist-test-run-rebuild)))
     ("format"
      (setq total-failures (orgist-test-run-formatting)))
     ("comments"
