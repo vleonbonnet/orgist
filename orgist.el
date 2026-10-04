@@ -6123,6 +6123,12 @@ snapshots before and after are recorded in the history."
   (interactive)
   (when orgist-sync-mutex
     (user-error "Orgist: a sync is running; try again when it ends"))
+  (orgist--start-rebuild))
+
+(defun orgist--start-rebuild (&optional prefer-remote)
+  "Fetch Todoist's full state, then rebuild from it and review.
+With PREFER-REMOTE, the review starts with every change set to take
+Todoist's version.  Holds the sync lock until the review opens."
   (setq orgist-sync-mutex (current-time))
   (orgist-log 'info "Rebuild: fetching Todoist's full state...")
   (orgist-remote
@@ -6136,15 +6142,20 @@ snapshots before and after are recorded in the history."
    :success (cl-function
              (lambda (&key data &allow-other-keys)
                (condition-case err
-                   (orgist--rebuild-from data #'orgist--finish-rebuild)
+                   (orgist--rebuild-from
+                    data (lambda (outcome)
+                           (orgist--finish-rebuild outcome nil prefer-remote)))
                  (error
                   (setq orgist-sync-mutex nil)
                   (orgist-log 'error "Rebuild failed: %s" (error-message-string err))))))))
 
-(defun orgist--finish-rebuild (outcome &optional review)
+(defvar orgist-confirm-prefer-remote)
+
+(defun orgist--finish-rebuild (outcome &optional review prefer-remote)
   "Install the snapshots of a rebuild OUTCOME, report, then review drift.
 OUTCOME is what `orgist--rebuild-from' passes, or nil when it failed.
-Opens the write-back review when REVIEW, or outside batch mode.
+Opens the write-back review when REVIEW, or outside batch mode; with
+PREFER-REMOTE every change starts set to take Todoist's version.
 Returns the pending changes, or the symbol `failed'."
   (let ((result 'failed))
     (unwind-protect
@@ -6173,8 +6184,114 @@ Returns the pending changes, or the symbol `failed'."
                       (plist-get outcome :rebuilt) (length result))))
       (setq orgist-sync-mutex nil))
     (when (and (listp result) result (or review (not noninteractive)))
-      (orgist-write-back))
+      (let ((orgist-confirm-prefer-remote prefer-remote))
+        (orgist-write-back)))
     result))
+
+;;; Undo a sync cycle
+
+(defconst orgist--cycle-results
+  '(("\\`Pull: " . pull)
+    ("\\`Completed-tasks pull: " . pull)
+    ("\\`Comments pull: " . pull)
+    ("\\`Write-back: " . write-back))
+  "History subjects that end a sync cycle, and the kind of cycle.")
+
+(defun orgist--cycles (&optional limit)
+  "Return the sync cycles in the history, newest first, at most LIMIT.
+Each is a plist: :revision and :time of the record that ended it,
+:subject, :kind (`pull' or `write-back'), and :before, the record just
+before it: the files as the cycle found them."
+  (when-let* ((history (orgist--history)))
+    (let ((log (org-sync-safety-history-log history))
+          (cycles nil))
+      (while (and (cdr log) (or (null limit) (< (length cycles) limit)))
+        (let* ((record (car log))
+               (kind (cdr (seq-find (lambda (result) (string-match-p (car result) (caddr record)))
+                                    orgist--cycle-results))))
+          (when kind
+            (push (list :revision (car record) :time (cadr record) :subject (caddr record)
+                        :kind kind :before (car (cadr log)))
+                  cycles)))
+        (setq log (cdr log)))
+      (nreverse cycles))))
+
+(defun orgist--restore-project-files (revision)
+  "Make the project files what the history recorded at REVISION.
+A changed file is rewritten and its buffer reverted; a file the
+history did not hold then is moved to the trash, and one it held that
+is gone comes back.  With the copies backend, which cannot tell a
+deleted file from an unchanged one, no file is moved to the trash.
+Returns the names of the files changed."
+  (let* ((history (orgist--history))
+         (then (seq-filter (lambda (file) (string-suffix-p ".org" file))
+                           (org-sync-safety-history-files history revision)))
+         (now (mapcar #'file-name-nondirectory (orgist--project-files)))
+         (changed nil))
+    (dolist (name then)
+      (let* ((file (expand-file-name name orgist-base-dir))
+             (bytes (org-sync-safety-history-file-at history revision name)))
+        (unless (and (file-exists-p file)
+                     (equal bytes (with-temp-buffer
+                                    (set-buffer-multibyte nil)
+                                    (insert-file-contents-literally file)
+                                    (buffer-string))))
+          (let ((coding-system-for-write 'no-conversion))
+            (write-region bytes nil file nil 'silent))
+          (when-let* ((buffer (find-buffer-visiting file)))
+            (with-current-buffer buffer
+              (let ((buffer-undo-list t)
+                    (inhibit-read-only t))
+                (insert-file-contents file t nil nil t))
+              (orgist-build-id-cache)))
+          (push name changed))))
+    (when (eq (org-sync-safety-history-backend history) 'git)
+      (dolist (name (seq-difference now then))
+        (let ((file (expand-file-name name orgist-base-dir)))
+          (when-let* ((buffer (find-buffer-visiting file)))
+            (with-current-buffer buffer (set-buffer-modified-p nil))
+            (kill-buffer buffer))
+          (orgist--trash-file file)
+          (push name changed))))
+    (nreverse changed)))
+
+;;;###autoload
+(defun orgist-undo-cycle (cycle)
+  "Return the project files to the state a sync CYCLE started from.
+Interactively, choose the cycle among the recent pulls and
+write-backs in the history.  Every change made to the files since,
+by syncs or by hand, is undone; the current files stay in the history,
+so this can be undone too.  Snapshots are then rebuilt from Todoist
+\(see `orgist-rebuild-and-validate'), so what the cycle changed shows
+as pending changes in the write-back review: after a pull, set to take
+Todoist's version again, to re-apply it; after a write-back, set to
+send the restored values, to undo it in Todoist too."
+  (interactive
+   (let* ((cycles (or (orgist--cycles 30)
+                      (user-error "Orgist: no sync cycle in the history")))
+          (choices (mapcar (lambda (c)
+                             (cons (format "%s  %s"
+                                           (format-time-string "%Y-%m-%d %H:%M" (plist-get c :time))
+                                           (plist-get c :subject))
+                                   c))
+                           cycles)))
+     (list (cdr (assoc (completing-read "Undo sync cycle: " choices nil t) choices)))))
+  (when orgist-sync-mutex
+    (user-error "Orgist: a sync is running; try again when it ends"))
+  (when-let* ((unsaved (seq-filter #'buffer-modified-p (orgist--project-buffers))))
+    (user-error "Orgist: save or revert %s first"
+                (mapconcat #'buffer-name unsaved ", ")))
+  (let ((label (format "%s (%s)" (plist-get cycle :subject)
+                       (format-time-string "%Y-%m-%d %H:%M" (plist-get cycle :time)))))
+    (when (or noninteractive
+              (yes-or-no-p (format "Return the project files to before %s?  Later changes to them are undone; the current files stay in the history. "
+                                   label)))
+      (orgist--history-checkpoint (format "Before undoing %s" label))
+      (let ((changed (orgist--restore-project-files (plist-get cycle :before))))
+        (orgist--history-checkpoint (format "Undid %s" label))
+        (orgist-log 'info "Undid %s: %d file(s) restored; rebuilding snapshots from Todoist"
+                    label (length changed))
+        (orgist--start-rebuild (eq (plist-get cycle :kind) 'pull))))))
 
 (defun orgist--section-element-p (element)
   "Return non-nil if Todoist ELEMENT is a section rather than a task."

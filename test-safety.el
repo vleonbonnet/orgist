@@ -64,6 +64,9 @@
         ;; B.org only changed in the first record.
         (should (equal (mapcar #'caddr (org-sync-safety-history-log history "B.org"))
                        '("First")))
+        ;; Each record knows its files.
+        (should (equal (sort (org-sync-safety-history-files history first) #'string<)
+                       '("A.org" "B.org" "state.el")))
         ;; Unrecorded files never enter the history.
         (should-not (org-sync-safety-history-file-at history second "notes.txt"))
         (should-not (org-sync-safety-history-file-at history second "data/blob.org"))
@@ -97,6 +100,7 @@
       (let ((second (org-sync-safety-history-commit history "Deleted B")))
         (should second)
         (should-not (org-sync-safety-history-file-at history second "B.org"))
+        (should-not (member "B.org" (org-sync-safety-history-files history second)))
         (org-sync-safety-history-restore history first "B.org")
         (should (file-exists-p (expand-file-name "B.org" root)))))))
 

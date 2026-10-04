@@ -222,6 +222,25 @@ The result is a unibyte string; decode it to display it."
        (error nil)))
     ('copies (org-sync-safety--copies-file-at history revision file))))
 
+(defun org-sync-safety-history-files (history revision)
+  "Return the files HISTORY recorded at REVISION, relative to its root.
+With the git backend the list is exact; the copies backend knows only
+which files have a copy at or before REVISION, so a file deleted since
+still appears in it."
+  (pcase (org-sync-safety-history-backend history)
+    ('git
+     (condition-case nil
+         (split-string (org-sync-safety--git history (list "ls-tree" "-r" "--name-only" revision))
+                       "\n" t)
+       (error nil)))
+    ('copies
+     (let ((dir (org-sync-safety--copies-dir history)))
+       (when (file-directory-p dir)
+         (seq-filter (lambda (file)
+                       (and (file-directory-p (expand-file-name file dir))
+                            (org-sync-safety--copies-file-at history revision file)))
+                     (directory-files dir nil directory-files-no-dot-files-regexp)))))))
+
 (defun org-sync-safety-history-restore (history revision file)
   "Write FILE as it was at REVISION of HISTORY.
 The current state is recorded first, so the restore itself can be
