@@ -648,14 +648,22 @@ operation sets the URL, the HTTP method and authorization.  The
 (defun orgist--pending-local-changes ()
   "Return pending local write-back changes, or nil.
 Runs the write-back diff scan without generating commands or
-showing any UI.  As a side effect the scan advances verification
-stamps for files that prove clean, so repeated calls are cheap
-when nothing changed.  Returns nil when write-back is disabled or
-no snapshots exist yet (first sync)."
+showing any UI, and settles descriptions already as in Todoist as
+write-back does (see `orgist--settle-descriptions'): otherwise such a
+diff, which write-back would never send, held auto-pulls back for
+good.  As a side effect the scan advances verification stamps for
+files that prove clean, so repeated calls are cheap when nothing
+changed.  Returns nil when write-back is disabled or no snapshots
+exist yet (first sync)."
   (when orgist-enable-write-back
     (orgist-load-snapshots)
     (when (> (hash-table-count orgist-snapshots) 0)
-      (orgist-diff-all-elements))))
+      (let* ((detected (orgist-diff-all-elements))
+             (changes (orgist--settle-descriptions detected)))
+        ;; Everything detected was settled: the scanned files are verified.
+        (when (and detected (not changes))
+          (orgist--commit-pending-stamps))
+        changes))))
 
 (defun orgist--auto-pull ()
   "Pull from Todoist if not already syncing.

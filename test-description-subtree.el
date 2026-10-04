@@ -430,6 +430,26 @@ empty diff."
         (should (equal (plist-get snap :description) "Body only.\n\n* Notes\nFrom Todoist."))
         (should (equal (plist-get snap :remote-description) recorded))))))
 
+(ert-deftest orgist-description/auto-pull-is-not-held-by-a-settled-description ()
+  "A description already as in Todoist does not count as a pending change.
+Auto-pull waits while unpushed changes exist; its check did not settle
+descriptions as write-back does, so a stale snapshot description held
+every auto-pull back until the next manual sync."
+  (skip-unless (executable-find "pandoc"))
+  (orgist-test--with-project
+    (let ((snap (gethash "6Xtask" orgist-snapshots)))
+      (should (equal (orgist--description-as-extracted (plist-get snap :remote-description))
+                     (plist-get snap :description)))
+      (puthash "6Xtask" (plist-put (copy-sequence snap) :description "Stale.") orgist-snapshots))
+    (should-not (orgist--pending-local-changes))
+    (should (equal (plist-get (gethash "6Xtask" orgist-snapshots) :description)
+                   "Buy the anti-siphon model.\n\n* Parts list\n- valve\n- clamp"))
+    ;; A real edit still holds the pull back.
+    (goto-char (point-min))
+    (re-search-forward "^Buy the anti-siphon model\\.$")
+    (insert " Today.")
+    (should (assoc "6Xtask" (orgist--pending-local-changes)))))
+
 (ert-deftest orgist-description/extraction-carries-no-text-properties ()
   "An extracted description is plain text, whatever the buffer displays.
 With `org-indent-mode', headings carry `line-prefix' properties, which
