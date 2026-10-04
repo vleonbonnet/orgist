@@ -186,6 +186,45 @@ text with it warned \"changed in Todoist\" for an unchanged task."
           (should (equal "changed in Todoist since last sync: description"
                          (plist-get modified :warning))))))))
 
+(ert-deftest orgist-confirm/take-remote-instead-of-sending ()
+  "A change whose \"take Todoist's version\" box is ticked is taken, not sent."
+  (orgist-test-confirm--with-project
+    (let* ((items (orgist-confirm--items orgist-test-confirm--changes
+                                         orgist-test-confirm--commands))
+           (modified (orgist-test-confirm--find items "Renew passport"))
+           (deleted (orgist-test-confirm--find items "Old task"))
+           (new (orgist-test-confirm--find items "Book photographer"))
+           (taken nil)
+           (sent nil))
+      (should (equal '(take-remote) (mapcar (lambda (tg) (plist-get tg :key))
+                                            (plist-get modified :toggles))))
+      (should (plist-get deleted :toggles))
+      (should-not (plist-get new :toggles))
+      ;; Tick it for the modified task only.
+      (setcar (plist-get (car (plist-get modified :toggles)) :cell) t)
+      (cl-letf (((symbol-function 'orgist--fetch-element)
+                 (lambda (id _section-p) `((id . ,id) (content . "Renew passport"))))
+                ((symbol-function 'orgist-take-remote-element)
+                 (lambda (id _element) (push id taken)))
+                ((symbol-function 'orgist--history-checkpoint) #'ignore)
+                ((symbol-function 'orgist-changes-to-commands)
+                 (lambda (changes) (mapcar #'car changes)))
+                ((symbol-function 'orgist-execute-write-back)
+                 (lambda (commands) (setq sent commands))))
+        (orgist-confirm--execute (list modified deleted new) 3 orgist-test-confirm--commands))
+      (should (equal '("T1") taken))
+      ;; The other two are sent, as a regenerated subset.
+      (should (equal '("T3" "T2") (sort sent #'string>))))))
+
+(ert-deftest orgist-confirm/prefer-remote-ticks-every-box ()
+  "When undoing a sync, every change starts with Todoist's version ticked."
+  (orgist-test-confirm--with-project
+    (let* ((orgist-confirm-prefer-remote t)
+           (items (orgist-confirm--items orgist-test-confirm--changes
+                                         orgist-test-confirm--commands)))
+      (should (orgist-confirm--takes-remote-p (orgist-test-confirm--find items "Renew passport")))
+      (should (orgist-confirm--takes-remote-p (orgist-test-confirm--find items "Old task"))))))
+
 (ert-deftest orgist-confirm/remote-fetch-respects-limit ()
   "Above the limit nothing is fetched and snapshots are used."
   (orgist-test-confirm--with-project

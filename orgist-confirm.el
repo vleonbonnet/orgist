@@ -38,10 +38,18 @@
 (declare-function orgist--label-to-tag "orgist" (label-name))
 (declare-function orgist-remote "orgist" (operation &rest args))
 (declare-function orgist--same-description-p "orgist" (a b))
+(declare-function orgist--fetch-element "orgist" (id section-p))
+(declare-function orgist-take-remote-element "orgist" (id element))
+(declare-function orgist--history-checkpoint "orgist" (subject &optional body))
 (defvar orgist-snapshots)
 (defvar orgist-sync-mutex)
 (defvar orgist-base-dir)
 (defvar orgist--pending-stamps)
+
+(defvar orgist-confirm-prefer-remote nil
+  "Initial state of each change's \"take Todoist's version\" box.
+Bound to t by commands that undo a sync, where Todoist's version is the
+likely choice.")
 
 (defcustom orgist-confirm-remote-fetch-limit 20
   "Fetch the live Todoist state of at most this many modified elements.
@@ -271,10 +279,13 @@ BUFFERS is the project buffer alist, REMOTES the live-state table."
          (project (or (car loc)
                       (and snapshot (orgist-confirm--project-of-deleted snapshot buffers))
                       "?"))
+         (take-remote (list :key 'take-remote :label "take Todoist's version instead"
+                            :cell (list orgist-confirm-prefer-remote)))
          (item
           (pcase diff
             ('deleted
              (list :label label :kind 'deleted :warning "permanent"
+                   :toggles (list take-remote)
                    :fields (delq nil
                                  (list (when-let* ((d (orgist-confirm--field-value
                                                        :description
@@ -293,6 +304,7 @@ BUFFERS is the project buffer alist, REMOTES the live-state table."
              (let ((parts (orgist-confirm--modified-fields
                            diff snapshot (gethash id remotes) loc)))
                (list :label label :kind 'modified
+                     :toggles (list take-remote)
                      :fields (car parts)
                      :warning (when (cdr parts)
                                 (format "changed in Todoist since last sync: %s"
@@ -344,18 +356,58 @@ BUFFERS is the project buffer alist, REMOTES the live-state table."
 
 ;;; Execution
 
+(defun orgist-confirm--takes-remote-p (item)
+  "Return non-nil if ITEM's \"take Todoist's version\" box is ticked."
+  (let ((toggle (seq-find (lambda (tg) (eq (plist-get tg :key) 'take-remote))
+                          (plist-get item :toggles))))
+    (and toggle (car (plist-get toggle :cell)))))
+
+(defun orgist-confirm--take-remote (items)
+  "Make the elements of ITEMS Todoist's current version in the files.
+Each element is fetched now, so the newest state wins.  Returns the
+labels of those that failed."
+  (let ((failed nil))
+    (orgist--history-checkpoint "Before taking Todoist's version: local state")
+    (dolist (item items)
+      (let* ((id (car (plist-get item :data)))
+             (snapshot (gethash id orgist-snapshots))
+             (element (orgist--fetch-element id (plist-get snapshot :section-p))))
+        (condition-case err
+            (if (not element)
+                (error "Todoist no longer has it")
+              (orgist-take-remote-element id element))
+          (error
+           (push (format "%s: %s" (plist-get item :label) (error-message-string err))
+                 failed)))))
+    (orgist--history-checkpoint
+     (format "Took Todoist's version of %d element(s)" (- (length items) (length failed))))
+    (when failed
+      (orgist-log 'error "Could not take Todoist's version of %s" (string-join (nreverse failed) "; ")))
+    failed))
+
 (defun orgist-confirm--execute (items total commands)
-  "Send the changes carried by ITEMS.
+  "Send the changes carried by ITEMS, or take Todoist's version of them.
 TOTAL is the number of changes offered; COMMANDS the batch built for
-all of them.  A strict subset is regenerated for the ticked changes
-only and the verification stamps are dropped so the rest re-detects."
-  (let ((changes (delq nil (mapcar (lambda (i) (plist-get i :data)) items))))
-    (if (= (length changes) total)
-        (orgist-execute-write-back commands)
-      (orgist-log 'info "Write-back: %d of %d change(s) selected, the rest stays pending"
+all of them.  Items whose \"take Todoist's version\" box is ticked are
+not sent: their elements become Todoist's version in the files (see
+`orgist-confirm--take-remote').  A strict subset is regenerated for
+the changes still to send, and the verification stamps are dropped so
+the rest re-detects."
+  (let* ((taken (seq-filter #'orgist-confirm--takes-remote-p items))
+         (to-send (seq-remove #'orgist-confirm--takes-remote-p items))
+         (changes (delq nil (mapcar (lambda (i) (plist-get i :data)) to-send))))
+    (when taken
+      (orgist-confirm--take-remote taken))
+    (cond
+     ((and (null taken) (= (length changes) total))
+      (orgist-execute-write-back commands))
+     (changes
+      (orgist-log 'info "Write-back: %d of %d change(s) to send, the rest stays pending"
                   (length changes) total)
       (setq orgist--pending-stamps nil)
-      (orgist-execute-write-back (orgist-changes-to-commands changes)))))
+      (orgist-execute-write-back (orgist-changes-to-commands changes)))
+     (t
+      (setq orgist--pending-stamps nil)))))
 
 (defun orgist-confirm--cancel ()
   "Abort the sync cycle so local changes are offered again later."
@@ -375,6 +427,7 @@ continue the sync flow.  It is NOT called on cancel."
            :buffer "*orgist-confirm*"
            :confirm-label "Confirm"
            :items (orgist-confirm--items changes commands)
+           :toggles '((:key take-remote :label "take Todoist's version of every change"))
            :execute (lambda (items) (orgist-confirm--execute items total commands))
            :on-success (lambda (_items) (when continuation (funcall continuation)))
            :on-cancel #'orgist-confirm--cancel))))

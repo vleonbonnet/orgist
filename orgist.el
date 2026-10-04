@@ -6176,6 +6176,66 @@ Returns the pending changes, or the symbol `failed'."
       (orgist-write-back))
     result))
 
+(defun orgist--section-element-p (element)
+  "Return non-nil if Todoist ELEMENT is a section rather than a task."
+  (and (alist-get 'name element) (not (alist-get 'content element))))
+
+(defun orgist-take-remote-element (id element)
+  "Make element ID in the files Todoist's ELEMENT, discarding local changes.
+ELEMENT is Todoist's current state of the task or section.  A heading
+deleted here is created again.  Applied by the pull code with no
+snapshot to compare against, so every field takes Todoist's value; the
+journal keeps any description text this replaces.  Orgist's own
+bookkeeping in the snapshot (`orgist--snapshot-bookkeeping') is kept."
+  (orgist-load-snapshots)
+  (let ((old (gethash id orgist-snapshots))
+        (orgist--batch-save-pending (make-hash-table :test 'eq)))
+    (remhash id orgist-snapshots)
+    (condition-case err
+        (progn
+          (if (orgist--section-element-p element)
+              (orgist--apply-pull nil (list element) nil)
+            (orgist--apply-pull nil nil (list element)))
+          (orgist--flush-pending-saves))
+      (error
+       (when old (puthash id old orgist-snapshots))
+       (signal (car err) (cdr err))))
+    (when-let* ((new (gethash id orgist-snapshots)))
+      (dolist (key orgist--snapshot-bookkeeping)
+        (when (plist-member old key)
+          (setq new (plist-put new key (plist-get old key)))))
+      (puthash id new orgist-snapshots))
+    (orgist-save-snapshots)))
+
+;;;###autoload
+(defun orgist-take-remote ()
+  "Discard local changes to the task or section at point; take Todoist's version.
+The heading's fields and description become what Todoist holds now.
+The journal keeps any description text this replaces, and the history
+records the files before and after."
+  (interactive)
+  (unless (derived-mode-p 'org-mode)
+    (user-error "Not in an Org buffer"))
+  (when orgist-sync-mutex
+    (user-error "Orgist: a sync is running; try again when it ends"))
+  (save-excursion
+    (org-back-to-heading t)
+    (let* ((id (orgist--element-id))
+           (label (org-get-heading t t t t))
+           (section-p (and (org-entry-get (point) "SECTION") t)))
+      (unless (and id (not (orgist--temp-id-p id)))
+        (user-error "Not a heading synced with Todoist"))
+      (let ((element (orgist--fetch-element id section-p)))
+        (unless element
+          (user-error "Todoist no longer has %s" label))
+        (when (or noninteractive
+                  (yes-or-no-p (format "Discard local changes to \"%s\" and take Todoist's version? "
+                                       label)))
+          (orgist--history-checkpoint (format "Before taking Todoist's version of %s" label))
+          (orgist-take-remote-element id element)
+          (orgist--history-checkpoint (format "Took Todoist's version of %s" label))
+          (orgist-log 'info "Took Todoist's version of %s" label))))))
+
 (defun orgist--rebuild-report (outcome changes)
   "Show the report of a rebuild OUTCOME, with CHANGES pending."
   (let* ((data (plist-get outcome :data))

@@ -1326,6 +1326,62 @@ deleted."
   (message "=== Passed: %d  Failed: %d ===" orgist-test--passes orgist-test--failures)
   orgist-test--failures)
 
+(defun orgist-test-run-take-remote ()
+  "Taking Todoist's version undoes local changes to one element.
+A changed title, an edited description and a deleted heading each go
+back to Todoist's state through the pull code; the journal keeps the
+discarded description, and orgist's bookkeeping survives."
+  (setq orgist-test--failures 0)
+  (setq orgist-test--passes 0)
+  (message "")
+  (message "=== Take Todoist's version ===")
+  (let* ((orgist-sync-on-save nil)
+         (items (orgist-test--orgtest-baseline))
+         (tasks (seq-filter (lambda (i) (and (alist-get 'content i)
+                                             (not (alist-get 'parent_id i))))
+                            items))
+         (element (lambda (id) (seq-find (lambda (i) (equal (alist-get 'id i) id)) items)))
+         (a (alist-get 'id (nth 0 tasks)))
+         (c (alist-get 'id (nth 2 tasks)))
+         (d (alist-get 'id (nth 3 tasks)))
+         (buffer (find-file-noselect (expand-file-name "Orgtest.org" orgist-base-dir))))
+    (cl-flet ((at (id fn) (with-current-buffer buffer
+                            (save-excursion (goto-char (orgist-find-element-by-id id))
+                                            (funcall fn))))
+              (pending () (let ((orgist--write-back-stamps (make-hash-table :test 'equal)))
+                            (orgist-diff-all-elements))))
+      (puthash a (plist-put (gethash a orgist-snapshots) :comment-ids '("c1")) orgist-snapshots)
+      (at a (lambda () (org-edit-headline "Changed here")))
+      (at c (lambda () (org-end-of-meta-data t) (insert "Notes written here.\n")))
+      (at d (lambda () (org-cut-subtree)))
+      (with-current-buffer buffer
+        (let ((orgist--inhibit-after-save t)) (save-buffer)))
+      (let ((before (pending)))
+        (orgist-test-assert (and (assoc a before) (assoc c before)
+                                 (eq (cdr (assoc d before)) 'deleted))
+                            "The three local changes are pending"))
+      (dolist (id (list a c d))
+        (orgist-take-remote-element id (funcall element id)))
+      (let ((after (pending)))
+        (orgist-test-assert (not (or (assoc a after) (assoc c after) (assoc d after)))
+                            "After taking Todoist's version nothing is pending for them"))
+      (orgist-test-assert-equal (alist-get 'content (funcall element a))
+                                (at a (lambda () (car (orgist-extract-heading-and-tags))))
+                                "The title is Todoist's again")
+      (orgist-test-assert (with-current-buffer buffer (orgist-find-element-by-id d))
+                          "The deleted heading is back")
+      (orgist-test-assert-equal '("c1") (plist-get (gethash a orgist-snapshots) :comment-ids)
+                                "Orgist's own bookkeeping survives")
+      (orgist-test-assert (let ((journal (orgist--journal-file)))
+                            (and (file-exists-p journal)
+                                 (with-temp-buffer
+                                   (insert-file-contents journal)
+                                   (string-match-p "Notes written here" (buffer-string)))))
+                          "The journal keeps the discarded description")))
+  (message "=== Results: Take Todoist's version ===")
+  (message "=== Passed: %d  Failed: %d ===" orgist-test--passes orgist-test--failures)
+  orgist-test--failures)
+
 (defun orgist-test-run-sole-writer-race ()
   "An edit made while a background sync runs is kept, and the sync deferred.
 With `orgist-sole-writer', the subprocess works on a staged copy: the
@@ -6200,7 +6256,8 @@ CLOSED: [2026-03-17 Tue 12:43]
                                 (orgist-test-run-sole-writer-race)))))
     ("rebuild"
      (setq orgist-test-record-mode 'replay)
-     (setq total-failures (orgist-test-run-rebuild)))
+     (setq total-failures (+ (orgist-test-run-rebuild)
+                              (orgist-test-run-take-remote))))
     ("format"
      (setq total-failures (orgist-test-run-formatting)))
     ("comments"
