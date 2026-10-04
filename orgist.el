@@ -5485,12 +5485,18 @@ against the multibyte form from a live buffer always returns nil,
 producing spurious write-back diffs.  This walker decodes any
 unibyte string containing high bytes back into multibyte form so
 the in-memory hash is uniformly multibyte regardless of how a
-given entry was last serialized."
+given entry was last serialized.  Text properties, which older
+versions let into descriptions, are dropped, so the next save
+writes plain strings."
   (cond
    ((and (stringp val)
          (not (multibyte-string-p val))
          (string-match-p "[^\x00-\x7f]" val))
-    (decode-coding-string val 'utf-8))
+    (substring-no-properties (decode-coding-string val 'utf-8)))
+   ((and (stringp val)
+         (> (length val) 0)
+         (or (text-properties-at 0 val) (next-property-change 0 val)))
+    (substring-no-properties val))
    ((stringp val) val)
    ((consp val)
     (cons (orgist--snapshot-decode-tree (car val))
@@ -6160,14 +6166,16 @@ another depth leaves its description unchanged.  A sub-heading's tags
 and metadata (planning, properties, logbook) are org-only and left
 out, as are element subtrees.  Sections and the file level have no
 description in Todoist: only their own body text is returned.
-State-change log lines are excluded."
+State-change log lines are excluded.  The result is plain text,
+without the properties the buffer displays it with."
   (save-excursion
     (org-back-to-heading-or-point-min t)
     (let ((parts (cons (orgist--entry-body-text)
                        (when (and (org-at-heading-p)
                                   (not (org-entry-get (point) "SECTION")))
                          (orgist--description-subheadings)))))
-      (string-trim (string-join (seq-remove #'string-empty-p parts) "\n\n")))))
+      (substring-no-properties
+       (string-trim (string-join (seq-remove #'string-empty-p parts) "\n\n"))))))
 
 (defun orgist--element-heading-p (&optional pom)
   "Return non-nil if the heading at POM (default point) is a Todoist element.
@@ -6199,7 +6207,7 @@ metadata.  Element subtrees are skipped whole."
         (if (orgist--element-heading-p)
             (goto-char (min subtree-end (orgist--subtree-end)))
           (let* ((stars (make-string (max 1 (- (org-current-level) task-level)) ?*))
-                 (title (org-get-heading t t t t))
+                 (title (substring-no-properties (org-get-heading t t t t)))
                  (text-end (save-excursion
                              (forward-line 1)
                              (if (re-search-forward org-outline-regexp-bol subtree-end t)
@@ -7688,18 +7696,19 @@ SUCCEEDED and FAILED are the respective command counts."
                      (setq result description))))))
     result))
 
-(defun orgist--settle-legacy-descriptions (changes)
-  "Drop description diffs in CHANGES that only reflect an old snapshot.
-Snapshots written before `:remote-description' existed recorded a
-task's description only up to its first child heading, so a task
-with description sub-headings diffs once after upgrading even when
-nothing was edited.  For each such diff, Todoist's description is
-fetched: when the local description is exactly what a pull of it
-produces, the difference is not a local edit, so the snapshot is
-completed from Todoist and the diff dropped — pushing it would only
-re-send Todoist its own text through a lossy round trip.  Otherwise,
-or when the fetch fails, the diff stays and its local edits are
-pushed.  Returns CHANGES without the settled diffs."
+(defun orgist--settle-descriptions (changes)
+  "Drop description diffs in CHANGES that are not local edits.
+A description diff is not an edit when the local description is
+exactly what a pull of Todoist's description produces: pushing it
+would only re-send Todoist its own text through a lossy round trip.
+Such a diff arises when the snapshot's description no longer matches
+the file although the text still matches Todoist, as after an edit
+made outside orgist.  Todoist's description is the one the snapshot
+recorded at the last sync (`:remote-description').  Snapshots written
+before that existed recorded a task's description only up to its
+first child heading; for them the description is fetched, and the
+diff stays when the fetch fails.  A settled snapshot records the
+local text.  Returns CHANGES without the settled diffs."
   (let ((settled 0))
     (prog1
         (delq nil
@@ -7709,13 +7718,17 @@ pushed.  Returns CHANGES without the settled diffs."
                         (diff (cdr change))
                         (desc-diff (and (consp diff) (assq :description diff)))
                         (snap (and desc-diff (gethash id orgist-snapshots)))
+                        (recorded (and snap (plist-member snap :remote-description)))
                         (remote (and snap
-                                     orgist-bearer-token
-                                     (not (plist-member snap :remote-description))
                                      (not (plist-get snap :section-p))
-                                     (orgist--fetch-task-description id))))
+                                     (if recorded
+                                         (or (plist-get snap :remote-description) "")
+                                       (and orgist-bearer-token
+                                            (orgist--fetch-task-description id))))))
                    (if (not (and remote
-                                 (equal (orgist--description-as-extracted remote)
+                                 (equal (if (string-empty-p remote)
+                                            ""
+                                          (orgist--description-as-extracted remote))
                                         (or (cddr desc-diff) ""))))
                        change
                      (setq snap (plist-put snap :description (cddr desc-diff)))
@@ -7727,7 +7740,7 @@ pushed.  Returns CHANGES without the settled diffs."
                changes))
       (when (> settled 0)
         (orgist-save-snapshots)
-        (orgist-log 'info "Description snapshots completed from Todoist for %d task(s); nothing to push for them"
+        (orgist-log 'info "Descriptions already as in Todoist for %d task(s); snapshots updated, nothing to push for them"
                     settled)))))
 
 (defun orgist-write-back (&optional continuation)
@@ -7751,7 +7764,7 @@ synchronously and the caller is responsible for continuing."
     (if (= (hash-table-count orgist-snapshots) 0)
         (orgist-log 'debug "No snapshots found (first sync?), skipping write-back")
       (let* ((detected (orgist-diff-all-elements))
-             (changes (orgist--settle-legacy-descriptions detected)))
+             (changes (orgist--settle-descriptions detected)))
         (if (not changes)
             (if detected
                 ;; Everything detected was settled from Todoist: the

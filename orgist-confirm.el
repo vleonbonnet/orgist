@@ -37,6 +37,7 @@
 (declare-function orgist-parse-todoist-date-with-duration "orgist" (date-info duration-info))
 (declare-function orgist--label-to-tag "orgist" (label-name))
 (declare-function orgist-remote "orgist" (operation &rest args))
+(declare-function orgist--same-description-p "orgist" (a b))
 (defvar orgist-snapshots)
 (defvar orgist-sync-mutex)
 (defvar orgist-base-dir)
@@ -159,7 +160,22 @@ sub-heading levels relative to the task."
                 (alist-get 'due remote) (alist-get 'duration remote))
           :deadline (orgist-parse-todoist-date-with-duration (alist-get 'deadline remote) nil)
           :description (when (and description (not (string-empty-p description)))
-                         (orgist--description-as-extracted description)))))
+                         (orgist--description-as-extracted description))
+          ;; As Todoist holds it, to compare with what the last sync recorded.
+          :remote-description description)))
+
+(defun orgist-confirm--remote-changed-p (field remote snapshot)
+  "Return non-nil if FIELD changed in Todoist since the last sync.
+REMOTE is the live state from `orgist-confirm--remote-state',
+SNAPSHOT the last-sync state.  A description is compared as Todoist
+holds it with the text the last sync recorded, when it recorded one:
+the snapshot's own description follows the file, and can differ from
+Todoist without Todoist having changed."
+  (if (and (eq field :description) (plist-member snapshot :remote-description))
+      (not (orgist--same-description-p (plist-get remote :remote-description)
+                                       (plist-get snapshot :remote-description)))
+    (not (orgist-confirm--same-value-p (plist-get remote field)
+                                       (plist-get snapshot field)))))
 
 (defconst orgist-confirm--remote-fields
   '(:content :checked :priority :labels :due :deadline :description)
@@ -230,10 +246,9 @@ state, REMOTE its live state or nil, LOC its (PROJECT BUFFER . POS)."
             (push (list :name "note" :new note) fields)))
          (t
           (when (and remote (memq field orgist-confirm--remote-fields))
-            (let ((live (plist-get remote field)))
-              (unless (orgist-confirm--same-value-p live (plist-get snapshot field))
-                (push (orgist-confirm--field-name field) remote-changed))
-              (setq old live)))
+            (when (orgist-confirm--remote-changed-p field remote snapshot)
+              (push (orgist-confirm--field-name field) remote-changed))
+            (setq old (plist-get remote field)))
           (push (list :name (orgist-confirm--field-name field)
                       :old (orgist-confirm--field-value field old)
                       :new (orgist-confirm--field-value field new))

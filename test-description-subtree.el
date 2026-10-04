@@ -379,7 +379,7 @@ which returns the value of `remote'."
   (skip-unless (executable-find "pandoc"))
   (let ((remote "Body only.\n\n# Notes\n\nFrom Todoist."))
     (orgist-test--with-legacy-snapshot "Body only.\n\n* Notes\nFrom Todoist."
-      (should-not (orgist--settle-legacy-descriptions changes))
+      (should-not (orgist--settle-descriptions changes))
       (should (= fetches 1))
       (let ((snap (gethash "6Xtask" orgist-snapshots)))
         (should (equal (plist-get snap :remote-description) remote))
@@ -391,24 +391,72 @@ which returns the value of `remote'."
   (skip-unless (executable-find "pandoc"))
   (let ((remote "Body only.\n\n# Notes\n\nFrom Todoist."))
     (orgist-test--with-legacy-snapshot "Body only.\n\n* Notes\nEdited in org."
-      (should (equal (orgist--settle-legacy-descriptions changes) changes))
+      (should (equal (orgist--settle-descriptions changes) changes))
       (should-not (plist-member (gethash "6Xtask" orgist-snapshots) :remote-description)))))
 
 (ert-deftest orgist-description/legacy-diff-kept-when-fetch-fails ()
   "Without Todoist's description the diff stays: pushing is the safe side."
   (let ((remote nil))
     (orgist-test--with-legacy-snapshot "Body only.\n\n* Notes\nAnything."
-      (should (equal (orgist--settle-legacy-descriptions changes) changes)))))
+      (should (equal (orgist--settle-descriptions changes) changes)))))
 
 (ert-deftest orgist-description/current-snapshots-are-never-fetched ()
-  "A snapshot that already records Todoist's description is not settled again."
+  "A snapshot that records Todoist's description is compared with it, not fetched."
   (let ((remote "irrelevant"))
     (orgist-test--with-legacy-snapshot "Body only.\n\n* Notes\nEdited."
       (puthash "6Xtask" (list :content "Task" :description "Body only."
                               :remote-description "Body only.")
                orgist-snapshots)
-      (should (equal (orgist--settle-legacy-descriptions changes) changes))
+      (should (equal (orgist--settle-descriptions changes) changes))
       (should (= fetches 0)))))
+
+(ert-deftest orgist-description/stale-snapshot-settles-against-recorded-todoist ()
+  "A description already as in Todoist is not pushed, even with a stale snapshot.
+The snapshot's description recorded seven copies of a section that an
+edit outside orgist reduced to one, Todoist's text: the confirm buffer
+offered to push a description identical to Todoist's, and showed an
+empty diff."
+  (skip-unless (executable-find "pandoc"))
+  (let ((remote "irrelevant")
+        (recorded "Body only.\n\n# Notes\n\nFrom Todoist."))
+    (orgist-test--with-legacy-snapshot "Body only.\n\n* Notes\nFrom Todoist."
+      (puthash "6Xtask" (list :content "Task"
+                              :description "Body only.\n\n* Notes\nFrom Todoist.\n\n* Notes\nFrom Todoist."
+                              :remote-description recorded)
+               orgist-snapshots)
+      (should-not (orgist--settle-descriptions changes))
+      (should (= fetches 0))
+      (let ((snap (gethash "6Xtask" orgist-snapshots)))
+        (should (equal (plist-get snap :description) "Body only.\n\n* Notes\nFrom Todoist."))
+        (should (equal (plist-get snap :remote-description) recorded))))))
+
+(ert-deftest orgist-description/extraction-carries-no-text-properties ()
+  "An extracted description is plain text, whatever the buffer displays.
+With `org-indent-mode', headings carry `line-prefix' properties, which
+leaked into snapshots and the snapshot file."
+  (orgist-test--with-task 1
+    (org-indent-mode 1)
+    (font-lock-ensure)
+    (let ((description (orgist-extract-body-text)))
+      (should (equal description orgist-test--expected-description))
+      (should-not (next-property-change 0 description))
+      (should-not (text-properties-at 0 description)))))
+
+(ert-deftest orgist-description/loaded-snapshots-carry-no-text-properties ()
+  "Strings read back from the snapshot file lose any text properties."
+  (let* ((orgist-snapshot-file (make-temp-file "orgist-snap-"))
+         (orgist-snapshots nil)
+         (orgist-log-file nil))
+    (unwind-protect
+        (progn
+          (with-temp-file orgist-snapshot-file
+            (insert ";; orgist snapshots -- do not edit\n"
+                    "((\"T1\" :content \"Task\" :description #(\"** Notes\" 0 2 (line-prefix \"*\"))))\n"))
+          (orgist-load-snapshots t)
+          (let ((description (plist-get (gethash "T1" orgist-snapshots) :description)))
+            (should (equal description "** Notes"))
+            (should-not (text-properties-at 0 description))))
+      (delete-file orgist-snapshot-file))))
 
 (provide 'test-description-subtree)
 ;;; test-description-subtree.el ends here

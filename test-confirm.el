@@ -155,6 +155,37 @@ Call the studio.
           (should (equal "changed in Todoist since last sync: description, priority"
                          (plist-get modified :warning))))))))
 
+(ert-deftest orgist-confirm/recorded-description-decides-the-warning ()
+  "A description is checked against the Todoist text the last sync recorded.
+The snapshot's own description follows the file: comparing Todoist's
+text with it warned \"changed in Todoist\" for an unchanged task."
+  (orgist-test-confirm--with-project
+    (let ((orgist-confirm-remote-fetch-limit 5)
+          (todoist "Expires in June.\n\nDocuments:\n- form"))
+      (puthash "T1" (list :content "Renew passport"
+                          :description "Stale text from an edit outside orgist."
+                          :remote-description todoist
+                          :priority 1 :parent-id "PROJ1")
+               orgist-snapshots)
+      (cl-letf (((symbol-function 'orgist-confirm--fetch-remote)
+                 (lambda (_id _section-p)
+                   `((content . "Renew passport") (description . ,todoist)
+                     (priority . 1) (labels . []) (checked . :json-false))))
+                ((symbol-function 'orgist-convert-description) (lambda (d _level) d)))
+        (let ((modified (orgist-test-confirm--find
+                         (orgist-confirm--items orgist-test-confirm--changes
+                                                orgist-test-confirm--commands)
+                         "Renew passport")))
+          (should (null (plist-get modified :warning))))
+        ;; Todoist really changed: the warning stays.
+        (setq todoist "Rewritten in Todoist.")
+        (let ((modified (orgist-test-confirm--find
+                         (orgist-confirm--items orgist-test-confirm--changes
+                                                orgist-test-confirm--commands)
+                         "Renew passport")))
+          (should (equal "changed in Todoist since last sync: description"
+                         (plist-get modified :warning))))))))
+
 (ert-deftest orgist-confirm/remote-fetch-respects-limit ()
   "Above the limit nothing is fetched and snapshots are used."
   (orgist-test-confirm--with-project
