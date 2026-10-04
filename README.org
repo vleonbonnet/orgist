@@ -424,8 +424,8 @@ commands with a =project_id= target.
 | Lifecycle (one)   | =./test-run.sh Orgtest=           |     9 | Single project lifecycle             |
 | Formatting        | =./test-run.sh format=            |    95 | Spacing, write-back, new/delete/move |
 | Comments          | =./test-run.sh comments=          |    17 | Comment pull, dedup, note push       |
-| Subprocess        | =./test-run.sh subprocess=        |    12 | Full + incremental subprocess sync   |
-| Sole writer       | =./test-run.sh sole-writer=       |    21 | Subprocess syncs on a staged copy; edit during a sync |
+| Subprocess        | =./test-run.sh subprocess=        |    15 | Full + incremental subprocess sync   |
+| Sole writer       | =./test-run.sh sole-writer=       |    24 | Subprocess syncs on a staged copy; edit during a sync |
 | Cross-project     | =./test-run.sh move=              |    11 | Cross-project task moves             |
 | State log         | =./test-run.sh state-log=         |    12 | Completion timestamps, reopen, repeats |
 | Archived          | =./test-run.sh archived=          |    21 | Archived sections, order sync        |

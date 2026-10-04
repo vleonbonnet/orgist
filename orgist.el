@@ -1228,6 +1228,34 @@ fetched again.  Snapshots are merged instead (see
     (,(expand-file-name "completed_pull_timestamp" orgist-base-dir) . "completed_pull_timestamp")
     (,(orgist--completed-retry-file) . "completed-retry.json")))
 
+(defun orgist--sync-state ()
+  "Return the sync resources this Emacs holds besides snapshots, for a subprocess.
+Reminders, collaborators and the user's profile accumulate across
+syncs in memory; a subprocess starts without them, and rendered tasks
+without their reminder stamps and assignee names."
+  (cl-flet ((entries (table)
+              (when table
+                (let ((result nil))
+                  (maphash (lambda (key value) (push (cons key value) result)) table)
+                  result))))
+    (list :reminders (entries orgist-reminders)
+          :collaborators (entries orgist-collaborators)
+          :timezone orgist-user-timezone
+          :inbox orgist-user-inbox-project-id)))
+
+(defun orgist--restore-sync-state (state)
+  "Install STATE, from `orgist--sync-state', in this Emacs."
+  (cl-flet ((table (entries)
+              (when entries
+                (let ((table (make-hash-table :test 'equal)))
+                  (dolist (entry entries)
+                    (puthash (car entry) (cdr entry) table))
+                  table))))
+    (setq orgist-reminders (table (plist-get state :reminders))
+          orgist-collaborators (table (plist-get state :collaborators))
+          orgist-user-timezone (plist-get state :timezone)
+          orgist-user-inbox-project-id (plist-get state :inbox))))
+
 (defun orgist--file-text (file)
   "Return FILE's text as Emacs decodes it when visiting, or nil."
   (when (file-exists-p file)
@@ -1462,6 +1490,15 @@ PLIST is a property list with these keys:
          ;; The subprocess hands back its snapshot changes here; they
          ;; merge against the snapshots as they are now.
          (delta-file (expand-file-name (concat name "-snapshot-delta.el") orgist-base-dir))
+         ;; Reminders, collaborators and user profile, for rendering.
+         (state-file (let ((file (expand-file-name (concat name "-state.el") orgist-base-dir))
+                           (print-length nil)
+                           (print-level nil)
+                           (coding-system-for-write 'utf-8-unix))
+                       (with-temp-file file
+                         (prin1 (orgist--sync-state) (current-buffer)))
+                       file))
+         (data-files (cons state-file data-files))
          (snapshot-base (progn (orgist-load-snapshots)
                                (orgist--copy-snapshots
                                 (or orgist-snapshots (make-hash-table :test 'equal)))))
@@ -1566,6 +1603,11 @@ PLIST is a property list with these keys:
                                                   (or orgist-snapshots
                                                       (make-hash-table :test 'equal))))
                      (setq orgist--snapshot-delta-file ,delta-file)
+                     (orgist--restore-sync-state
+                      (with-temp-buffer
+                        (let ((coding-system-for-read 'utf-8))
+                          (insert-file-contents ,state-file))
+                        (read (current-buffer))))
                      (setq orgist-sync-mutex nil)
                      (setq revert-without-query '(".*"))
                      ;; Disable file locking — the parent Emacs may hold

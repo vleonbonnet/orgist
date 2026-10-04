@@ -414,6 +414,13 @@ Fetch full remote state, rebuild snapshots from it (never from local), run ID va
 
 Exit: an intentionally drifted fixture surfaces every drifted field as a pending diff; undoing a pull's cycle leaves its remote changes pending, not lost.
 
+Plan:
+1. Remote snapshots by a shadow pull: the full remote state is applied, in a background Emacs, to a staged copy of the project files with no snapshots, so every value is Todoist's as a pull renders it; no second converter that could disagree with the pull.  Fields Todoist does not hold (comment and activity bookkeeping) carry over from the existing snapshots.
+2. Validation: an element Todoist holds but the files lack keeps a snapshot only if it had one (a local deletion, which write-back still proposes); otherwise it is reported, never recreated or deleted.  An element the files hold but Todoist's active state lacks keeps its snapshot when done locally (completed tasks are not in a full sync); otherwise it is fetched alone: completed in Todoist is drift, gone is an orphan, reported.
+3. =orgist-rebuild-and-validate=: replaces the snapshots, reports, and opens the write-back review, where drift appears as pending changes.
+4. Take Todoist's version: per item in the review buffer, and =orgist-take-remote= for the heading at point, so drift can be resolved either way.
+5. =orgist-undo-cycle=: restores the project files a sync cycle started from, rebuilds from remote, and opens the review with Todoist's version preselected.
+
 ** TODO M3 — Overlay, projection-only
 :PROPERTIES:
 :ID:       1283cd1e-4b07-4843-842f-4eb6aaa414e3

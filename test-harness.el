@@ -1134,6 +1134,80 @@ temp dir containing only orgist.el (no orgist-confirm.el)."
 ;;; E2. Subprocess incremental sync test
 ;;; -----------------------------------------------------------
 
+(defun orgist-test--orgtest-baseline ()
+  "Set up an isolated Orgtest as a previous in-process sync left it.
+Returns the project's items from the cached full sync."
+  (orgist-test-setup-isolation "Orgtest")
+  (let* ((json-object-type 'alist)
+         (json-array-type 'vector)
+         (json-key-type 'symbol)
+         (data (json-read-file (expand-file-name "full-sync.json" orgist-test-cache-dir)))
+         (filter-ids (orgist-resolve-project-filter (alist-get 'projects data)))
+         (in-project (lambda (key) (lambda (e) (member (alist-get key e) filter-ids))))
+         (projects (seq-filter (funcall in-project 'id) (alist-get 'projects data)))
+         (sections (seq-filter (funcall in-project 'project_id) (alist-get 'sections data)))
+         (items (seq-filter (funcall in-project 'project_id) (alist-get 'items data)))
+         (inhibit-redisplay t)
+         (orgist--batch-save-pending (make-hash-table :test 'eq)))
+    (orgist-update-projects (orgist-sort-hierarchically projects))
+    (orgist-update-elements sections 'section)
+    (orgist-update-elements (orgist-sort-hierarchically items) 'item)
+    (orgist--flush-pending-saves)
+    (orgist-save-snapshots)
+    items))
+
+(defun orgist-test--wait-for-process (name)
+  "Wait up to two minutes for process NAME, then let its sentinel run."
+  (let ((proc (get-process name))
+        (waited 0))
+    (while (and proc (process-live-p proc) (< waited 120))
+      (accept-process-output proc 1)
+      (setq waited (1+ waited)))
+    (accept-process-output nil 0.5)))
+
+(defun orgist-test-run-subprocess-state ()
+  "A background sync renders with the reminders and assignees Emacs knows.
+Reminders and collaborators accumulate in memory across syncs; an
+incremental sync only carries what changed.  The subprocess started
+without them, so a large pull wrote raw user IDs as assignees and
+rebuilt bodies without their reminder stamps."
+  (setq orgist-test--failures 0)
+  (setq orgist-test--passes 0)
+  (message "")
+  (message "=== Background sync with reminders and collaborators (sole writer: %s) ==="
+           orgist-sole-writer)
+  (let* ((items (orgist-test--orgtest-baseline))
+         (item (seq-find (lambda (i) (alist-get 'content i)) items))
+         (id (alist-get 'id item))
+         (assigned (append '((content . "Assigned in Todoist") (responsible_uid . "C1"))
+                           (assq-delete-all 'responsible_uid
+                                            (assq-delete-all 'content (copy-sequence item)))))
+         (file (expand-file-name "Orgtest.org" orgist-base-dir)))
+    ;; Known from earlier syncs, not part of this one.
+    (setq orgist-collaborators (make-hash-table :test 'equal)
+          orgist-reminders (make-hash-table :test 'equal))
+    (puthash "C1" '((id . "C1") (full_name . "Jane Doe") (email . "jane@example.org"))
+             orgist-collaborators)
+    (puthash id `(((id . "R1") (item_id . ,id) (type . "absolute")
+                   (due . ((date . "2026-11-20T09:00:00")))))
+             orgist-reminders)
+    (orgist--subprocess-pull `((sync_token . "token-after")
+                               (projects . []) (sections . [])
+                               (items . ,(vector assigned))))
+    (orgist-test--wait-for-process "orgist-sync")
+    (let ((text (with-temp-buffer (insert-file-contents file) (buffer-string))))
+      (orgist-test-assert (string-match-p "Assigned in Todoist" text)
+                          "The background sync applied the change")
+      (orgist-test-assert (string-match-p ":ASSIGNEE: +Jane" text)
+                          "The assignee is a name, not a user ID")
+      (orgist-test-assert (string-match-p "<2026-11-20 [A-Za-z]+ 09:00>" text)
+                          "The reminder known from an earlier sync is in the body")))
+  (setq orgist-collaborators nil
+        orgist-reminders nil)
+  (message "=== Results: Background sync state ===")
+  (message "=== Passed: %d  Failed: %d ===" orgist-test--passes orgist-test--failures)
+  orgist-test--failures)
+
 (defun orgist-test-run-sole-writer-race ()
   "An edit made while a background sync runs is kept, and the sync deferred.
 With `orgist-sole-writer', the subprocess works on a staged copy: the
@@ -1146,25 +1220,8 @@ applies the change to the edited buffer."
   (message "========================================")
   (message "=== Sole writer: edit during a background sync ===")
   (message "========================================")
-  (orgist-test-setup-isolation "Orgtest")
   (let* ((orgist-sole-writer t)
-         (json-object-type 'alist)
-         (json-array-type 'vector)
-         (json-key-type 'symbol)
-         (data (json-read-file (expand-file-name "full-sync.json" orgist-test-cache-dir)))
-         (filter-ids (orgist-resolve-project-filter (alist-get 'projects data)))
-         (in-project (lambda (key) (lambda (e) (member (alist-get key e) filter-ids))))
-         (projects (seq-filter (funcall in-project 'id) (alist-get 'projects data)))
-         (sections (seq-filter (funcall in-project 'project_id) (alist-get 'sections data)))
-         (items (seq-filter (funcall in-project 'project_id) (alist-get 'items data))))
-    ;; Phase 1: the project as a previous sync left it.
-    (let ((inhibit-redisplay t)
-          (orgist--batch-save-pending (make-hash-table :test 'eq)))
-      (orgist-update-projects (orgist-sort-hierarchically projects))
-      (orgist-update-elements sections 'section)
-      (orgist-update-elements (orgist-sort-hierarchically items) 'item)
-      (orgist--flush-pending-saves)
-      (orgist-save-snapshots))
+         (items (orgist-test--orgtest-baseline)))
     (orgist-save-sync-token "token-before")
     (let* ((item (seq-find (lambda (i) (alist-get 'content i)) items))
            (id (alist-get 'id item))
@@ -1180,12 +1237,7 @@ applies the change to the edited buffer."
       (with-current-buffer buffer
         (goto-char (point-max))
         (insert "* Typed during the sync\n"))
-      (let ((proc (get-process "orgist-sync"))
-            (waited 0))
-        (while (and proc (process-live-p proc) (< waited 120))
-          (accept-process-output proc 1)
-          (setq waited (1+ waited)))
-        (accept-process-output nil 0.5))
+      (orgist-test--wait-for-process "orgist-sync")
       ;; Phase 3: the edit stands, the sync is deferred.
       (with-current-buffer buffer
         (orgist-test-assert (string-match-p "Typed during the sync" (buffer-string))
@@ -6019,12 +6071,14 @@ CLOSED: [2026-03-17 Tue 12:43]
     ("subprocess"
      (setq orgist-test-record-mode 'replay)
      (setq total-failures (+ (orgist-test-run-subprocess)
-                              (orgist-test-run-subprocess-incremental))))
+                              (orgist-test-run-subprocess-incremental)
+                              (orgist-test-run-subprocess-state))))
     ("sole-writer"
      (setq orgist-test-record-mode 'replay)
      (let ((orgist-sole-writer t))
        (setq total-failures (+ (orgist-test-run-subprocess)
                                 (orgist-test-run-subprocess-incremental)
+                                (orgist-test-run-subprocess-state)
                                 (orgist-test-run-sole-writer-race)))))
     ("format"
      (setq total-failures (orgist-test-run-formatting)))
