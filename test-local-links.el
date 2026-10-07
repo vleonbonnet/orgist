@@ -10,6 +10,7 @@
 (require 'test-isolation)
 (require 'ert)
 (require 'orgist)
+(require 'org-element)
 (setq orgist-log-file nil)
 
 (defun orgist-test--first-link (text)

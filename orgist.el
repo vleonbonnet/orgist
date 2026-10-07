@@ -59,6 +59,10 @@
 ;; Loaded lazily; call site is guarded by `featurep'.
 (declare-function org-inlinetask-outline-regexp "org-inlinetask")
 
+(defvar orgist-mode)
+(defvar orgist-request-retry-max)
+(defvar orgist-write-back-timeout)
+
 ;;; Settings
 (defgroup orgist nil
   "Bi-directional sync between Todoist and Org Mode."
@@ -1048,107 +1052,107 @@ errors (curl SSL, timeout, HTTP 429/5xx) are retried up to
                           (buffer-string))
                       "*")))
     (orgist-remote
-      'sync
-      :data `(("sync_token" . ,sync-token)
-              ("resource_types" . ,orgist--sync-resource-types))
-      :parser 'json-read
-      :error (cl-function (lambda (&key (data nil) error-thrown symbol-status
-                                  response &allow-other-keys)
-                            (let* ((status-code (when response
-                                                  (request-response-status-code response)))
-                                   (transport (orgist--transport-error-p error-thrown))
-                                   (retryable (or transport
-                                                  (orgist--retryable-http-p status-code)
-                                                  (eql status-code 429)))
-                                   (detail (or (alist-get 'error data)
-                                               (and (consp error-thrown)
-                                                    (cdr error-thrown))
-                                               error-thrown)))
-                              (if (and retryable (< retries orgist-request-retry-max))
-                                  (let ((delay (if (eql status-code 429)
-                                                   (or (alist-get 'retry_after data) 5)
-                                                 (* 2 (1+ retries)))))
-                                    (orgist-log 'warn
-                                                "Sync error (%s), retrying in %ds (%d/%d): %S"
-                                                (if transport "transport" (format "HTTP %s" status-code))
-                                                delay (1+ retries) orgist-request-retry-max detail)
-                                    (orgist--flush-log-buffer)
-                                    (run-at-time delay nil #'orgist-pull (1+ retries)))
-                                (setq orgist-sync-mutex nil)
-                                (orgist-log 'warn "Sync API error: HTTP %s %s — %S"
-                                            (or status-code "?") (or symbol-status "?")
-                                            detail)
-                                (orgist--flush-log-buffer)
-                                (error "Sync API error: HTTP %s — %S"
-                                       (or status-code "?") detail)))))
-      :success (cl-function
-                (lambda (&key data &allow-other-keys)
-                  (condition-case err
-                  (let* ((sync-token (alist-get 'sync_token data))
-                         (projects (alist-get 'projects data))
-                         (sections (alist-get 'sections data))
-                         (items (alist-get 'items data))
-                         (filter-ids (orgist-resolve-project-filter projects)))
-                    ;; Store additional sync resources
-                    (orgist-store-user-profile data)
-                    (orgist-store-labels data)
-                    (orgist-store-reminders data)
-                    (orgist-store-collaborators data)
-                    (when-let* ((limits (alist-get 'user_plan_limits data)))
-                      (setq orgist-plan-limits limits))
-                    (orgist-apply-label-faces)
-                    (setq orgist--pull-counts
-                          (list (length projects) (length sections) (length items)))
-                    (orgist-log 'debug "Sync response: %d projects, %d sections, %d items"
-                                (length projects) (length sections) (length items))
-                    (when filter-ids
-                      (setq projects (seq-filter
-                                      (lambda (p) (member (alist-get 'id p) filter-ids))
-                                      projects))
-                      (setq sections (seq-filter
-                                      (lambda (s) (member (alist-get 'project_id s) filter-ids))
-                                      sections))
-                      (setq items (seq-filter
-                                   (lambda (i) (member (alist-get 'project_id i) filter-ids))
-                                   items))
-                      (orgist-log 'debug "Filtered to project(s) %s: %d projects, %d sections, %d items"
-                                  orgist-sync-project-filter
-                                  (length projects) (length sections) (length items)))
-                    (cond
-                     ((and orgist-sync-project-filter (not filter-ids))
-                      (orgist-log 'warn "Aborting sync: project filter '%s' matched nothing"
-                                  orgist-sync-project-filter)
-                      (setq orgist--pull-counts '(0 0 0))
-                      (orgist--finish-pull))
-                     (t
-                      (if (and (not noninteractive)
-                               (> (length items) orgist-async-chunk-size))
-                          ;; Large set in interactive mode: offload to subprocess.
-                          ;; Sync token is saved by the subprocess after
-                          ;; successful processing (not before).
-                          (orgist--subprocess-pull data)
-                        ;; Small set or batch mode: synchronous in-process.
-                        (let ((inhibit-redisplay t)
-                              (orgist--batch-save-pending (make-hash-table :test 'eq))
-                              (gc-cons-threshold (* 100 1024 1024))
-                              (gc-cons-percentage 0.6))
-                          (unless (equal orgist--pull-counts '(0 0 0))
-                            (orgist--history-checkpoint "Before pull: local state"))
-                          (orgist--apply-pull projects sections items)
-                          (orgist--flush-pending-saves)
-                          ;; Save sync token only after successful processing.
-                          ;; Don't save when filtering, as we skip other
-                          ;; projects' changes and would lose them.
-                          (unless orgist-sync-project-filter
-                            (orgist-save-sync-token sync-token))
-                          (orgist--finish-pull))))))
-                    (error
-                     (setq orgist-sync-mutex nil)
-                     (orgist-log 'warn "Error during sync processing: %s"
-                                 (error-message-string err))
-                     (orgist--flush-log-buffer)
-                     (message "Orgist: sync error — %s"
-                              (error-message-string err)))))))))
+     'sync
+     :data `(("sync_token" . ,sync-token)
+             ("resource_types" . ,orgist--sync-resource-types))
+     :parser 'json-read
+     :error (cl-function (lambda (&key (data nil) error-thrown symbol-status
+                                       response &allow-other-keys)
+                           (let* ((status-code (when response
+                                                 (request-response-status-code response)))
+                                  (transport (orgist--transport-error-p error-thrown))
+                                  (retryable (or transport
+                                                 (orgist--retryable-http-p status-code)
+                                                 (eql status-code 429)))
+                                  (detail (or (alist-get 'error data)
+                                              (and (consp error-thrown)
+                                                   (cdr error-thrown))
+                                              error-thrown)))
+                             (if (and retryable (< retries orgist-request-retry-max))
+                                 (let ((delay (if (eql status-code 429)
+                                                  (or (alist-get 'retry_after data) 5)
+                                                (* 2 (1+ retries)))))
+                                   (orgist-log 'warn
+                                               "Sync error (%s), retrying in %ds (%d/%d): %S"
+                                               (if transport "transport" (format "HTTP %s" status-code))
+                                               delay (1+ retries) orgist-request-retry-max detail)
+                                   (orgist--flush-log-buffer)
+                                   (run-at-time delay nil #'orgist-pull (1+ retries)))
+                               (setq orgist-sync-mutex nil)
+                               (orgist-log 'warn "Sync API error: HTTP %s %s — %S"
+                                           (or status-code "?") (or symbol-status "?")
+                                           detail)
+                               (orgist--flush-log-buffer)
+                               (error "Sync API error: HTTP %s — %S"
+                                      (or status-code "?") detail)))))
+     :success (cl-function
+               (lambda (&key data &allow-other-keys)
+                 (condition-case err
+                     (let* ((sync-token (alist-get 'sync_token data))
+                            (projects (alist-get 'projects data))
+                            (sections (alist-get 'sections data))
+                            (items (alist-get 'items data))
+                            (filter-ids (orgist-resolve-project-filter projects)))
+                       ;; Store additional sync resources
+                       (orgist-store-user-profile data)
+                       (orgist-store-labels data)
+                       (orgist-store-reminders data)
+                       (orgist-store-collaborators data)
+                       (when-let* ((limits (alist-get 'user_plan_limits data)))
+                         (setq orgist-plan-limits limits))
+                       (orgist-apply-label-faces)
+                       (setq orgist--pull-counts
+                             (list (length projects) (length sections) (length items)))
+                       (orgist-log 'debug "Sync response: %d projects, %d sections, %d items"
+                                   (length projects) (length sections) (length items))
+                       (when filter-ids
+                         (setq projects (seq-filter
+                                         (lambda (p) (member (alist-get 'id p) filter-ids))
+                                         projects))
+                         (setq sections (seq-filter
+                                         (lambda (s) (member (alist-get 'project_id s) filter-ids))
+                                         sections))
+                         (setq items (seq-filter
+                                      (lambda (i) (member (alist-get 'project_id i) filter-ids))
+                                      items))
+                         (orgist-log 'debug "Filtered to project(s) %s: %d projects, %d sections, %d items"
+                                     orgist-sync-project-filter
+                                     (length projects) (length sections) (length items)))
+                       (cond
+                        ((and orgist-sync-project-filter (not filter-ids))
+                         (orgist-log 'warn "Aborting sync: project filter '%s' matched nothing"
+                                     orgist-sync-project-filter)
+                         (setq orgist--pull-counts '(0 0 0))
+                         (orgist--finish-pull))
+                        (t
+                         (if (and (not noninteractive)
+                                  (> (length items) orgist-async-chunk-size))
+                             ;; Large set in interactive mode: offload to subprocess.
+                             ;; Sync token is saved by the subprocess after
+                             ;; successful processing (not before).
+                             (orgist--subprocess-pull data)
+                           ;; Small set or batch mode: synchronous in-process.
+                           (let ((inhibit-redisplay t)
+                                 (orgist--batch-save-pending (make-hash-table :test 'eq))
+                                 (gc-cons-threshold (* 100 1024 1024))
+                                 (gc-cons-percentage 0.6))
+                             (unless (equal orgist--pull-counts '(0 0 0))
+                               (orgist--history-checkpoint "Before pull: local state"))
+                             (orgist--apply-pull projects sections items)
+                             (orgist--flush-pending-saves)
+                             ;; Save sync token only after successful processing.
+                             ;; Don't save when filtering, as we skip other
+                             ;; projects' changes and would lose them.
+                             (unless orgist-sync-project-filter
+                               (orgist-save-sync-token sync-token))
+                             (orgist--finish-pull))))))
+                   (error
+                    (setq orgist-sync-mutex nil)
+                    (orgist-log 'warn "Error during sync processing: %s"
+                                (error-message-string err))
+                    (orgist--flush-log-buffer)
+                    (message "Orgist: sync error — %s"
+                             (error-message-string err)))))))))
 
 
 (defun orgist--subprocess-locale-config ()
@@ -1544,121 +1548,121 @@ PLIST is a property list with these keys:
                 (print-level nil))
             (format "%S"
                     `(progn
-                     ;; Load dependencies — inherit relevant load-path
-                     ;; entries from the parent Emacs.
-                     ,@(mapcar (lambda (p)
-                                 `(add-to-list 'load-path ,p))
-                               all-paths)
-                     (load ,(expand-file-name "orgist.el" orgist-el-dir)
-                           nil nil t)
-                     ;; Inherit locale and coding-system settings
-                     ;; from parent Emacs.
-                     ,@(orgist--subprocess-locale-config)
-                     ;; HTTP: inherit request.el backend and TLS settings
-                     ,@(when needs-http
-                         `((setenv "TZ" ,(getenv "TZ"))
-                           (require 'request nil t)
-                           (setq request-backend
-                                 ',(if (boundp 'request-backend)
-                                       request-backend 'url-retrieve))
-                           (setq request-curl
-                                 ,(if (boundp 'request-curl)
-                                      request-curl
-                                    (executable-find "curl")))
-                           (setq gnutls-trustfiles
-                                 ',(if (boundp 'gnutls-trustfiles)
-                                       gnutls-trustfiles nil))))
-                     ;; Configure orgist
-                     (setq orgist-base-dir ,orgist-base-dir)
-                     (setq orgist-sync-token-filename ,orgist-sync-token-filename)
-                     (setq orgist-snapshot-file ,orgist-snapshot-file)
-                     (setq orgist-labels-file ,orgist-labels-file)
-                     ;; Journal and trash go where the parent's do; the
-                     ;; parent records history around the subprocess.
-                     (setq orgist-history-directory ,(orgist--safety-directory))
-                     (setq orgist-history nil)
-                     ;; No log file in subprocess — output goes to
-                     ;; stdout/stderr, captured by parent's process filter.
-                     (setq orgist-log-file nil)
-                     (setq orgist-log-level ',orgist-log-level)
-                     (setq orgist-bearer-token ,token)
-                     (setq orgist-read-only ,orgist-read-only)
-                     (setq orgist-tag ,orgist-tag)
-                     (setq orgist-treat-priority-4-as-none
-                           ,orgist-treat-priority-4-as-none)
-                     ;; Sole writer: project and state files are the
-                     ;; staged copies; attachments still go to the real
-                     ;; attachment directory.
-                     ,@(when staging-dir
-                         `((setq orgist-base-dir ,staging-dir)
-                           (setq orgist-sync-token-filename
-                                 ,(expand-file-name "sync_token" staging-dir))
-                           (setq orgist-snapshot-file
-                                 ,(expand-file-name "snapshots.el" staging-dir))
-                           (setq orgist-labels-file
-                                 ,(expand-file-name "labels.el" staging-dir))
-                           (setq org-attach-id-dir
-                                 ,(expand-file-name org-attach-id-dir orgist-base-dir))))
-                     ;; Shadow: journal, trash and attachments stay in
-                     ;; the copy too.
-                     ,@(when shadow
-                         `((setq orgist-history-directory ,staging-dir)
-                           (setq orgist-sync-attachments nil)
-                           (setq org-attach-id-dir
-                                 ,(expand-file-name "data/" staging-dir))))
-                     ;; Enable write-back so snapshots are recorded
-                     ;; during element updates; the subprocess never
-                     ;; calls orgist-write-back itself.
-                     (setq orgist-enable-write-back t)
-                     (setq orgist-write-back-dry-run t)
-                     (setq orgist-project-buffer-cache nil)
-                     ;; Load existing snapshots from disk so
-                     ;; incremental syncs preserve entries for
-                     ;; elements not in this batch (and retain
-                     ;; comment-ids, activity-ids, etc.).
-                     (orgist-load-snapshots)
-                     ;; Every snapshot save also writes the changes since
-                     ;; now to the delta file, for the parent to merge.
-                     (setq orgist--snapshot-base (orgist--copy-snapshots
-                                                  (or orgist-snapshots
-                                                      (make-hash-table :test 'equal))))
-                     (setq orgist--snapshot-delta-file ,delta-file)
-                     (orgist--restore-sync-state
-                      (with-temp-buffer
-                        (let ((coding-system-for-read 'utf-8))
-                          (insert-file-contents ,state-file))
-                        (read (current-buffer))))
-                     (setq orgist-sync-mutex nil)
-                     (setq revert-without-query '(".*"))
-                     ;; Disable file locking — the parent Emacs may hold
-                     ;; locks on .org files, and batch mode cannot prompt
-                     ;; "steal the lock?", so save-buffer would error.
-                     (setq create-lockfiles nil)
-                     ;; Suppress "file changed on disk" conflicts — the
-                     ;; parent Emacs may save files while the subprocess
-                     ;; is running, and batch mode cannot prompt.
-                     ;; Override the C-level entry point directly so that
-                     ;; even if userlock.el is autoloaded later (which
-                     ;; would overwrite ask-user-about-supersession-threat),
-                     ;; the wrapper that C code actually calls is already
-                     ;; neutralized.
-                     (defun userlock--ask-user-about-supersession-threat (_) nil)
-                     (defun ask-user-about-supersession-threat (_) nil)
-                     ;; Org-mode settings — must match the parent
-                     ;; Emacs so headings, logbook entries, and
-                     ;; timestamps are created identically.
-                     ,@(orgist--subprocess-org-config)
-                     ;; Extra settings from caller
-                     ,@extra-settings
-                     ;; Open org files and build id-caches
-                     ,@(when open-org-files
-                         `((orgist-load-snapshots t)
-                           (dolist (file (orgist--project-files))
-                             (find-file file)
-                             (org-mode)
-                             (orgist-build-id-cache))))
-                     ;; Job body
-                     ,@job-body)))))
+                       ;; Load dependencies — inherit relevant load-path
+                       ;; entries from the parent Emacs.
+                       ,@(mapcar (lambda (p)
+                                   `(add-to-list 'load-path ,p))
+                                 all-paths)
+                       (load ,(expand-file-name "orgist.el" orgist-el-dir)
+                             nil nil t)
+                       ;; Inherit locale and coding-system settings
+                       ;; from parent Emacs.
+                       ,@(orgist--subprocess-locale-config)
+                       ;; HTTP: inherit request.el backend and TLS settings
+                       ,@(when needs-http
+                           `((setenv "TZ" ,(getenv "TZ"))
+                             (require 'request nil t)
+                             (setq request-backend
+                                   ',(if (boundp 'request-backend)
+                                         request-backend 'url-retrieve))
+                             (setq request-curl
+                                   ,(if (boundp 'request-curl)
+                                        request-curl
+                                      (executable-find "curl")))
+                             (setq gnutls-trustfiles
+                                   ',(if (boundp 'gnutls-trustfiles)
+                                         gnutls-trustfiles nil))))
+                       ;; Configure orgist
+                       (setq orgist-base-dir ,orgist-base-dir)
+                       (setq orgist-sync-token-filename ,orgist-sync-token-filename)
+                       (setq orgist-snapshot-file ,orgist-snapshot-file)
+                       (setq orgist-labels-file ,orgist-labels-file)
+                       ;; Journal and trash go where the parent's do; the
+                       ;; parent records history around the subprocess.
+                       (setq orgist-history-directory ,(orgist--safety-directory))
+                       (setq orgist-history nil)
+                       ;; No log file in subprocess — output goes to
+                       ;; stdout/stderr, captured by parent's process filter.
+                       (setq orgist-log-file nil)
+                       (setq orgist-log-level ',orgist-log-level)
+                       (setq orgist-bearer-token ,token)
+                       (setq orgist-read-only ,orgist-read-only)
+                       (setq orgist-tag ,orgist-tag)
+                       (setq orgist-treat-priority-4-as-none
+                             ,orgist-treat-priority-4-as-none)
+                       ;; Sole writer: project and state files are the
+                       ;; staged copies; attachments still go to the real
+                       ;; attachment directory.
+                       ,@(when staging-dir
+                           `((setq orgist-base-dir ,staging-dir)
+                             (setq orgist-sync-token-filename
+                                   ,(expand-file-name "sync_token" staging-dir))
+                             (setq orgist-snapshot-file
+                                   ,(expand-file-name "snapshots.el" staging-dir))
+                             (setq orgist-labels-file
+                                   ,(expand-file-name "labels.el" staging-dir))
+                             (setq org-attach-id-dir
+                                   ,(expand-file-name org-attach-id-dir orgist-base-dir))))
+                       ;; Shadow: journal, trash and attachments stay in
+                       ;; the copy too.
+                       ,@(when shadow
+                           `((setq orgist-history-directory ,staging-dir)
+                             (setq orgist-sync-attachments nil)
+                             (setq org-attach-id-dir
+                                   ,(expand-file-name "data/" staging-dir))))
+                       ;; Enable write-back so snapshots are recorded
+                       ;; during element updates; the subprocess never
+                       ;; calls orgist-write-back itself.
+                       (setq orgist-enable-write-back t)
+                       (setq orgist-write-back-dry-run t)
+                       (setq orgist-project-buffer-cache nil)
+                       ;; Load existing snapshots from disk so
+                       ;; incremental syncs preserve entries for
+                       ;; elements not in this batch (and retain
+                       ;; comment-ids, activity-ids, etc.).
+                       (orgist-load-snapshots)
+                       ;; Every snapshot save also writes the changes since
+                       ;; now to the delta file, for the parent to merge.
+                       (setq orgist--snapshot-base (orgist--copy-snapshots
+                                                    (or orgist-snapshots
+                                                        (make-hash-table :test 'equal))))
+                       (setq orgist--snapshot-delta-file ,delta-file)
+                       (orgist--restore-sync-state
+                        (with-temp-buffer
+                          (let ((coding-system-for-read 'utf-8))
+                            (insert-file-contents ,state-file))
+                          (read (current-buffer))))
+                       (setq orgist-sync-mutex nil)
+                       (setq revert-without-query '(".*"))
+                       ;; Disable file locking — the parent Emacs may hold
+                       ;; locks on .org files, and batch mode cannot prompt
+                       ;; "steal the lock?", so save-buffer would error.
+                       (setq create-lockfiles nil)
+                       ;; Suppress "file changed on disk" conflicts — the
+                       ;; parent Emacs may save files while the subprocess
+                       ;; is running, and batch mode cannot prompt.
+                       ;; Override the C-level entry point directly so that
+                       ;; even if userlock.el is autoloaded later (which
+                       ;; would overwrite ask-user-about-supersession-threat),
+                       ;; the wrapper that C code actually calls is already
+                       ;; neutralized.
+                       (defun userlock--ask-user-about-supersession-threat (_) nil)
+                       (defun ask-user-about-supersession-threat (_) nil)
+                       ;; Org-mode settings — must match the parent
+                       ;; Emacs so headings, logbook entries, and
+                       ;; timestamps are created identically.
+                       ,@(orgist--subprocess-org-config)
+                       ;; Extra settings from caller
+                       ,@extra-settings
+                       ;; Open org files and build id-caches
+                       ,@(when open-org-files
+                           `((orgist-load-snapshots t)
+                             (dolist (file (orgist--project-files))
+                               (find-file file)
+                               (org-mode)
+                               (orgist-build-id-cache))))
+                       ;; Job body
+                       ,@job-body)))))
     ;; Remove stale done and delta files
     (dolist (f (list done-file delta-file))
       (when (file-exists-p f)
@@ -1766,7 +1770,7 @@ buffers and reloads snapshots when the subprocess finishes."
       :done-file done-file
       :needs-http nil
       :extra-settings `((setq orgist-sync-project-filter ,orgist-sync-project-filter)
-                         (setq orgist-sync-attachments ,orgist-sync-attachments))
+                        (setq orgist-sync-attachments ,orgist-sync-attachments))
       :open-org-files nil
       :job-body `(;; Read JSON and process
                   (let* ((json-object-type 'alist)
@@ -2537,21 +2541,21 @@ only sent for labels that genuinely don't exist — a code 54
 Returns non-nil on success, nil on request failure."
   (let ((fetched nil))
     (orgist-remote
-      'sync
-      :retry t
-      :data '(("sync_token" . "*")
-              ("resource_types" . "[\"labels\"]"))
-      :parser 'json-read
-      :sync t
-      :timeout orgist-write-back-timeout
-      :error (cl-function
-              (lambda (&key data error-thrown &allow-other-keys)
-                (orgist-log 'warn "Label refresh API error: %S (err=%S)"
-                            data error-thrown)))
-      :success (cl-function
-                (lambda (&key data &allow-other-keys)
-                  (orgist-store-labels data)
-                  (setq fetched t))))
+     'sync
+     :retry t
+     :data '(("sync_token" . "*")
+             ("resource_types" . "[\"labels\"]"))
+     :parser 'json-read
+     :sync t
+     :timeout orgist-write-back-timeout
+     :error (cl-function
+             (lambda (&key data error-thrown &allow-other-keys)
+               (orgist-log 'warn "Label refresh API error: %S (err=%S)"
+                           data error-thrown)))
+     :success (cl-function
+               (lambda (&key data &allow-other-keys)
+                 (orgist-store-labels data)
+                 (setq fetched t))))
     (when fetched
       (orgist-log 'info "Refreshed label cache: %d label(s)"
                   (if orgist-labels (hash-table-count orgist-labels) 0)))
@@ -2629,9 +2633,9 @@ Uses org-safe tag names (hyphens/spaces replaced with underscores)."
        orgist-labels)
       (when faces
         (setopt org-tag-faces (append faces
-                                    (seq-remove
-                                     (lambda (f) (assoc (car f) faces))
-                                     org-tag-faces)))
+                                      (seq-remove
+                                       (lambda (f) (assoc (car f) faces))
+                                       org-tag-faces)))
         (orgist-log 'debug "Applied %d label face(s)" (length faces))))))
 
 (defun orgist--label-to-tag (label-name)
@@ -2679,7 +2683,7 @@ like \"Selfcare\" match Todoist labels like \"Self-care\"."
   "Resolve collaborator UID to display name.
 Returns the full_name if found, otherwise the UID string."
   (or (when-let* ((table orgist-collaborators)
-                   (collab (gethash uid table)))
+                  (collab (gethash uid table)))
         (alist-get 'full_name collab))
       uid))
 
@@ -3113,61 +3117,61 @@ heading levels."
                                 transplanted t))
                         (orgist-build-id-cache)
                         (orgist--save-buffer)))))))
-          ;; Process element
-          (with-current-buffer project-buffer
-            (save-excursion
-              (let* ((todoist-parent-id (or parent-id section-id project-id))
-                     (parent-point (orgist-find-element-by-id todoist-parent-id)))
-                (if (not parent-point)
-                    (orgist-log 'warn "Parent not found for %s %s (parent: %s) in %s, skipping"
-                                (symbol-name element-type) label
-                                todoist-parent-id
-                                (buffer-name project-buffer))
-                  ;; 1. Find or create element
-                  (let ((is-new nil)
-                        (was-reparented nil)
-                        (order (or section-order child-order)))
-                    (if-let* ((existing-point (orgist-find-element-by-id element-id)))
-                        (progn
-                          (orgist-log 'debug "Found existing element %s at point %d"
-                                      label existing-point)
-                          (goto-char existing-point)
-                          ;; 2. Reparent if parent changed
-                          (setq was-reparented
-                                (orgist-reparent-if-needed element-id todoist-parent-id)))
-                      ;; Insert new element
-                      (orgist-log 'debug "Creating new element %s at parent point %d"
-                                  label parent-point)
-                      (goto-char parent-point)
-                      (orgist-insert-element element)
-                      (setq is-new t))
-                    ;; 3. Update content/properties
-                    (orgist-update-element element is-new)
-                    ;; 4. Reposition among siblings if new, reparented,
-                    ;;    transplanted from another file, or order changed
-                    (let* ((old-order (org-entry-get (point) "TODOIST-ORDER"))
-                           (needs-position (or is-new
-                                              was-reparented
-                                              transplanted
-                                              (not (equal old-order
-                                                         (number-to-string order))))))
-                      (org-set-property "TODOIST-ORDER"
-                                        (number-to-string order))
-                      (when needs-position
-                        (orgist-log 'debug "Repositioning %s (old-order=%s new-order=%s)"
-                                    label old-order order)
-                        (orgist-position-element-by-order order element-type)
-                        ;; org-move-subtree can eat blank lines between a
-                        ;; parent's body text and its first child heading,
-                        ;; and the trailing blank line of the moved subtree
-                        ;; itself.  Re-normalize both.
-                        (orgist--normalize-body-spacing)
-                        (save-excursion
-                          (when (org-up-heading-safe)
-                            (orgist--normalize-body-spacing)))
-                        ;; Rebuild cache: org-move-subtree invalidates markers
-                        (orgist-rebuild-subtree-cache)))
-                    (orgist--save-buffer)))))))))))))
+            ;; Process element
+            (with-current-buffer project-buffer
+              (save-excursion
+                (let* ((todoist-parent-id (or parent-id section-id project-id))
+                       (parent-point (orgist-find-element-by-id todoist-parent-id)))
+                  (if (not parent-point)
+                      (orgist-log 'warn "Parent not found for %s %s (parent: %s) in %s, skipping"
+                                  (symbol-name element-type) label
+                                  todoist-parent-id
+                                  (buffer-name project-buffer))
+                    ;; 1. Find or create element
+                    (let ((is-new nil)
+                          (was-reparented nil)
+                          (order (or section-order child-order)))
+                      (if-let* ((existing-point (orgist-find-element-by-id element-id)))
+                          (progn
+                            (orgist-log 'debug "Found existing element %s at point %d"
+                                        label existing-point)
+                            (goto-char existing-point)
+                            ;; 2. Reparent if parent changed
+                            (setq was-reparented
+                                  (orgist-reparent-if-needed element-id todoist-parent-id)))
+                        ;; Insert new element
+                        (orgist-log 'debug "Creating new element %s at parent point %d"
+                                    label parent-point)
+                        (goto-char parent-point)
+                        (orgist-insert-element element)
+                        (setq is-new t))
+                      ;; 3. Update content/properties
+                      (orgist-update-element element is-new)
+                      ;; 4. Reposition among siblings if new, reparented,
+                      ;;    transplanted from another file, or order changed
+                      (let* ((old-order (org-entry-get (point) "TODOIST-ORDER"))
+                             (needs-position (or is-new
+                                                 was-reparented
+                                                 transplanted
+                                                 (not (equal old-order
+                                                             (number-to-string order))))))
+                        (org-set-property "TODOIST-ORDER"
+                                          (number-to-string order))
+                        (when needs-position
+                          (orgist-log 'debug "Repositioning %s (old-order=%s new-order=%s)"
+                                      label old-order order)
+                          (orgist-position-element-by-order order element-type)
+                          ;; org-move-subtree can eat blank lines between a
+                          ;; parent's body text and its first child heading,
+                          ;; and the trailing blank line of the moved subtree
+                          ;; itself.  Re-normalize both.
+                          (orgist--normalize-body-spacing)
+                          (save-excursion
+                            (when (org-up-heading-safe)
+                              (orgist--normalize-body-spacing)))
+                          ;; Rebuild cache: org-move-subtree invalidates markers
+                          (orgist-rebuild-subtree-cache)))
+                      (orgist--save-buffer)))))))))))))
 
 (defun orgist-reparent-if-needed (element-id todoist-parent-id)
   "Move element at point to TODOIST-PARENT-ID if its org parent differs.
@@ -3218,7 +3222,7 @@ Content is filled in by `orgist-update-element'."
 
 (defconst orgist--user-hooks
   '(org-trigger-hook org-after-todo-state-change-hook org-todo-repeat-hook
-    org-after-tags-change-hook org-property-changed-functions)
+                     org-after-tags-change-hook org-property-changed-functions)
   "Org hooks whose user functions may legitimately change other entries.
 A dependency trigger completing the next task is one.  Their changes
 are exempt from the guard of `orgist-update-element'.")
@@ -4630,10 +4634,10 @@ regular date."
                                         (string-suffix-p "Z" date)))
                            (orgist--convert-timezone date timezone)))
            (raw-date-part (if tz-converted
-                                (car tz-converted)
-                              (if has-time
-                                  (substring date 0 (string-match "T" date))
-                                date)))
+                              (car tz-converted)
+                            (if has-time
+                                (substring date 0 (string-match "T" date))
+                              date)))
            ;; Normalize to zero-padded YYYY-MM-DD (API may send e.g. 2026-2-3)
            (effective-date-part
             (if (string-match "\\`\\([0-9]\\{4\\}\\)-\\([0-9]+\\)-\\([0-9]+\\)\\'" raw-date-part)
@@ -4743,14 +4747,14 @@ Handles complex recurrence patterns including dates, times, and frequencies."
 Removes \"at HH:MM(am/pm)\", standalone time patterns, and
 \"starting at ...\" clauses.  Returns the cleaned date-only string."
   (thread-last string
-    (replace-regexp-in-string
-     "\\bat [0-9]+\\(?::[0-9]+\\)?[ \t]*\\(?:am\\|pm\\)?" "")
-    (replace-regexp-in-string
-     "\\b[0-9]+\\(?::[0-9]+\\)?[ \t]*\\(am\\|pm\\)\\b" "")
-    (replace-regexp-in-string
-     "\\bstarting at [0-9]+\\(?::[0-9]+\\)?[ \t]*\\(?:am\\|pm\\)?" "")
-    (replace-regexp-in-string "\\s-+" " ")
-    string-trim))
+               (replace-regexp-in-string
+                "\\bat [0-9]+\\(?::[0-9]+\\)?[ \t]*\\(?:am\\|pm\\)?" "")
+               (replace-regexp-in-string
+                "\\b[0-9]+\\(?::[0-9]+\\)?[ \t]*\\(am\\|pm\\)\\b" "")
+               (replace-regexp-in-string
+                "\\bstarting at [0-9]+\\(?::[0-9]+\\)?[ \t]*\\(?:am\\|pm\\)?" "")
+               (replace-regexp-in-string "\\s-+" " ")
+               string-trim))
 
 (defun orgist-month-name-to-number (month-name)
   "Convert MONTH-NAME (e.g. \"jan\", \"february\") to a month number (1-12).
@@ -5372,9 +5376,9 @@ hold local edits that have not been pushed yet."
                      :reminder-ids (when old-snap
                                      (plist-get old-snap :reminder-ids))
                      :attachment-files (or (when old-snap
-                                           (plist-get old-snap :attachment-files))
-                                         (when orgist-sync-attachments
-                                           (orgist--collect-attachment-files)))
+                                             (plist-get old-snap :attachment-files))
+                                           (when orgist-sync-attachments
+                                             (orgist--collect-attachment-files)))
                      :metadata-comment-id (when old-snap
                                             (plist-get old-snap :metadata-comment-id))
                      :last-repeat (org-entry-get (point) "LAST_REPEAT"))
@@ -5731,9 +5735,9 @@ Useful after a sync error that left snapshots stale."
                  ;; Preserve metadata from the existing snapshot
                  (when old
                    (dolist (key '(:note-count :responsible-uid
-                                  :comment-ids :activity-ids
-                                  :comments-pulled :reminder-ids
-                                  :activity-note-count :due-string))
+                                              :comment-ids :activity-ids
+                                              :comments-pulled :reminder-ids
+                                              :activity-note-count :due-string))
                      (when-let* ((val (plist-get old key)))
                        (setq local (plist-put local key val)))))
                  ;; Synthesize metadata from existing logbook Notes
@@ -5850,8 +5854,8 @@ and offers to rebuild when problems are found."
                               (length missing)))
               (insert "These tasks are invisible to write-back detection.\n\n")
               (dolist (entry (seq-take (sort missing
-                                            (lambda (a b)
-                                              (string< (cdr a) (cdr b))))
+                                             (lambda (a b)
+                                               (string< (cdr a) (cdr b))))
                                        50))
                 (insert (format "  %s  (%s)\n" (car entry) (cdr entry))))
               (when (length> missing 50)
@@ -5893,7 +5897,7 @@ and offers to rebuild when problems are found."
 
 (defconst orgist--snapshot-bookkeeping
   '(:comment-ids :activity-ids :comments-pulled :activity-note-count
-    :reminder-ids :attachment-files :metadata-comment-id)
+                 :reminder-ids :attachment-files :metadata-comment-id)
   "Snapshot fields orgist keeps for itself, which Todoist's state lacks.")
 
 (defun orgist--write-snapshot-table (table file)
@@ -6490,8 +6494,8 @@ Returns an alist suitable for the Todoist API `due' field, with
                        (match-string 1 timestamp)))
            ;; Build the date field (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)
            (api-date (if time
-                        (format "%sT%s:00" date time)
-                      date))
+                         (format "%sT%s:00" date time)
+                       date))
            ;; Build a human-readable string for the Todoist API.
            ;; Prefer the stored Todoist string when the timestamp still
            ;; has a repeater — it preserves day-of-week anchors that
@@ -6884,12 +6888,12 @@ of (FIELD . (OLD . NEW)) for each changed field."
             (goto-char pos)
             (let* ((local (orgist-element-local-state))
                    (fields `(:content :checked :priority :labels
-                             :due :due-string :deadline :duration
-                             ,@(when (eq (orgist--policy :description) 'sync)
-                                 '(:description))
-                             :parent-id :order :section-p :archived-p :last-repeat
-                             ,@(when orgist-sync-attachments
-                                 '(:attachment-files))))
+                                      :due :due-string :deadline :duration
+                                      ,@(when (eq (orgist--policy :description) 'sync)
+                                          '(:description))
+                                      :parent-id :order :section-p :archived-p :last-repeat
+                                      ,@(when orgist-sync-attachments
+                                          '(:attachment-files))))
                    (diffs '()))
               (dolist (field fields)
                 (let ((old-val (plist-get snapshot field))
@@ -6912,9 +6916,9 @@ of (FIELD . (OLD . NEW)) for each changed field."
                   ;; flat filename list.  Compare only the filenames.
                   (when (eq field :attachment-files)
                     (let ((old-names (sort (mapcar (lambda (e)
-                                                    (if (consp e) (cdr e) e))
-                                                  (or old-val '()))
-                                          #'string<))
+                                                     (if (consp e) (cdr e) e))
+                                                   (or old-val '()))
+                                           #'string<))
                           (new-names (sort (or new-val '()) :lessp #'string<)))
                       (if (equal old-names new-names)
                           ;; No real change — skip this field
@@ -7368,10 +7372,10 @@ Returns a list of command alists with keys `type', `uuid', `args'."
                            ;; sending the same label_add twice (Todoist returns code 54).
                            (let ((todoist-name (orgist--tag-to-label label)))
                              (unless (cl-some (lambda (cmd)
-                                               (and (equal (alist-get 'type cmd) "label_add")
-                                                    (equal (alist-get 'name (alist-get 'args cmd))
-                                                           todoist-name)))
-                                             commands)
+                                                (and (equal (alist-get 'type cmd) "label_add")
+                                                     (equal (alist-get 'name (alist-get 'args cmd))
+                                                            todoist-name)))
+                                              commands)
                                (push (list (cons 'type "label_add")
                                            (cons 'uuid (org-id-uuid))
                                            (cons 'temp_id (org-id-uuid))
@@ -7486,14 +7490,14 @@ Returns a list of command alists with keys `type', `uuid', `args'."
                            ;; the next occurrence from the new recurrence type.
                            (setcdr due-pair
                                    (seq-remove (lambda (pair) (eq (car pair) 'date))
-                                                 (cdr due-pair)))
+                                               (cdr due-pair)))
                          ;; Normal case: drop due entirely.
                          (setq update-args
                                (seq-remove (lambda (pair) (eq (car pair) 'due))
-                                             update-args))))
+                                           update-args))))
                      (setq update-args
                            (seq-remove (lambda (pair) (eq (car pair) 'duration))
-                                         update-args))))
+                                       update-args))))
                   (:archived-p
                    ;; Archive/unarchive is a separate command
                    (when (plist-get snapshot :section-p)
@@ -7506,9 +7510,9 @@ Returns a list of command alists with keys `type', `uuid', `args'."
             ;; If last-repeat triggered date-complete, suppress item_update
             ;; when the only remaining update-arg is the id.
             (when (and needs-date-complete
-                      needs-update
-                      (length= update-args 1)
-                      (assq 'id update-args))
+                       needs-update
+                       (length= update-args 1)
+                       (assq 'id update-args))
               (setq needs-update nil))
             ;; Emit note_add commands for new logbook Notes.
             (when-let* ((notes-diff (assq :notes diff)))
@@ -7697,22 +7701,22 @@ Todoist's authoritative next occurrence."
   (dolist (id item-ids)
     (let ((task nil))
       (orgist-remote
-        'get-task
-        :path (list id)
-        :retry t
-        :parser 'json-read
-        :sync t
-        :error (cl-function
-                (lambda (&key data error-thrown &allow-other-keys)
-                  (let ((code (orgist--http-error-code error-thrown)))
-                    (if (memq code '(403 404 410))
-                        (orgist-log 'debug "Refresh date: task %s returned HTTP %s, skipping"
-                                    id code)
-                      (orgist-log 'warn "Refresh date: API error for %s: %S (err=%S)"
-                                  id data error-thrown)))))
-        :success (cl-function
-                  (lambda (&key data &allow-other-keys)
-                    (setq task data))))
+       'get-task
+       :path (list id)
+       :retry t
+       :parser 'json-read
+       :sync t
+       :error (cl-function
+               (lambda (&key data error-thrown &allow-other-keys)
+                 (let ((code (orgist--http-error-code error-thrown)))
+                   (if (memq code '(403 404 410))
+                       (orgist-log 'debug "Refresh date: task %s returned HTTP %s, skipping"
+                                   id code)
+                     (orgist-log 'warn "Refresh date: API error for %s: %S (err=%S)"
+                                 id data error-thrown)))))
+       :success (cl-function
+                 (lambda (&key data &allow-other-keys)
+                   (setq task data))))
       (when task
         (let ((due (alist-get 'due task))
               (duration (alist-get 'duration task)))
@@ -8160,28 +8164,28 @@ downloaded or applied."
   (let* ((json-commands (json-encode (vconcat commands)))
          (response nil))
     (orgist-remote
-      'commands
-      :retry t
-      :headers '(("Connection" . "close"))
-      :data `(("commands" . ,json-commands))
-      :parser 'json-read
-      :sync t
-      :timeout orgist-write-back-timeout
-      :error (cl-function
-              (lambda (&key data error-thrown symbol-status response
-                       &allow-other-keys)
-                (let ((status-code (when response
-                                     (request-response-status-code response)))
-                      (detail (or (alist-get 'error data)
-                                  (and (consp error-thrown) (cdr error-thrown))
-                                  error-thrown)))
-                  (orgist-log 'warn "Write-back API error: HTTP %s %s — %S"
-                              (or status-code "?") (or symbol-status "?") detail)
-                  (error "Write-back API call failed: HTTP %s — %S"
-                         (or status-code "?") detail))))
-      :success (cl-function
-                (lambda (&key data &allow-other-keys)
-                  (setq response data))))
+     'commands
+     :retry t
+     :headers '(("Connection" . "close"))
+     :data `(("commands" . ,json-commands))
+     :parser 'json-read
+     :sync t
+     :timeout orgist-write-back-timeout
+     :error (cl-function
+             (lambda (&key data error-thrown symbol-status response
+                           &allow-other-keys)
+               (let ((status-code (when response
+                                    (request-response-status-code response)))
+                     (detail (or (alist-get 'error data)
+                                 (and (consp error-thrown) (cdr error-thrown))
+                                 error-thrown)))
+                 (orgist-log 'warn "Write-back API error: HTTP %s %s — %S"
+                             (or status-code "?") (or symbol-status "?") detail)
+                 (error "Write-back API call failed: HTTP %s — %S"
+                        (or status-code "?") detail))))
+     :success (cl-function
+               (lambda (&key data &allow-other-keys)
+                 (setq response data))))
     (unless response
       (orgist-log 'warn "Write-back: API returned empty response"))
     (list :sync-status (alist-get 'sync_status response)
@@ -8579,20 +8583,20 @@ Key fields: `activity_log' (boolean), `activity_log_limit' (integer)."
   (or orgist-plan-limits
       (progn
         (orgist-remote
-          'sync
-          :retry t
-          :data `(("sync_token" . "*")
-                  ("resource_types" . "[\"user_plan_limits\"]"))
-          :parser 'json-read
-          :sync t
-          :error (cl-function
-                  (lambda (&key data error-thrown &allow-other-keys)
-                    (orgist-log 'warn "Plan limits API error: %S (err=%S)"
-                                data error-thrown)))
-          :success (cl-function
-                    (lambda (&key data &allow-other-keys)
-                      (setq orgist-plan-limits
-                            (alist-get 'user_plan_limits data)))))
+         'sync
+         :retry t
+         :data `(("sync_token" . "*")
+                 ("resource_types" . "[\"user_plan_limits\"]"))
+         :parser 'json-read
+         :sync t
+         :error (cl-function
+                 (lambda (&key data error-thrown &allow-other-keys)
+                   (orgist-log 'warn "Plan limits API error: %S (err=%S)"
+                               data error-thrown)))
+         :success (cl-function
+                   (lambda (&key data &allow-other-keys)
+                     (setq orgist-plan-limits
+                           (alist-get 'user_plan_limits data)))))
         orgist-plan-limits)))
 
 (defun orgist-activity-log-available-p ()
@@ -8622,30 +8626,30 @@ Paginates via cursor.  Returns a flat list of section alists."
         (when cursor
           (push (cons "cursor" cursor) params))
         (orgist-remote
-          'archived-sections
-          :retry t
-          :params params
-          :parser 'json-read
-          :sync t
-          :error (cl-function
-                  (lambda (&key error-thrown &allow-other-keys)
-                    (let ((code (orgist--http-error-code error-thrown)))
-                      (unless (memq code '(403 404))
-                        (orgist-log 'warn "Archived sections error for %s: %S"
-                                    project-id error-thrown)))
-                    (setq done t)))
-          :success (cl-function
-                    (lambda (&key data &allow-other-keys)
-                      (setq page-sections
-                            (cond
-                             ((and (listp data) (assq 'sections data))
-                              (append (alist-get 'sections data) nil))
-                             ((and (listp data) (assq 'results data))
-                              (append (alist-get 'results data) nil))
-                             ((vectorp data) (append data nil))
-                             (t nil)))
-                      (setq next-cursor
-                            (and (listp data) (alist-get 'next_cursor data))))))
+         'archived-sections
+         :retry t
+         :params params
+         :parser 'json-read
+         :sync t
+         :error (cl-function
+                 (lambda (&key error-thrown &allow-other-keys)
+                   (let ((code (orgist--http-error-code error-thrown)))
+                     (unless (memq code '(403 404))
+                       (orgist-log 'warn "Archived sections error for %s: %S"
+                                   project-id error-thrown)))
+                   (setq done t)))
+         :success (cl-function
+                   (lambda (&key data &allow-other-keys)
+                     (setq page-sections
+                           (cond
+                            ((and (listp data) (assq 'sections data))
+                             (append (alist-get 'sections data) nil))
+                            ((and (listp data) (assq 'results data))
+                             (append (alist-get 'results data) nil))
+                            ((vectorp data) (append data nil))
+                            (t nil)))
+                     (setq next-cursor
+                           (and (listp data) (alist-get 'next_cursor data))))))
         (setq all-sections (nconc all-sections page-sections))
         (if (or (null page-sections) (null next-cursor))
             (setq done t)
@@ -8693,29 +8697,29 @@ Paginates via cursor."
         (when cursor
           (push (cons "cursor" cursor) params))
         (orgist-remote
-          'completed-tasks
-          :retry t
-          :params params
-          :parser 'json-read
-          :sync t
-          :error (cl-function
-                  (lambda (&key data error-thrown symbol-status &allow-other-keys)
-                    (let ((code (orgist--http-error-code error-thrown)))
-                      (if (memq code '(403 404 410))
-                          (orgist-log 'debug "Completed tasks: HTTP %s, skipping" code)
-                        (orgist-log 'warn "Completed tasks API error: %S (status=%S err=%S)"
-                                    data symbol-status error-thrown)))
-                    (setq done t)))
-          :success (cl-function
-                    (lambda (&key data &allow-other-keys)
-                      (let ((tasks (cond
-                                    ((and (listp data) (assq 'results data))
-                                     (alist-get 'results data))
-                                    ((and (listp data) (assq 'items data))
-                                     (alist-get 'items data))
-                                    (t data))))
-                        (setq page-tasks (append tasks nil))
-                        (setq next-cursor (alist-get 'next_cursor data))))))
+         'completed-tasks
+         :retry t
+         :params params
+         :parser 'json-read
+         :sync t
+         :error (cl-function
+                 (lambda (&key data error-thrown symbol-status &allow-other-keys)
+                   (let ((code (orgist--http-error-code error-thrown)))
+                     (if (memq code '(403 404 410))
+                         (orgist-log 'debug "Completed tasks: HTTP %s, skipping" code)
+                       (orgist-log 'warn "Completed tasks API error: %S (status=%S err=%S)"
+                                   data symbol-status error-thrown)))
+                   (setq done t)))
+         :success (cl-function
+                   (lambda (&key data &allow-other-keys)
+                     (let ((tasks (cond
+                                   ((and (listp data) (assq 'results data))
+                                    (alist-get 'results data))
+                                   ((and (listp data) (assq 'items data))
+                                    (alist-get 'items data))
+                                   (t data))))
+                       (setq page-tasks (append tasks nil))
+                       (setq next-cursor (alist-get 'next_cursor data))))))
         (setq all-tasks (nconc all-tasks page-tasks))
         (if (or (null page-tasks) (null next-cursor))
             (setq done t)
@@ -8967,26 +8971,26 @@ HTTP 403/404/410 are treated as empty (task gone or inaccessible).
 Retries automatically on HTTP 429 rate limiting."
   (let ((result nil))
     (orgist-remote
-      'comments
-      :retry t
-      :params `(("task_id" . ,task-id))
-      :parser 'json-read
-      :sync t
-      :error (cl-function
-              (lambda (&key data error-thrown symbol-status &allow-other-keys)
-                (let ((code (orgist--http-error-code error-thrown)))
-                  (if (memq code '(403 404 410))
-                      (orgist-log 'debug "Comments: %s returned HTTP %s, skipping"
-                                  task-id code)
-                    (orgist-log 'warn "Comments API error for %s: %S (status=%S err=%S)"
-                                task-id data symbol-status error-thrown)))))
-      :success (cl-function
-                (lambda (&key data &allow-other-keys)
-                  ;; API v1 wraps comments in {"results": [...]}
-                  (let ((comments (if (and (listp data) (assq 'results data))
-                                      (alist-get 'results data)
-                                    data)))
-                    (setq result (append comments nil))))))
+     'comments
+     :retry t
+     :params `(("task_id" . ,task-id))
+     :parser 'json-read
+     :sync t
+     :error (cl-function
+             (lambda (&key data error-thrown symbol-status &allow-other-keys)
+               (let ((code (orgist--http-error-code error-thrown)))
+                 (if (memq code '(403 404 410))
+                     (orgist-log 'debug "Comments: %s returned HTTP %s, skipping"
+                                 task-id code)
+                   (orgist-log 'warn "Comments API error for %s: %S (status=%S err=%S)"
+                               task-id data symbol-status error-thrown)))))
+     :success (cl-function
+               (lambda (&key data &allow-other-keys)
+                 ;; API v1 wraps comments in {"results": [...]}
+                 (let ((comments (if (and (listp data) (assq 'results data))
+                                     (alist-get 'results data)
+                                   data)))
+                   (setq result (append comments nil))))))
     result))
 
 (defun orgist-fetch-task-activity (task-id)
@@ -9010,29 +9014,29 @@ Only returns completed/uncompleted events (state changes)."
         (when cursor
           (push (cons "cursor" cursor) params))
         (orgist-remote
-          'activities
-          :retry t
-          :params params
-          :parser 'json-read
-          :sync t
-          :error (cl-function
-                  (lambda (&key data error-thrown symbol-status &allow-other-keys)
-                    (let ((code (orgist--http-error-code error-thrown)))
-                      (if (memq code '(403 404 410))
-                          (orgist-log 'debug "Activity: %s returned HTTP %s, skipping"
-                                      task-id code)
-                        (orgist-log 'warn "Activity API error for %s: %S (status=%S err=%S)"
-                                    task-id data symbol-status error-thrown)))
-                    (setq done t)))
-          :success (cl-function
-                    (lambda (&key data &allow-other-keys)
-                      ;; v1 wraps in {"results": [...], "nextCursor": ...}
-                      (let ((events (if (and (listp data) (assq 'results data))
-                                        (alist-get 'results data)
-                                      ;; Fallback for old format in test fixtures
-                                      (alist-get 'events data))))
-                        (setq page-events (append events nil))
-                        (setq next-cursor (alist-get 'nextCursor data))))))
+         'activities
+         :retry t
+         :params params
+         :parser 'json-read
+         :sync t
+         :error (cl-function
+                 (lambda (&key data error-thrown symbol-status &allow-other-keys)
+                   (let ((code (orgist--http-error-code error-thrown)))
+                     (if (memq code '(403 404 410))
+                         (orgist-log 'debug "Activity: %s returned HTTP %s, skipping"
+                                     task-id code)
+                       (orgist-log 'warn "Activity API error for %s: %S (status=%S err=%S)"
+                                   task-id data symbol-status error-thrown)))
+                   (setq done t)))
+         :success (cl-function
+                   (lambda (&key data &allow-other-keys)
+                     ;; v1 wraps in {"results": [...], "nextCursor": ...}
+                     (let ((events (if (and (listp data) (assq 'results data))
+                                       (alist-get 'results data)
+                                     ;; Fallback for old format in test fixtures
+                                     (alist-get 'events data))))
+                       (setq page-events (append events nil))
+                       (setq next-cursor (alist-get 'nextCursor data))))))
         (setq all-events (nconc all-events page-events))
         (if (or (null page-events) (null next-cursor))
             (setq done t)
@@ -9067,146 +9071,146 @@ Searches all open org buffers for the task heading."
               (throw 'found nil))))))
     (if (not pos)
         (orgist-log 'debug "Comments: task %s not found in any buffer, skipping" task-id)
-    (unwind-protect
-    (with-current-buffer target-buf
-      (save-excursion
-        (save-restriction
-          (widen)
-          (goto-char pos)
-          (org-back-to-heading t)
-          (let* ((snapshot (gethash task-id orgist-snapshots))
-                 (known-comment-ids (when snapshot
-                                      (plist-get snapshot :comment-ids)))
-                 (known-activity-ids (when snapshot
-                                       (plist-get snapshot :activity-ids)))
-                 (new-comment-ids (copy-sequence (or known-comment-ids '())))
-                 (new-activity-ids (copy-sequence (or known-activity-ids '())))
-                 ;; Fetch comments (skip if note_count is 0).
-                 ;; Sort chronologically (oldest first) so entries are
-                 ;; inserted in the correct order regardless of
-                 ;; `org-log-states-order-reversed'.
-                 (note-count (when snapshot (plist-get snapshot :note-count)))
-                 (comments (if (and note-count (= note-count 0))
-                               (progn
-                                 (orgist-log 'debug "Comments: skipping %s (note_count=0)" task-id)
-                                 nil)
-                             (orgist-fetch-task-comments task-id)))
-                 (comments (sort (copy-sequence comments)
-                                 (lambda (a b)
-                                   (string< (or (alist-get 'posted_at a) "")
-                                            (or (alist-get 'posted_at b) ""))))))
-            (dolist (comment comments)
-              (let ((comment-id (alist-get 'id comment)))
-                (cond
-                 ;; Metadata comment — restore properties, don't insert as Note
-                 ((orgist--metadata-comment-p comment)
-                  (when orgist-sync-metadata
-                    (orgist-log 'debug "Restoring metadata from comment %s" comment-id)
-                    (condition-case err
+      (unwind-protect
+          (with-current-buffer target-buf
+            (save-excursion
+              (save-restriction
+                (widen)
+                (goto-char pos)
+                (org-back-to-heading t)
+                (let* ((snapshot (gethash task-id orgist-snapshots))
+                       (known-comment-ids (when snapshot
+                                            (plist-get snapshot :comment-ids)))
+                       (known-activity-ids (when snapshot
+                                             (plist-get snapshot :activity-ids)))
+                       (new-comment-ids (copy-sequence (or known-comment-ids '())))
+                       (new-activity-ids (copy-sequence (or known-activity-ids '())))
+                       ;; Fetch comments (skip if note_count is 0).
+                       ;; Sort chronologically (oldest first) so entries are
+                       ;; inserted in the correct order regardless of
+                       ;; `org-log-states-order-reversed'.
+                       (note-count (when snapshot (plist-get snapshot :note-count)))
+                       (comments (if (and note-count (= note-count 0))
+                                     (progn
+                                       (orgist-log 'debug "Comments: skipping %s (note_count=0)" task-id)
+                                       nil)
+                                   (orgist-fetch-task-comments task-id)))
+                       (comments (sort (copy-sequence comments)
+                                       (lambda (a b)
+                                         (string< (or (alist-get 'posted_at a) "")
+                                                  (or (alist-get 'posted_at b) ""))))))
+                  (dolist (comment comments)
+                    (let ((comment-id (alist-get 'id comment)))
+                      (cond
+                       ;; Metadata comment — restore properties, don't insert as Note
+                       ((orgist--metadata-comment-p comment)
+                        (when orgist-sync-metadata
+                          (orgist-log 'debug "Restoring metadata from comment %s" comment-id)
+                          (condition-case err
+                              (save-excursion
+                                (goto-char pos)
+                                (org-back-to-heading t)
+                                (orgist-restore-metadata (alist-get 'content comment)))
+                            (error
+                             (orgist-log 'warn "Failed to restore metadata %s: %s"
+                                         comment-id (error-message-string err)))))
+                        ;; Track it so we don't re-process, and store the ID
+                        (push comment-id new-comment-ids)
+                        (when snapshot
+                          (plist-put snapshot :metadata-comment-id comment-id)))
+                       ;; Already known comment — skip
+                       ((member comment-id known-comment-ids) nil)
+                       ;; New regular comment — insert as logbook Note
+                       (t
+                        (orgist-log 'debug "Comments: inserting comment %s for task %s"
+                                    comment-id task-id)
+                        (condition-case err
+                            (save-excursion
+                              (goto-char pos)
+                              (org-back-to-heading t)
+                              (orgist-insert-comment-as-note
+                               (alist-get 'posted_at comment)
+                               (alist-get 'content comment)))
+                          (error
+                           (orgist-log 'warn "Failed to insert comment %s: %s"
+                                       comment-id (error-message-string err))))
+                        (push comment-id new-comment-ids)))))
+                  ;; Fetch and insert activity (completed/uncompleted only).
+                  ;; Sort chronologically so insertion order is correct.
+                  (let ((events (when (orgist-activity-log-available-p)
+                                  (sort (copy-sequence
+                                         (orgist-fetch-task-activity task-id))
+                                        (lambda (a b)
+                                          (string< (or (alist-get 'event_date a)
+                                                       (alist-get 'eventDate a) "")
+                                                   (or (alist-get 'event_date b)
+                                                       (alist-get 'eventDate b) "")))))))
+                    (dolist (event events)
+                      (let ((event-id (alist-get 'id event)))
+                        (unless (member event-id known-activity-ids)
+                          (orgist-log 'debug "Activity: inserting %s for task %s"
+                                      event-id task-id)
+                          (condition-case err
+                              (save-excursion
+                                (goto-char pos)
+                                (org-back-to-heading t)
+                                (orgist-insert-activity-as-log event))
+                            (error
+                             (orgist-log 'warn "Failed to insert activity %s: %s"
+                                         event-id (error-message-string err))))
+                          (push event-id new-activity-ids))))
+                    ;; Deduplicate and sort logbook.  Each duplicate Note
+                    ;; removed here was a known note re-inserted because its
+                    ;; snapshot id was a "rebuilt" placeholder — its real id
+                    ;; was just recorded above, so retire one placeholder per
+                    ;; removal to keep the known-comment count aligned with
+                    ;; the actual logbook notes.
+                    (condition-case nil
                         (save-excursion
                           (goto-char pos)
                           (org-back-to-heading t)
-                          (orgist-restore-metadata (alist-get 'content comment)))
-                      (error
-                       (orgist-log 'warn "Failed to restore metadata %s: %s"
-                                   comment-id (error-message-string err)))))
-                  ;; Track it so we don't re-process, and store the ID
-                  (push comment-id new-comment-ids)
-                  (when snapshot
-                    (plist-put snapshot :metadata-comment-id comment-id)))
-                 ;; Already known comment — skip
-                 ((member comment-id known-comment-ids) nil)
-                 ;; New regular comment — insert as logbook Note
-                 (t
-                  (orgist-log 'debug "Comments: inserting comment %s for task %s"
-                              comment-id task-id)
-                  (condition-case err
-                      (save-excursion
-                        (goto-char pos)
-                        (org-back-to-heading t)
-                        (orgist-insert-comment-as-note
-                         (alist-get 'posted_at comment)
-                         (alist-get 'content comment)))
-                    (error
-                     (orgist-log 'warn "Failed to insert comment %s: %s"
-                                 comment-id (error-message-string err))))
-                  (push comment-id new-comment-ids)))))
-            ;; Fetch and insert activity (completed/uncompleted only).
-            ;; Sort chronologically so insertion order is correct.
-            (let ((events (when (orgist-activity-log-available-p)
-                            (sort (copy-sequence
-                                   (orgist-fetch-task-activity task-id))
-                                  (lambda (a b)
-                                    (string< (or (alist-get 'event_date a)
-                                                 (alist-get 'eventDate a) "")
-                                             (or (alist-get 'event_date b)
-                                                 (alist-get 'eventDate b) "")))))))
-              (dolist (event events)
-                (let ((event-id (alist-get 'id event)))
-                  (unless (member event-id known-activity-ids)
-                    (orgist-log 'debug "Activity: inserting %s for task %s"
-                                event-id task-id)
-                    (condition-case err
-                        (save-excursion
-                          (goto-char pos)
-                          (org-back-to-heading t)
-                          (orgist-insert-activity-as-log event))
-                      (error
-                       (orgist-log 'warn "Failed to insert activity %s: %s"
-                                   event-id (error-message-string err))))
-                    (push event-id new-activity-ids))))
-              ;; Deduplicate and sort logbook.  Each duplicate Note
-              ;; removed here was a known note re-inserted because its
-              ;; snapshot id was a "rebuilt" placeholder — its real id
-              ;; was just recorded above, so retire one placeholder per
-              ;; removal to keep the known-comment count aligned with
-              ;; the actual logbook notes.
-              (condition-case nil
-                  (save-excursion
-                    (goto-char pos)
-                    (org-back-to-heading t)
-                    (let* ((removed-notes (or (orgist-deduplicate-logbook) 0))
-                           (placeholders (seq-count
-                                          (lambda (i) (equal i "rebuilt"))
-                                          new-comment-ids))
-                           (keep (- placeholders
-                                    (min removed-notes placeholders))))
-                      (when (< keep placeholders)
-                        (setq new-comment-ids
-                              (append (seq-remove
-                                       (lambda (i) (equal i "rebuilt"))
-                                       new-comment-ids)
-                                      (make-list keep "rebuilt")))))
-                    (orgist-sort-logbook))
-                (error nil))
-              ;; Sync attachments from comments (download new, remove stale).
-              (let ((new-attachment-files
-                     (when orgist-sync-attachments
-                       (condition-case err
-                           (save-excursion
-                             (goto-char pos)
-                             (org-back-to-heading t)
-                             (orgist-sync-task-attachments
-                              task-id comments
-                              (when snapshot
-                                (plist-get snapshot :attachment-files))))
-                         (error
-                          (orgist-log 'warn "Failed to sync attachments for %s: %s"
-                                      task-id (error-message-string err))
-                          (when snapshot
-                            (plist-get snapshot :attachment-files)))))))
-                ;; Update snapshot — always update even if insertion partially
-                ;; failed, to avoid retrying the same entries indefinitely.
-                (when snapshot
-                  (let ((updated (copy-sequence snapshot)))
-                    (plist-put updated :comment-ids new-comment-ids)
-                    (plist-put updated :activity-ids new-activity-ids)
-                    (plist-put updated :comments-pulled t)
-                    (when orgist-sync-attachments
-                      (plist-put updated :attachment-files new-attachment-files))
-                    (puthash task-id updated orgist-snapshots)))))))))
-      ;; Clean up marker
-      (when (markerp pos) (set-marker pos nil))))))
+                          (let* ((removed-notes (or (orgist-deduplicate-logbook) 0))
+                                 (placeholders (seq-count
+                                                (lambda (i) (equal i "rebuilt"))
+                                                new-comment-ids))
+                                 (keep (- placeholders
+                                          (min removed-notes placeholders))))
+                            (when (< keep placeholders)
+                              (setq new-comment-ids
+                                    (append (seq-remove
+                                             (lambda (i) (equal i "rebuilt"))
+                                             new-comment-ids)
+                                            (make-list keep "rebuilt")))))
+                          (orgist-sort-logbook))
+                      (error nil))
+                    ;; Sync attachments from comments (download new, remove stale).
+                    (let ((new-attachment-files
+                           (when orgist-sync-attachments
+                             (condition-case err
+                                 (save-excursion
+                                   (goto-char pos)
+                                   (org-back-to-heading t)
+                                   (orgist-sync-task-attachments
+                                    task-id comments
+                                    (when snapshot
+                                      (plist-get snapshot :attachment-files))))
+                               (error
+                                (orgist-log 'warn "Failed to sync attachments for %s: %s"
+                                            task-id (error-message-string err))
+                                (when snapshot
+                                  (plist-get snapshot :attachment-files)))))))
+                      ;; Update snapshot — always update even if insertion partially
+                      ;; failed, to avoid retrying the same entries indefinitely.
+                      (when snapshot
+                        (let ((updated (copy-sequence snapshot)))
+                          (plist-put updated :comment-ids new-comment-ids)
+                          (plist-put updated :activity-ids new-activity-ids)
+                          (plist-put updated :comments-pulled t)
+                          (when orgist-sync-attachments
+                            (plist-put updated :attachment-files new-attachment-files))
+                          (puthash task-id updated orgist-snapshots)))))))))
+        ;; Clean up marker
+        (when (markerp pos) (set-marker pos nil))))))
 
 (defun orgist-download-file (url dest-path)
   "Download file from URL to DEST-PATH.
@@ -9227,18 +9231,18 @@ on success, or nil on error."
   (let ((result nil)
         (file-name (file-name-nondirectory file-path)))
     (orgist-remote
-      'upload
-      :retry t
-      :files `(("file" . ,file-path))
-      :parser 'json-read
-      :sync t
-      :error (cl-function
-              (lambda (&key data error-thrown &allow-other-keys)
-                (orgist-log 'warn "Upload failed for %s: %S (err=%S)"
-                            file-name data error-thrown)))
-      :success (cl-function
-                (lambda (&key data &allow-other-keys)
-                  (setq result data))))
+     'upload
+     :retry t
+     :files `(("file" . ,file-path))
+     :parser 'json-read
+     :sync t
+     :error (cl-function
+             (lambda (&key data error-thrown &allow-other-keys)
+               (orgist-log 'warn "Upload failed for %s: %S (err=%S)"
+                           file-name data error-thrown)))
+     :success (cl-function
+               (lambda (&key data &allow-other-keys)
+                 (setq result data))))
     result))
 
 (defun orgist-create-comment-with-attachment (task-id attachment-meta)
@@ -9247,26 +9251,26 @@ ATTACHMENT-META is the alist returned by `orgist-upload-file'.
 Returns the created comment alist, or nil on error."
   (let ((result nil))
     (orgist-remote
-      'add-comment
-      :retry t
-      :headers '(("Content-Type" . "application/json"))
-      :data (json-encode
-             `((task_id . ,task-id)
-               (content . ,(or (alist-get 'file_name attachment-meta) ""))
-               (attachment
-                . ((resource_type . "file")
-                   (file_url . ,(alist-get 'file_url attachment-meta))
-                   (file_type . ,(alist-get 'file_type attachment-meta))
-                   (file_name . ,(alist-get 'file_name attachment-meta))))))
-      :parser 'json-read
-      :sync t
-      :error (cl-function
-              (lambda (&key data error-thrown &allow-other-keys)
-                (orgist-log 'warn "Comment create failed for task %s: %S (err=%S)"
-                            task-id data error-thrown)))
-      :success (cl-function
-                (lambda (&key data &allow-other-keys)
-                  (setq result data))))
+     'add-comment
+     :retry t
+     :headers '(("Content-Type" . "application/json"))
+     :data (json-encode
+            `((task_id . ,task-id)
+              (content . ,(or (alist-get 'file_name attachment-meta) ""))
+              (attachment
+               . ((resource_type . "file")
+                  (file_url . ,(alist-get 'file_url attachment-meta))
+                  (file_type . ,(alist-get 'file_type attachment-meta))
+                  (file_name . ,(alist-get 'file_name attachment-meta))))))
+     :parser 'json-read
+     :sync t
+     :error (cl-function
+             (lambda (&key data error-thrown &allow-other-keys)
+               (orgist-log 'warn "Comment create failed for task %s: %S (err=%S)"
+                           task-id data error-thrown)))
+     :success (cl-function
+               (lambda (&key data &allow-other-keys)
+                 (setq result data))))
     result))
 
 (defun orgist-delete-comment (comment-id)
@@ -9274,20 +9278,20 @@ Returns the created comment alist, or nil on error."
 Returns non-nil on success."
   (let ((ok nil))
     (orgist-remote
-      'delete-comment
-      :path (list comment-id)
-      :retry t
-      :sync t
-      :error (cl-function
-              (lambda (&key data error-thrown &allow-other-keys)
-                (let ((code (orgist--http-error-code error-thrown)))
-                  (if (memq code '(404 410))
-                      (progn (orgist-log 'debug "Comment %s already gone" comment-id)
-                             (setq ok t))
-                    (orgist-log 'warn "Comment delete failed for %s: %S (err=%S)"
-                                comment-id data error-thrown)))))
-      :success (cl-function
-                (lambda (&rest _) (setq ok t))))
+     'delete-comment
+     :path (list comment-id)
+     :retry t
+     :sync t
+     :error (cl-function
+             (lambda (&key data error-thrown &allow-other-keys)
+               (let ((code (orgist--http-error-code error-thrown)))
+                 (if (memq code '(404 410))
+                     (progn (orgist-log 'debug "Comment %s already gone" comment-id)
+                            (setq ok t))
+                   (orgist-log 'warn "Comment delete failed for %s: %S (err=%S)"
+                               comment-id data error-thrown)))))
+     :success (cl-function
+               (lambda (&rest _) (setq ok t))))
     ok))
 
 ;;; Metadata comments (non-Todoist property preservation)
@@ -9393,19 +9397,19 @@ Point must be on the heading."
 Returns the created comment alist, or nil on error."
   (let ((result nil))
     (orgist-remote
-      'add-comment
-      :retry t
-      :headers '(("Content-Type" . "application/json"))
-      :data (json-encode `((task_id . ,task-id) (content . ,content)))
-      :parser 'json-read
-      :sync t
-      :error (cl-function
-              (lambda (&key data error-thrown &allow-other-keys)
-                (orgist-log 'warn "Metadata comment create failed for %s: %S (err=%S)"
-                            task-id data error-thrown)))
-      :success (cl-function
-                (lambda (&key data &allow-other-keys)
-                  (setq result data))))
+     'add-comment
+     :retry t
+     :headers '(("Content-Type" . "application/json"))
+     :data (json-encode `((task_id . ,task-id) (content . ,content)))
+     :parser 'json-read
+     :sync t
+     :error (cl-function
+             (lambda (&key data error-thrown &allow-other-keys)
+               (orgist-log 'warn "Metadata comment create failed for %s: %S (err=%S)"
+                           task-id data error-thrown)))
+     :success (cl-function
+               (lambda (&key data &allow-other-keys)
+                 (setq result data))))
     result))
 
 (defun orgist-update-metadata-comment (comment-id content)
@@ -9413,19 +9417,19 @@ Returns the created comment alist, or nil on error."
 Returns non-nil on success."
   (let ((ok nil))
     (orgist-remote
-      'update-comment
-      :path (list comment-id)
-      :retry t
-      :headers '(("Content-Type" . "application/json"))
-      :data (json-encode `((content . ,content)))
-      :parser 'json-read
-      :sync t
-      :error (cl-function
-              (lambda (&key data error-thrown &allow-other-keys)
-                (orgist-log 'warn "Metadata comment update failed for %s: %S (err=%S)"
-                            comment-id data error-thrown)))
-      :success (cl-function
-                (lambda (&rest _) (setq ok t))))
+     'update-comment
+     :path (list comment-id)
+     :retry t
+     :headers '(("Content-Type" . "application/json"))
+     :data (json-encode `((content . ,content)))
+     :parser 'json-read
+     :sync t
+     :error (cl-function
+             (lambda (&key data error-thrown &allow-other-keys)
+               (orgist-log 'warn "Metadata comment update failed for %s: %S (err=%S)"
+                           comment-id data error-thrown)))
+     :success (cl-function
+               (lambda (&rest _) (setq ok t))))
     ok))
 
 (defun orgist-sync-metadata-comments (commands &optional temp-id-mapping)
@@ -9568,125 +9572,125 @@ When FORCE is nil (auto-pull after sync), only pulls for tasks
 that haven't been pulled yet.  When FORCE is non-nil (manual
 `orgist-pull-comments'), pulls for all tasks."
   (catch 'orgist-early-return
-  (unless orgist-snapshots
-    (orgist-load-snapshots))
-  ;; Skip if a comments pull is already running (it can take 20+ min).
-  ;; Only force-pull (M-x orgist-pull-comments) restarts.
-  (when-let* ((old (get-process "orgist-comments")))
-    (when (process-live-p old)
-      (if force
-          (progn
-            (orgist-log 'debug "Killing previous comments subprocess")
-            (delete-process old))
-        (orgist-log 'debug "Comments subprocess already running, skipping")
-        (throw 'orgist-early-return nil))))
-  (let ((task-ids '()))
-    (maphash (lambda (id snap)
-               (unless (or (plist-get snap :section-p)
-                           (and (not force)
-                                (plist-get snap :comments-pulled)))
-                 (push id task-ids)))
-             orgist-snapshots)
-    (setq task-ids (nreverse task-ids))
-    (if (null task-ids)
-        (orgist-log 'debug "Comments: nothing to pull%s"
-                    (if force "" " (all tasks already pulled)"))
-    (let* ((ids-file (expand-file-name "comments-task-ids.json" orgist-base-dir))
-           (done-file (expand-file-name "comments-done" orgist-base-dir)))
-    ;; Write task IDs to temp file
-      (with-temp-file ids-file
-        (insert (json-encode (vconcat task-ids))))
-    (orgist-log 'debug "Spawning comments subprocess for %d tasks" (length task-ids))
-    (orgist-log 'debug "Orgist: pulling comments for %d tasks in background..."
-                (length task-ids))
-    (orgist--history-checkpoint "Before comments pull: local state")
-    (orgist--run-subprocess
-     (list
-      :name "orgist-comments"
-      :data-files (list ids-file)
-      :done-file done-file
-      :needs-http t
-      :extra-settings `((setq orgist-sync-attachments ,orgist-sync-attachments))
-      :open-org-files t
-      :job-body `(;; Read task ID list
-                  (let* ((json-array-type 'list)
-                         (ids (json-read-file ,ids-file))
-                         (total (length ids))
-                         (count 0)
-                         (skipped 0)
-                         (errors 0)
-                         (start-time (float-time))
-                         (last-progress-time start-time))
-                    (message "Orgist [INFO] Comments: starting (%d tasks)" total)
-                    (dolist (task-id ids)
-                      (setq count (1+ count))
-                      ;; Progress: every 25 tasks, every 30s, or at the end.
-                      ;; Count-based and timer-based checks share one cooldown
-                      ;; to avoid near-simultaneous duplicate lines.
-                      (let ((now (float-time)))
-                        (when (or (<= total 20)
-                                  (and (= (% count 25) 0)
-                                       (>= (- now last-progress-time) 5.0))
-                                  (>= (- now last-progress-time) 30.0)
-                                  (= count total))
-                          (let* ((elapsed (- now start-time))
-                                 (rate (if (> elapsed 0)
-                                          (/ (float count) elapsed) 0))
-                                 (remaining (if (> rate 0)
-                                                (/ (float (- total count)) rate)
-                                              0))
-                                 (elapsed-m (floor (/ elapsed 60)))
-                                 (elapsed-s (floor (mod elapsed 60)))
-                                 (eta-m (floor (/ remaining 60)))
-                                 (eta-s (floor (mod remaining 60))))
-                            (message "Orgist [INFO] Comments: [%d/%d] %dm%02ds elapsed, ~%dm%02ds left (%.1f/min, %d skipped)"
-                                     count total elapsed-m elapsed-s
-                                     eta-m eta-s (* rate 60) skipped))
-                          (setq last-progress-time now)))
-                      (condition-case err
-                          (let* ((snap (gethash task-id orgist-snapshots))
-                                 (nc (when snap (plist-get snap :note-count))))
-                            (if (and nc (= nc 0)
-                                     (plist-get snap :comments-pulled))
-                                (setq skipped (1+ skipped))
-                              (orgist-sync-task-comments-and-activity task-id)))
-                        (error
-                         (setq errors (1+ errors))
-                         (let ((name (when-let* ((s (gethash task-id orgist-snapshots)))
-                                       (plist-get s :content))))
-                           (message "Orgist [WARN] Comments: error on %s%s: %s"
-                                    task-id
-                                    (if name (format " (%s)" name) "")
-                                    (error-message-string err)))))
-                      ;; Rate limiting
-                      (sleep-for 0.1))
-                    ;; Save all buffers and snapshots.
-                    ;; Update the visited-file modtime before saving so
-                    ;; Emacs doesn't prompt "file has changed since visited"
-                    ;; when the main process reverted/saved the file during
-                    ;; the subprocess run.
-                    (dolist (buf (buffer-list))
-                      (when (and (buffer-file-name buf)
-                                 (buffer-modified-p buf))
-                        (with-current-buffer buf
-                          (set-visited-file-modtime)
-                          (save-buffer))))
-                    (orgist-save-snapshots)
-                    (let* ((total-time (- (float-time) start-time))
-                           (minutes (floor (/ total-time 60)))
-                           (seconds (floor (mod total-time 60))))
-                      (with-temp-file ,done-file
-                        (insert (format "%d\n" (- total skipped))))
-                      (message "Orgist [INFO] Comments: complete — %d tasks in %dm%02ds (%d skipped, %d errors)"
-                               total minutes seconds skipped errors))))
-      :on-success (lambda (count)
-                    (when (and count (> count 0))
-                      (orgist--history-checkpoint
-                       (format "Comments pull: %d task(s)" count))
-                      (message "Orgist: comments: %d tasks synced" count)))
-      :on-failure (lambda (event)
-                    (message "Orgist: comments sync failed — %s"
-                             (string-trim event))))))))))
+    (unless orgist-snapshots
+      (orgist-load-snapshots))
+    ;; Skip if a comments pull is already running (it can take 20+ min).
+    ;; Only force-pull (M-x orgist-pull-comments) restarts.
+    (when-let* ((old (get-process "orgist-comments")))
+      (when (process-live-p old)
+        (if force
+            (progn
+              (orgist-log 'debug "Killing previous comments subprocess")
+              (delete-process old))
+          (orgist-log 'debug "Comments subprocess already running, skipping")
+          (throw 'orgist-early-return nil))))
+    (let ((task-ids '()))
+      (maphash (lambda (id snap)
+                 (unless (or (plist-get snap :section-p)
+                             (and (not force)
+                                  (plist-get snap :comments-pulled)))
+                   (push id task-ids)))
+               orgist-snapshots)
+      (setq task-ids (nreverse task-ids))
+      (if (null task-ids)
+          (orgist-log 'debug "Comments: nothing to pull%s"
+                      (if force "" " (all tasks already pulled)"))
+        (let* ((ids-file (expand-file-name "comments-task-ids.json" orgist-base-dir))
+               (done-file (expand-file-name "comments-done" orgist-base-dir)))
+          ;; Write task IDs to temp file
+          (with-temp-file ids-file
+            (insert (json-encode (vconcat task-ids))))
+          (orgist-log 'debug "Spawning comments subprocess for %d tasks" (length task-ids))
+          (orgist-log 'debug "Orgist: pulling comments for %d tasks in background..."
+                      (length task-ids))
+          (orgist--history-checkpoint "Before comments pull: local state")
+          (orgist--run-subprocess
+           (list
+            :name "orgist-comments"
+            :data-files (list ids-file)
+            :done-file done-file
+            :needs-http t
+            :extra-settings `((setq orgist-sync-attachments ,orgist-sync-attachments))
+            :open-org-files t
+            :job-body `(;; Read task ID list
+                        (let* ((json-array-type 'list)
+                               (ids (json-read-file ,ids-file))
+                               (total (length ids))
+                               (count 0)
+                               (skipped 0)
+                               (errors 0)
+                               (start-time (float-time))
+                               (last-progress-time start-time))
+                          (message "Orgist [INFO] Comments: starting (%d tasks)" total)
+                          (dolist (task-id ids)
+                            (setq count (1+ count))
+                            ;; Progress: every 25 tasks, every 30s, or at the end.
+                            ;; Count-based and timer-based checks share one cooldown
+                            ;; to avoid near-simultaneous duplicate lines.
+                            (let ((now (float-time)))
+                              (when (or (<= total 20)
+                                        (and (= (% count 25) 0)
+                                             (>= (- now last-progress-time) 5.0))
+                                        (>= (- now last-progress-time) 30.0)
+                                        (= count total))
+                                (let* ((elapsed (- now start-time))
+                                       (rate (if (> elapsed 0)
+                                                 (/ (float count) elapsed) 0))
+                                       (remaining (if (> rate 0)
+                                                      (/ (float (- total count)) rate)
+                                                    0))
+                                       (elapsed-m (floor (/ elapsed 60)))
+                                       (elapsed-s (floor (mod elapsed 60)))
+                                       (eta-m (floor (/ remaining 60)))
+                                       (eta-s (floor (mod remaining 60))))
+                                  (message "Orgist [INFO] Comments: [%d/%d] %dm%02ds elapsed, ~%dm%02ds left (%.1f/min, %d skipped)"
+                                           count total elapsed-m elapsed-s
+                                           eta-m eta-s (* rate 60) skipped))
+                                (setq last-progress-time now)))
+                            (condition-case err
+                                (let* ((snap (gethash task-id orgist-snapshots))
+                                       (nc (when snap (plist-get snap :note-count))))
+                                  (if (and nc (= nc 0)
+                                           (plist-get snap :comments-pulled))
+                                      (setq skipped (1+ skipped))
+                                    (orgist-sync-task-comments-and-activity task-id)))
+                              (error
+                               (setq errors (1+ errors))
+                               (let ((name (when-let* ((s (gethash task-id orgist-snapshots)))
+                                             (plist-get s :content))))
+                                 (message "Orgist [WARN] Comments: error on %s%s: %s"
+                                          task-id
+                                          (if name (format " (%s)" name) "")
+                                          (error-message-string err)))))
+                            ;; Rate limiting
+                            (sleep-for 0.1))
+                          ;; Save all buffers and snapshots.
+                          ;; Update the visited-file modtime before saving so
+                          ;; Emacs doesn't prompt "file has changed since visited"
+                          ;; when the main process reverted/saved the file during
+                          ;; the subprocess run.
+                          (dolist (buf (buffer-list))
+                            (when (and (buffer-file-name buf)
+                                       (buffer-modified-p buf))
+                              (with-current-buffer buf
+                                (set-visited-file-modtime)
+                                (save-buffer))))
+                          (orgist-save-snapshots)
+                          (let* ((total-time (- (float-time) start-time))
+                                 (minutes (floor (/ total-time 60)))
+                                 (seconds (floor (mod total-time 60))))
+                            (with-temp-file ,done-file
+                              (insert (format "%d\n" (- total skipped))))
+                            (message "Orgist [INFO] Comments: complete — %d tasks in %dm%02ds (%d skipped, %d errors)"
+                                     total minutes seconds skipped errors))))
+            :on-success (lambda (count)
+                          (when (and count (> count 0))
+                            (orgist--history-checkpoint
+                             (format "Comments pull: %d task(s)" count))
+                            (message "Orgist: comments: %d tasks synced" count)))
+            :on-failure (lambda (event)
+                          (message "Orgist: comments sync failed — %s"
+                                   (string-trim event))))))))))
 
 
 ;;; Project comments
@@ -9696,24 +9700,24 @@ that haven't been pulled yet.  When FORCE is non-nil (manual
 Returns a list of comment alists, or nil on error."
   (let ((result nil))
     (orgist-remote
-      'comments
-      :params `(("project_id" . ,project-id))
-      :parser 'json-read
-      :sync t
-      :error (cl-function
-              (lambda (&key data error-thrown &allow-other-keys)
-                (let ((code (orgist--http-error-code error-thrown)))
-                  (if (memq code '(403 404 410))
-                      (orgist-log 'debug "Project comments: %s returned HTTP %s"
-                                  project-id code)
-                    (orgist-log 'warn "Project comments API error for %s: %S"
-                                project-id data)))))
-      :success (cl-function
-                (lambda (&key data &allow-other-keys)
-                  (let ((comments (if (and (listp data) (assq 'results data))
-                                      (alist-get 'results data)
-                                    data)))
-                    (setq result (append comments nil))))))
+     'comments
+     :params `(("project_id" . ,project-id))
+     :parser 'json-read
+     :sync t
+     :error (cl-function
+             (lambda (&key data error-thrown &allow-other-keys)
+               (let ((code (orgist--http-error-code error-thrown)))
+                 (if (memq code '(403 404 410))
+                     (orgist-log 'debug "Project comments: %s returned HTTP %s"
+                                 project-id code)
+                   (orgist-log 'warn "Project comments API error for %s: %S"
+                               project-id data)))))
+     :success (cl-function
+               (lambda (&key data &allow-other-keys)
+                 (let ((comments (if (and (listp data) (assq 'results data))
+                                     (alist-get 'results data)
+                                   data)))
+                   (setq result (append comments nil))))))
     result))
 
 (defun orgist-sync-project-comments (project-id buf)
@@ -9772,111 +9776,111 @@ Fetches archived completed tasks from the Todoist API and inserts
 them as DONE headings.  When FORCE is non-nil (manual pull),
 uses the full lookback window instead of last pull timestamp."
   (catch 'orgist-early-return
-  (unless orgist-snapshots
-    (orgist-load-snapshots))
-  ;; Skip if already running
-  (when-let* ((old (get-process "orgist-completed")))
-    (when (process-live-p old)
-      (if force
-          (progn
-            (orgist-log 'debug "Killing previous completed-tasks subprocess")
-            (delete-process old))
-        (orgist-log 'debug "Completed-tasks subprocess already running, skipping")
-        (throw 'orgist-early-return nil))))
-  ;; Check plan limits
-  (unless (orgist-completed-tasks-available-p)
-    (orgist-log 'debug "Completed tasks not available on current plan")
-    (throw 'orgist-early-return nil))
-  ;; Compute time range
-  (let* ((until-time (format-time-string "%Y-%m-%dT%H:%M:%SZ" nil t))
-         (last-pull (and (not force) (orgist-load-completed-pull-timestamp)))
-         (since-time (or last-pull
-                         (format-time-string
-                          "%Y-%m-%dT%H:%M:%SZ"
-                          (time-subtract nil (* orgist-completed-tasks-since-days
-                                                86400))
-                          t)))
-         (config-file (expand-file-name "completed-config.json" orgist-base-dir))
-         (done-file (expand-file-name "completed-done" orgist-base-dir)))
-    ;; Write config
-    (with-temp-file config-file
-      (insert (json-encode `((since . ,since-time) (until . ,until-time)))))
-    (orgist-log 'debug "Spawning completed-tasks subprocess (since %s)" since-time)
-    (orgist-log 'debug "Orgist: pulling completed tasks in background...")
-    (orgist--history-checkpoint "Before completed-tasks pull: local state")
-    (orgist--run-subprocess
-     (list
-      :name "orgist-completed"
-      :data-files (list config-file)
-      :done-file done-file
-      :needs-http t
-      :extra-settings nil
-      :open-org-files t
-      :job-body `(;; Read config
-                  (let* ((json-object-type 'alist)
-                         (json-key-type 'symbol)
-                         (config (json-read-file ,config-file))
-                         (since (alist-get 'since config))
-                         (until (alist-get 'until config))
-                         (start-time (float-time)))
-                    ;; Fetch archived sections first so completed
-                    ;; tasks can find their parent sections.
-                    ;; Only insert sections that don't already exist in
-                    ;; their project buffer — re-processing existing ones
-                    ;; would mark buffers dirty via org-mode setters even
-                    ;; when nothing changed.
-                    (let* ((archived-sections (orgist-fetch-archived-sections))
-                           (new-sections
-                            (seq-filter
-                             (lambda (s)
-                               (let* ((sid (alist-get 'id s))
-                                      (pid (alist-get 'project_id s))
-                                      (buf (orgist-get-project-buffer pid)))
-                                 (not (and buf
-                                           (with-current-buffer buf
-                                             (orgist-find-element-by-id sid))))))
-                             archived-sections)))
-                      (when new-sections
-                        (message "Orgist [DEBUG] Inserting %d new archived section(s) (of %d total)"
-                                 (length new-sections) (length archived-sections))
-                        (orgist-update-elements new-sections 'section)))
-                    (message "Orgist [DEBUG] Completed tasks: fetching since %s" since)
-                    (let ((tasks (orgist-fetch-completed-tasks since until)))
-                      (message "Orgist [DEBUG] Completed tasks: %d tasks fetched"
-                               (length tasks))
-                      ;; Run even with no new tasks when earlier pulls
-                      ;; left unplaced completions awaiting retry.
-                      (when (or tasks (file-exists-p (orgist--completed-retry-file)))
-                        (orgist-process-completed-tasks tasks))
-                      ;; Save buffers and snapshots
-                      (dolist (buf (buffer-list))
-                        (when (and (buffer-file-name buf)
-                                   (buffer-modified-p buf))
-                          (with-current-buffer buf (save-buffer))))
-                      (orgist-save-snapshots)
-                      (orgist-save-completed-pull-timestamp)
-                      (let* ((total-time (- (float-time) start-time))
-                             (minutes (floor (/ total-time 60)))
-                             (seconds (floor (mod total-time 60))))
-                        (with-temp-file ,done-file
-                          (insert (format "%d\n" (length tasks))))
-                        (if (length> tasks 0)
-                            (message "Orgist [INFO] Completed tasks: done — %d tasks in %dm%02ds"
-                                     (length tasks) minutes seconds)
-                          (message "Orgist [DEBUG] Completed tasks: done — 0 tasks in %dm%02ds"
-                                   minutes seconds))))))
-      :on-success (lambda (count)
-                    (when (and count (> count 0))
-                      (orgist--history-checkpoint
-                       (format "Completed-tasks pull: %d task(s)" count))
-                      (message "Orgist: completed tasks: %d synced" count))
-                    ;; Chain comments pull if enabled (covers both active
-                    ;; and newly-inserted completed tasks in one pass)
-                    (when orgist-sync-comments
-                      (orgist--subprocess-comments-pull)))
-      :on-failure (lambda (event)
-                    (message "Orgist: completed tasks sync failed — %s"
-                             (string-trim event))))))))
+    (unless orgist-snapshots
+      (orgist-load-snapshots))
+    ;; Skip if already running
+    (when-let* ((old (get-process "orgist-completed")))
+      (when (process-live-p old)
+        (if force
+            (progn
+              (orgist-log 'debug "Killing previous completed-tasks subprocess")
+              (delete-process old))
+          (orgist-log 'debug "Completed-tasks subprocess already running, skipping")
+          (throw 'orgist-early-return nil))))
+    ;; Check plan limits
+    (unless (orgist-completed-tasks-available-p)
+      (orgist-log 'debug "Completed tasks not available on current plan")
+      (throw 'orgist-early-return nil))
+    ;; Compute time range
+    (let* ((until-time (format-time-string "%Y-%m-%dT%H:%M:%SZ" nil t))
+           (last-pull (and (not force) (orgist-load-completed-pull-timestamp)))
+           (since-time (or last-pull
+                           (format-time-string
+                            "%Y-%m-%dT%H:%M:%SZ"
+                            (time-subtract nil (* orgist-completed-tasks-since-days
+                                                  86400))
+                            t)))
+           (config-file (expand-file-name "completed-config.json" orgist-base-dir))
+           (done-file (expand-file-name "completed-done" orgist-base-dir)))
+      ;; Write config
+      (with-temp-file config-file
+        (insert (json-encode `((since . ,since-time) (until . ,until-time)))))
+      (orgist-log 'debug "Spawning completed-tasks subprocess (since %s)" since-time)
+      (orgist-log 'debug "Orgist: pulling completed tasks in background...")
+      (orgist--history-checkpoint "Before completed-tasks pull: local state")
+      (orgist--run-subprocess
+       (list
+        :name "orgist-completed"
+        :data-files (list config-file)
+        :done-file done-file
+        :needs-http t
+        :extra-settings nil
+        :open-org-files t
+        :job-body `(;; Read config
+                    (let* ((json-object-type 'alist)
+                           (json-key-type 'symbol)
+                           (config (json-read-file ,config-file))
+                           (since (alist-get 'since config))
+                           (until (alist-get 'until config))
+                           (start-time (float-time)))
+                      ;; Fetch archived sections first so completed
+                      ;; tasks can find their parent sections.
+                      ;; Only insert sections that don't already exist in
+                      ;; their project buffer — re-processing existing ones
+                      ;; would mark buffers dirty via org-mode setters even
+                      ;; when nothing changed.
+                      (let* ((archived-sections (orgist-fetch-archived-sections))
+                             (new-sections
+                              (seq-filter
+                               (lambda (s)
+                                 (let* ((sid (alist-get 'id s))
+                                        (pid (alist-get 'project_id s))
+                                        (buf (orgist-get-project-buffer pid)))
+                                   (not (and buf
+                                             (with-current-buffer buf
+                                               (orgist-find-element-by-id sid))))))
+                               archived-sections)))
+                        (when new-sections
+                          (message "Orgist [DEBUG] Inserting %d new archived section(s) (of %d total)"
+                                   (length new-sections) (length archived-sections))
+                          (orgist-update-elements new-sections 'section)))
+                      (message "Orgist [DEBUG] Completed tasks: fetching since %s" since)
+                      (let ((tasks (orgist-fetch-completed-tasks since until)))
+                        (message "Orgist [DEBUG] Completed tasks: %d tasks fetched"
+                                 (length tasks))
+                        ;; Run even with no new tasks when earlier pulls
+                        ;; left unplaced completions awaiting retry.
+                        (when (or tasks (file-exists-p (orgist--completed-retry-file)))
+                          (orgist-process-completed-tasks tasks))
+                        ;; Save buffers and snapshots
+                        (dolist (buf (buffer-list))
+                          (when (and (buffer-file-name buf)
+                                     (buffer-modified-p buf))
+                            (with-current-buffer buf (save-buffer))))
+                        (orgist-save-snapshots)
+                        (orgist-save-completed-pull-timestamp)
+                        (let* ((total-time (- (float-time) start-time))
+                               (minutes (floor (/ total-time 60)))
+                               (seconds (floor (mod total-time 60))))
+                          (with-temp-file ,done-file
+                            (insert (format "%d\n" (length tasks))))
+                          (if (length> tasks 0)
+                              (message "Orgist [INFO] Completed tasks: done — %d tasks in %dm%02ds"
+                                       (length tasks) minutes seconds)
+                            (message "Orgist [DEBUG] Completed tasks: done — 0 tasks in %dm%02ds"
+                                     minutes seconds))))))
+        :on-success (lambda (count)
+                      (when (and count (> count 0))
+                        (orgist--history-checkpoint
+                         (format "Completed-tasks pull: %d task(s)" count))
+                        (message "Orgist: completed tasks: %d synced" count))
+                      ;; Chain comments pull if enabled (covers both active
+                      ;; and newly-inserted completed tasks in one pass)
+                      (when orgist-sync-comments
+                        (orgist--subprocess-comments-pull)))
+        :on-failure (lambda (event)
+                      (message "Orgist: completed tasks sync failed — %s"
+                               (string-trim event))))))))
 
 
 ;;;###autoload
@@ -9900,20 +9904,20 @@ pull the result into the appropriate org buffer."
   (let ((result nil))
     ;; Never retried: a retry after a timeout could create the task twice.
     (orgist-remote
-      'quick-add
-      :headers '(("Content-Type" . "application/json"))
-      :data (json-encode `((text . ,text)
-                           (meta . t)
-                           (auto_reminder . t)))
-      :parser 'json-read
-      :sync t
-      :error (cl-function
-              (lambda (&key data error-thrown &allow-other-keys)
-                (orgist-log 'warn "Quick-add failed: %S (err=%S)" data error-thrown)
-                (message "Orgist: quick-add failed — %S" error-thrown)))
-      :success (cl-function
-                (lambda (&key data &allow-other-keys)
-                  (setq result data))))
+     'quick-add
+     :headers '(("Content-Type" . "application/json"))
+     :data (json-encode `((text . ,text)
+                          (meta . t)
+                          (auto_reminder . t)))
+     :parser 'json-read
+     :sync t
+     :error (cl-function
+             (lambda (&key data error-thrown &allow-other-keys)
+               (orgist-log 'warn "Quick-add failed: %S (err=%S)" data error-thrown)
+               (message "Orgist: quick-add failed — %S" error-thrown)))
+     :success (cl-function
+               (lambda (&key data &allow-other-keys)
+                 (setq result data))))
     (if result
         (progn
           (orgist-log 'debug "Quick-add created task: %s (id=%s)"
