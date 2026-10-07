@@ -15,6 +15,7 @@
     (add-to-list 'load-path (expand-file-name dir))))
 (add-to-list 'load-path default-directory)
 (require 'test-isolation)
+(require 'orgist)
 (let ((script-dir (file-name-directory (or load-file-name buffer-file-name))))
   (load (expand-file-name "orgist.el" script-dir) nil nil t))
 (require 'json)
@@ -437,7 +438,7 @@ comments instead of skipping due to note_count=0 optimization."
       :parser 'json-read
       :sync t
       :error (cl-function
-              (lambda (&key error-thrown &allow-other-keys)
+              (lambda (&key &allow-other-keys)
                 ;; 404/410 means deleted — good
                 nil))
       :success (cl-function

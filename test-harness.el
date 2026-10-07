@@ -15,6 +15,7 @@
     (add-to-list 'load-path (expand-file-name dir))))
 (add-to-list 'load-path default-directory)
 (require 'test-isolation)
+(require 'orgist)
 ;; Explicitly load orgist.el source (not byte-compiled .elc from elpaca)
 (let ((script-dir (file-name-directory (or load-file-name buffer-file-name))))
   (load (expand-file-name "orgist.el" script-dir) nil nil t))
@@ -65,7 +66,7 @@
       (catch 'found
         (dolist (file (directory-files orgist-base-dir t "\\`[^.].*\\.org\\'"))
           (with-current-buffer (find-file-noselect file)
-            (when-let ((id (org-entry-get (point-min) "ID" t)))
+            (when-let* ((id (org-entry-get (point-min) "ID" t)))
               (throw 'found id))))
         nil)))
 
@@ -84,7 +85,7 @@
           (with-current-buffer (find-file-noselect file)
             (org-map-entries
              (lambda ()
-               (when-let ((id (and (org-entry-get nil "SECTION")
+               (when-let* ((id (and (org-entry-get nil "SECTION")
                                    (org-entry-get nil "ID"))))
                  (throw 'found id)))
              nil 'file)))
@@ -407,8 +408,9 @@ ORIG-FN is the original `request', URL is the endpoint, ARGS are kwargs."
 
 (defun orgist-test-setup-isolation (project-name)
   "Set up isolated test environment for PROJECT-NAME.
-Shared JSON cache lives in test-data/ (replay) or test-data/<Project>/ (record).
-Runtime artifacts (org files, token, snapshots) go to /tmp/orgist-test/<Project>/."
+Shared JSON cache lives in test-data/ (replay) or test-data/<Project>/
+(record).
+Runtime artifacts go to orgist-test/<Project>/ under the temp directory."
   (let* ((script-dir (file-name-directory (or load-file-name buffer-file-name)))
          (test-data-dir (expand-file-name "test-data/" script-dir))
          (runtime-dir (expand-file-name
@@ -2488,7 +2490,7 @@ Creates synthetic Todoist data and verifies exact formatting of:
                 (save-excursion
                   (goto-char (orgist-find-element-by-id parent-id))
                   (org-entry-delete (point) "TODOIST-ORDER"))
-                (when-let ((snap (gethash parent-id orgist-snapshots)))
+                (when-let* ((snap (gethash parent-id orgist-snapshots)))
                   (puthash parent-id (plist-put snap :order nil) orgist-snapshots)))
               (orgist-test-assert
                (and parent-id
@@ -2966,7 +2968,7 @@ Phase 5: New Note detection and note_add command generation"
       (when pos
         (save-excursion
           (goto-char pos)
-          (let ((subtree-end (save-excursion (org-end-of-subtree t t) (point)))
+          (let ((_subtree-end (save-excursion (org-end-of-subtree t t) (point)))
                 (content (buffer-substring-no-properties
                           pos (save-excursion (org-end-of-subtree t t) (point)))))
             ;; Check that Note entries were inserted
@@ -4362,7 +4364,7 @@ org file has:
 
         ;; 1. Check e-acute (U+00E9) is encoded as c3 a9
         (orgist-test-assert
-         (let ((pos (seq-position raw-bytes ?\x63))  ; 'c' in 'claration'
+         (let ((_pos (seq-position raw-bytes ?\x63))  ; 'c' in 'claration'
                (found nil))
            ;; Search for the byte sequence c3 a9 63 6c (é c l)
            (dotimes (i (- (length raw-bytes) 3))
@@ -4930,7 +4932,8 @@ Creates a test task, verifies it, then deletes it."
 ;;; ============================================================
 
 (defun orgist-test-run-attachments ()
-  "Test attachment sync: ATTACH tag filtering, pull, push, diff, non-TODO children."
+  "Test attachment sync: ATTACH tag filtering, pull, push, diff, non-TODO
+children."
   (setq orgist-test--failures 0)
   (setq orgist-test--passes 0)
   (message "")
@@ -5540,7 +5543,7 @@ Creates a test task, verifies it, then deletes it."
              (upload-cmds (seq-filter
                            (lambda (c) (equal (alist-get 'type c) "attachment_upload"))
                            commands))
-             (delete-cmds (seq-filter
+             (_delete-cmds (seq-filter
                            (lambda (c) (equal (alist-get 'type c) "attachment_delete"))
                            commands)))
         (orgist-test-assert
@@ -6184,7 +6187,7 @@ CLOSED: [2026-03-17 Tue 12:43]
     (when-let* ((buf (find-buffer-visiting file)))
       (with-current-buffer buf (orgist-build-id-cache))))
   ;; Add :ARCHIVE: tag to an active section
-  (let ((active-pos (when-let ((active-section-id
+  (let ((active-pos (when-let* ((active-section-id
                                (orgist-test--runtime-section-id)))
                       (orgist-find-element-by-id active-section-id))))
     (when active-pos
