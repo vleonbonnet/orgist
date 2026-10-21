@@ -1480,8 +1480,43 @@ snapshot changes must not be merged."
                  (not (equal (orgist--file-text staged) (orgist--file-text (car state)))))
         (copy-file staged (car state) t)))))
 
+(defun orgist--subprocess-output-relay (name token)
+  "Return a function relaying the output of subprocess NAME.
+Called with a chunk of output, the function logs each complete line
+and shows the subprocess's ERROR, WARN and INFO lines; called with
+nil, it does the same for the incomplete line left over.  A line can
+arrive split across chunks, so it is only looked at once complete.
+TOKEN is replaced in every line: a backtrace prints the arguments of
+a failed request, its authorization header included."
+  (let ((partial ""))
+    (cl-flet ((relay (line)
+                (when (and (stringp token) (length> token 0))
+                  (setq line (string-replace token "<orgist-bearer-token>" line)))
+                (orgist-log 'debug "%s: %s" name line)
+                (cond
+                 ((string-match "\\`Orgist \\[ERROR\\] \\(.*\\)" line)
+                  (message "Orgist [ERROR] %s" (match-string 1 line)))
+                 ((string-match "\\`Orgist \\[WARN\\] \\(.*\\)" line)
+                  (message "Orgist [WARN] %s" (match-string 1 line)))
+                 ((string-match "\\`Orgist \\[INFO\\] \\(.*\\)" line)
+                  (message "Orgist: %s" (match-string 1 line))))))
+      (lambda (output)
+        ;; Errors here must not cascade: the sentinel handles failures.
+        (condition-case err
+            (let ((lines (if output
+                             (split-string (concat partial output) "\n")
+                           (list partial ""))))
+              (setq partial (car (last lines)))
+              (dolist (line (butlast lines))
+                (unless (string-empty-p line)
+                  (relay line))))
+          (error
+           (message "Orgist: %s filter error: %S" name err)))))))
+
 (defun orgist--run-subprocess (plist)
   "Spawn an Emacs subprocess with shared boilerplate.
+The bearer token reaches the subprocess on its standard input, never
+on its command line, and is redacted from the output it logs.
 PLIST is a property list with these keys:
   :name          — process name string
   :data-files    — list of temp files to clean up
@@ -1491,7 +1526,8 @@ PLIST is a property list with these keys:
   :open-org-files — non-nil to open .org files and build id-caches
   :job-body      — list of sexps for the subprocess to execute
   :on-success    — function(count) called on completion
-  :on-failure    — function(event) called on failure"
+  :on-failure    — function(event) called on failure
+Return the process."
   (let* ((name (plist-get plist :name))
          (data-files (plist-get plist :data-files))
          (done-file (plist-get plist :done-file))
@@ -1531,6 +1567,7 @@ PLIST is a property list with these keys:
          (review-dir (when-let* ((f (symbol-file 'org-sync-confirm-show)))
                        (file-name-directory f)))
          (token (orgist--bearer-token))
+         (relay (orgist--subprocess-output-relay name token))
          (dep-paths (seq-filter
                      (lambda (p)
                        (or (string-match-p "/request" p)
@@ -1585,7 +1622,10 @@ PLIST is a property list with these keys:
                      ;; stdout/stderr, captured by parent's process filter.
                      (setq orgist-log-file nil)
                      (setq orgist-log-level ',orgist-log-level)
-                     (setq orgist-bearer-token ,token)
+                     ;; From stdin: other processes can read a command line.
+                     (setq orgist-bearer-token
+                           (let ((line (string-trim (read-from-minibuffer ""))))
+                             (and (length> line 0) line)))
                      (setq orgist-read-only ,orgist-read-only)
                      (setq orgist-tag ,orgist-tag)
                      (setq orgist-treat-priority-4-as-none
@@ -1671,9 +1711,13 @@ PLIST is a property list with these keys:
            (make-process
             :name name
             :command (list emacs-path "-Q" "--batch" "--eval" program)
+            ;; A pty would echo the token back into the output.
+            :connection-type 'pipe
             :noquery t
+            :filter (lambda (_proc output) (funcall relay output))
             :sentinel
             (lambda (_proc event)
+              (funcall relay nil)
               (cond
                ((string-match-p "finished" event)
                 (orgist-log 'debug "%s subprocess finished" name)
@@ -1726,26 +1770,17 @@ PLIST is a property list with these keys:
                     (funcall on-failure event)
                   (message "Orgist: %s failed — %s"
                            name (string-trim event)))))))))
-      ;; Log all subprocess output to file (debug level = file only,
-      ;; not *Messages*); relay Orgist [INFO/WARN] lines to minibuffer.
-      ;; Wrap in condition-case so errors in the filter don't
-      ;; cascade (the subprocess sentinel handles the failure).
-      (set-process-filter
-       process
-       (lambda (_proc output)
-         (condition-case err
-             (dolist (line (split-string output "\n" t))
-               (when (length> line 0)
-                 (orgist-log 'debug "%s: %s" name line))
-               (cond
-                ((string-match "\\`Orgist \\[ERROR\\] \\(.*\\)" line)
-                 (message "Orgist [ERROR] %s" (match-string 1 line)))
-                ((string-match "\\`Orgist \\[WARN\\] \\(.*\\)" line)
-                 (message "Orgist [WARN] %s" (match-string 1 line)))
-                ((string-match "\\`Orgist \\[INFO\\] \\(.*\\)" line)
-                 (message "Orgist: %s" (match-string 1 line)))))
-           (error
-            (message "Orgist: %s filter error: %S" name err))))))))
+      ;; The program reads the token from stdin; ending the input makes
+      ;; any later read fail rather than wait forever.  A child that
+      ;; died already fails through its sentinel.
+      (condition-case err
+          (progn
+            (process-send-string process (concat token "\n"))
+            (process-send-eof process))
+        (error
+         (orgist-log 'warn "%s: could not pass the token: %s"
+                     name (error-message-string err))))
+      process)))
 
 (defun orgist--subprocess-pull (data)
   "Process sync DATA in a subprocess to avoid blocking the UI.

@@ -496,5 +496,124 @@ deferred file ran on into the next line and matched no snapshot."
           (should (string-match-p "Pulled\r\n" (buffer-string)))
           (should-not (string-match-p "[^\r]\n" (buffer-string))))))))
 
+;;; Subprocess token
+;;
+;; The token used to be part of the program on the subprocess's command
+;; line, which other processes can read, and a failing subprocess's
+;; backtrace printed that command line into orgist's log.
+
+(defconst orgist-test--token "tok-SECRET-123"
+  "A bearer token that must never show up in a command line or the log.")
+
+(defmacro orgist-test--relaying (&rest body)
+  "Run BODY with `orgist-log' and `message' recording.
+Binds LOGGED and MESSAGES to the texts they received, oldest first."
+  (declare (indent 0))
+  `(let ((logged nil)
+         (messages nil))
+     (cl-letf (((symbol-function 'orgist-log)
+                (lambda (_level format-string &rest args)
+                  (setq logged (append logged (list (apply #'format format-string args))))))
+               ((symbol-function 'message)
+                (lambda (format-string &rest args)
+                  (setq messages (append messages (list (apply #'format format-string args)))))))
+       ,@body)))
+
+(ert-deftest orgist-seams/relay-redacts-a-token-split-across-chunks ()
+  "Lines are only looked at once complete, so a split token is redacted too."
+  (orgist-test--relaying
+    (let ((relay (orgist--subprocess-output-relay "orgist-test" orgist-test--token)))
+      (funcall relay "one\nAuthorization: Bearer tok-SE")
+      (funcall relay "CRET-123 sent\n\nOrgist [WARN] Bad tok-SECRET-123\ntail tok-SECRET")
+      (funcall relay "-123")
+      (should (equal logged '("orgist-test: one"
+                              "orgist-test: Authorization: Bearer <orgist-bearer-token> sent"
+                              "orgist-test: Orgist [WARN] Bad <orgist-bearer-token>")))
+      (funcall relay nil)
+      (should (equal (car (last logged)) "orgist-test: tail <orgist-bearer-token>"))
+      (should (equal messages '("Orgist [WARN] Bad <orgist-bearer-token>")))
+      ;; Flushing again finds nothing left.
+      (funcall relay nil)
+      (should (= (length logged) 4)))))
+
+(ert-deftest orgist-seams/relay-without-a-token-keeps-lines ()
+  "With no token, or an empty one, lines are logged as they came."
+  (dolist (token '(nil ""))
+    (orgist-test--relaying
+      (let ((relay (orgist--subprocess-output-relay "orgist-test" token)))
+        (funcall relay "Orgist [INFO] Pulled 3 tasks\n")
+        (should (equal logged '("orgist-test: Orgist [INFO] Pulled 3 tasks")))
+        (should (equal messages '("Orgist: Pulled 3 tasks")))))))
+
+(defmacro orgist-test--with-subprocess-env (&rest body)
+  "Run BODY with orgist's files, log and token in a throwaway directory.
+Binds LOG to the log file.  Subprocesses get that directory as HOME,
+so nothing they save lands in the user's files."
+  (declare (indent 0))
+  `(let* ((orgist-base-dir (file-name-as-directory (make-temp-file "orgist-run-" t)))
+          ;; Expanded while ~ is still the user's home.
+          (default-directory (expand-file-name default-directory))
+          (load-path (mapcar #'expand-file-name load-path))
+          (orgist--directory (expand-file-name orgist--directory))
+          (orgist-history-directory nil)
+          (orgist-sync-token-filename (expand-file-name "sync_token" orgist-base-dir))
+          (orgist-snapshot-file (expand-file-name "snapshots.el" orgist-base-dir))
+          (orgist-labels-file (expand-file-name "labels.el" orgist-base-dir))
+          (orgist-snapshots nil)
+          (orgist-sole-writer nil)
+          (log (expand-file-name "orgist.log" orgist-base-dir))
+          (orgist-log-file log)
+          (orgist-bearer-token orgist-test--token)
+          (process-environment (cons (concat "HOME=" orgist-base-dir) process-environment)))
+     (unwind-protect (progn ,@body)
+       (delete-directory orgist-base-dir t))))
+
+(defun orgist-test--run-subprocess (name job-body)
+  "Run subprocess NAME with JOB-BODY, a list of forms, and wait for its sentinel.
+The job writes its done file after JOB-BODY.  Returns (PROCESS
+. OUTCOME), OUTCOME being (success COUNT) or (failure EVENT)."
+  (let* ((outcome nil)
+         (done (expand-file-name (concat name "-done") orgist-base-dir))
+         (process (orgist--run-subprocess
+                   (list :name name
+                         :data-files nil
+                         :done-file done
+                         :needs-http nil
+                         :job-body (append job-body
+                                           `((with-temp-file ,done (insert "1\n"))))
+                         :on-success (lambda (count) (setq outcome (list 'success count)))
+                         :on-failure (lambda (event) (setq outcome (list 'failure event))))))
+         (deadline (+ (float-time) 120)))
+    (while (and (not outcome) (< (float-time) deadline))
+      (accept-process-output nil 0.1))
+    (cons process outcome)))
+
+(ert-deftest orgist-seams/subprocess-token-comes-on-stdin ()
+  "The subprocess has the token, and its command line does not."
+  (orgist-test--with-subprocess-env
+    (ignore log)
+    (dolist (token (list orgist-test--token nil))
+      (let* ((orgist-bearer-token token)
+             (seen (expand-file-name "token-seen" orgist-base-dir))
+             (run (orgist-test--run-subprocess
+                   "orgist-test"
+                   `((with-temp-file ,seen (prin1 orgist-bearer-token (current-buffer)))))))
+        (should (equal (cdr run) '(success 1)))
+        (should (equal (orgist-test--file-string seen) (prin1-to-string token)))
+        (should-not (string-search orgist-test--token
+                                   (string-join (process-command (car run)) " ")))))))
+
+(ert-deftest orgist-seams/subprocess-failure-logs-no-token ()
+  "A failing subprocess's output, backtrace included, is logged without the token."
+  (orgist-test--with-subprocess-env
+    (let ((run (orgist-test--run-subprocess
+                "orgist-test"
+                '((message "Authorization: Bearer %s" orgist-bearer-token)
+                  (error "Request failed with %s" orgist-bearer-token)))))
+      (should (eq (car (cdr run)) 'failure))
+      (let ((text (orgist-test--file-string log)))
+        (should (string-search "Authorization: Bearer <orgist-bearer-token>" text))
+        (should-not (string-search orgist-test--token text))))))
+
 (provide 'test-seams)
 ;;; test-seams.el ends here

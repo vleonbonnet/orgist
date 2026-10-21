@@ -194,12 +194,7 @@ Example:
 
 ** Key Components
 
-- *API layer*: async HTTP via the =request= library to
-  =https://api.todoist.com/api/v1/sync=.  In interactive Emacs, large item
-  sets are offloaded to an =emacs --batch= subprocess so the UI stays
-  completely responsive (threshold controlled by =orgist-async-chunk-size=).
-  The subprocess runs the same sync code path as batch/test mode, writes
-  org files and snapshots to disk, then the main Emacs reverts its buffers.
+- *API layer*: async HTTP via the =request= library to =https://api.todoist.com/api/v1/sync=.  In interactive Emacs, large item sets are offloaded to an =emacs --batch= subprocess so the UI stays completely responsive (threshold controlled by =orgist-async-chunk-size=). The subprocess runs the same sync code path as batch/test mode, writes org files and snapshots to disk, then the main Emacs reverts its buffers. The API token reaches it on standard input, never on its command line, and is redacted from the subprocess output orgist logs.
 - *Buffer cache*: one Emacs buffer per org file, keyed by project ID in
   =orgist-project-buffer-cache=.
 - *ID cache*: buffer-local hash table mapping element IDs to marker positions
