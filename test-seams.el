@@ -379,7 +379,8 @@ Binds STAGING to the staging, and DIR to its directory."
             (orgist-sync-token-filename (expand-file-name "sync_token" orgist-base-dir))
             (orgist-snapshot-file (expand-file-name "snapshots.el" orgist-base-dir))
             (orgist-labels-file (expand-file-name "labels.el" orgist-base-dir))
-            (staging (orgist--stage-project-files "test"))
+            (staging (orgist--stage-project-files
+                      (expand-file-name "run/staging/" orgist-base-dir)))
             (dir (car staging)))
        ,@body)))
 
@@ -482,7 +483,8 @@ deferred file ran on into the next line and matched no snapshot."
         (write-region (orgist-test--project "PA" "TA") nil file nil 'silent))
       (let* ((orgist-log-file nil)
              (orgist-history-directory nil)
-             (staging (orgist--stage-project-files "test"))
+             (staging (orgist--stage-project-files
+                       (expand-file-name "run/staging/" orgist-base-dir)))
              (staged (expand-file-name "A.org" (car staging))))
         (with-current-buffer (find-file-noselect staged)
           (goto-char (point-max))
@@ -564,29 +566,40 @@ so nothing they save lands in the user's files."
           (log (expand-file-name "orgist.log" orgist-base-dir))
           (orgist-log-file log)
           (orgist-bearer-token orgist-test--token)
+          (orgist--subprocess-run-dirs nil)
           (process-environment (cons (concat "HOME=" orgist-base-dir) process-environment)))
      (unwind-protect (progn ,@body)
+       (dolist (process (process-list))
+         (when (string-prefix-p "orgist-test" (process-name process))
+           (delete-process process)))
        (delete-directory orgist-base-dir t))))
 
-(defun orgist-test--run-subprocess (name job-body)
-  "Run subprocess NAME with JOB-BODY, a list of forms, and wait for its sentinel.
-The job writes its done file after JOB-BODY.  Returns (PROCESS
-. OUTCOME), OUTCOME being (success COUNT) or (failure EVENT)."
-  (let* ((outcome nil)
-         (done (expand-file-name (concat name "-done") orgist-base-dir))
-         (process (orgist--run-subprocess
-                   (list :name name
-                         :data-files nil
-                         :done-file done
-                         :needs-http nil
-                         :job-body (append job-body
-                                           `((with-temp-file ,done (insert "1\n"))))
-                         :on-success (lambda (count) (setq outcome (list 'success count)))
-                         :on-failure (lambda (event) (setq outcome (list 'failure event))))))
-         (deadline (+ (float-time) 120)))
-    (while (and (not outcome) (< (float-time) deadline))
+(defun orgist-test--start-subprocess (name job-body &optional inputs)
+  "Start subprocess NAME with INPUTS and JOB-BODY, a list of forms.
+The job writes its done file after JOB-BODY.  Return a cons of the
+process and, once its sentinel ran, (success COUNT) or (failure EVENT)."
+  (let ((run (list nil)))
+    (setcar run (orgist--run-subprocess
+                 (list :name name
+                       :inputs inputs
+                       :needs-http nil
+                       :job-body (append job-body
+                                         '((with-temp-file (orgist--run-file "done")
+                                             (insert "1\n"))))
+                       :on-success (lambda (count) (setcdr run (list 'success count)))
+                       :on-failure (lambda (event) (setcdr run (list 'failure event))))))
+    run))
+
+(defun orgist-test--wait-for-run (run)
+  "Wait up to two minutes for the sentinel of RUN to have run; return RUN."
+  (let ((deadline (+ (float-time) 120)))
+    (while (and (not (cdr run)) (< (float-time) deadline))
       (accept-process-output nil 0.1))
-    (cons process outcome)))
+    run))
+
+(defun orgist-test--run-subprocess (name job-body &optional inputs)
+  "Run subprocess NAME with INPUTS and JOB-BODY; see `orgist-test--start-subprocess'."
+  (orgist-test--wait-for-run (orgist-test--start-subprocess name job-body inputs)))
 
 (ert-deftest orgist-seams/subprocess-token-comes-on-stdin ()
   "The subprocess has the token, and its command line does not."
@@ -614,6 +627,89 @@ The job writes its done file after JOB-BODY.  Returns (PROCESS
       (let ((text (orgist-test--file-string log)))
         (should (string-search "Authorization: Bearer <orgist-bearer-token>" text))
         (should-not (string-search orgist-test--token text))))))
+
+;;; Run directories
+;;
+;; Every run of a subprocess used the same input, done, state and delta
+;; files.  A completed-tasks run exited while Emacs was busy with a pull;
+;; before its sentinel ran, the next run started and wrote its input,
+;; which that sentinel then removed as its own, and the next run failed.
+
+(ert-deftest orgist-seams/overlapping-runs-keep-their-own-files ()
+  "One run ending while the next of the same subprocess runs leaves that one's files."
+  (dolist (sole-writer '(nil t))
+    (orgist-test--with-subprocess-env
+      (ignore log)
+      (with-temp-file (expand-file-name "A.org" orgist-base-dir)
+        (insert (orgist-test--project "PA" "TA")))
+      (let* ((orgist-sole-writer sole-writer)
+             (go (expand-file-name "go" orgist-base-dir))
+             (seen (expand-file-name "seen" orgist-base-dir))
+             (first (orgist-test--start-subprocess "orgist-test" nil '(("input" . "first"))))
+             (second (orgist-test--start-subprocess
+                      "orgist-test"
+                      `((let ((deadline (+ (float-time) 120)))
+                          (while (and (not (file-exists-p ,go)) (< (float-time) deadline))
+                            (sleep-for 0.05)))
+                        (with-temp-file ,seen
+                          (insert-file-contents (orgist--run-file "input"))))
+                      '(("input" . "second")))))
+        (orgist-test--wait-for-run first)
+        (should (equal (cdr first) '(success 1)))
+        ;; The second run, still waiting, has its files and its copy.
+        (should (= (length orgist--subprocess-run-dirs) 1))
+        (let ((dir (car orgist--subprocess-run-dirs)))
+          (should (file-exists-p (expand-file-name "input" dir)))
+          (should (file-exists-p (expand-file-name "state.el" dir)))
+          (should (eq (file-exists-p (expand-file-name "staging/A.org" dir))
+                      orgist-sole-writer)))
+        (with-temp-file go)
+        (orgist-test--wait-for-run second)
+        (should (equal (cdr second) '(success 1)))
+        (should (equal (orgist-test--file-string seen) "second"))
+        ;; Both runs' directories are gone, and the area with them.
+        (should-not orgist--subprocess-run-dirs)
+        (should-not (file-exists-p (expand-file-name "runs/" (orgist--safety-directory))))))))
+
+(ert-deftest orgist-seams/failed-run-removes-its-directory ()
+  "A failing run's directory goes too, and a run that cannot start leaves none."
+  (orgist-test--with-subprocess-env
+    (ignore log)
+    (let ((run (orgist-test--run-subprocess "orgist-test" '((error "Boom")))))
+      (should (eq (car (cdr run)) 'failure)))
+    (should-not orgist--subprocess-run-dirs)
+    (cl-letf (((symbol-function 'make-process)
+               (lambda (&rest _) (error "Cannot spawn"))))
+      (should-error (orgist-test--start-subprocess "orgist-test" nil)))
+    (should-not orgist--subprocess-run-dirs)
+    (should-not (file-exists-p (expand-file-name "runs/" (orgist--safety-directory))))))
+
+(ert-deftest orgist-seams/leftover-runs-are-removed ()
+  "Run directories no run holds are removed when a run starts.
+A registered one stays, and so does one of another Emacs still running."
+  (orgist-test--with-subprocess-env
+    (ignore log)
+    (let* ((runs (expand-file-name "runs/" (orgist--safety-directory)))
+           (registered (orgist--make-run-directory "orgist-test"))
+           (left (lambda (pid) (expand-file-name (format "orgist-test-%s-AbC123" pid) runs))))
+      (dolist (pid (list (emacs-pid) 4242 4243 4244 "x"))
+        (make-directory (funcall left pid) t))
+      (with-temp-file (expand-file-name "stray" runs))
+      (cl-letf (((symbol-function 'process-attributes)
+                 (lambda (pid)
+                   (pcase pid
+                     (4242 '((comm . "emacs.exe")))
+                     (4244 '((comm . "notepad.exe")))))))
+        (let ((new (orgist--make-run-directory "orgist-test")))
+          (should (equal (sort (directory-files runs nil directory-files-no-dot-files-regexp)
+                               #'string<)
+                         (sort (list (file-name-nondirectory (directory-file-name registered))
+                                     (file-name-nondirectory (directory-file-name new))
+                                     (file-name-nondirectory (funcall left 4242)))
+                               #'string<)))
+          (should (string-match-p (format "\\`orgist-test-%d-" (emacs-pid))
+                                  (file-name-nondirectory (directory-file-name new))))
+          (should (equal orgist--subprocess-run-dirs (list new registered))))))))
 
 (provide 'test-seams)
 ;;; test-seams.el ends here

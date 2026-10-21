@@ -1280,19 +1280,14 @@ without their reminder stamps and assignee names."
           (buffer-substring-no-properties (point-min) (point-max))))
     (orgist--file-text file)))
 
-(defun orgist--stage-project-files (name)
-  "Copy the project and state files to a fresh staging directory for NAME.
+(defun orgist--stage-project-files (dir)
+  "Copy the project and state files to the staging directory DIR.
 A project file is staged as its buffer holds it, unsaved edits
 included, as an in-process pull would see it.  Return (DIR . BASE):
 DIR is the directory, BASE an alist of each project file's name and
 text when staged."
-  (let ((dir (file-name-as-directory
-              (expand-file-name (concat "staging/" name) (orgist--safety-directory))))
+  (let ((dir (file-name-as-directory dir))
         (base nil))
-    ;; A leftover from an interrupted run holds nothing committed: its
-    ;; cursors were never taken over, so the next sync fetches again.
-    (when (file-directory-p dir)
-      (delete-directory dir t))
     (make-directory dir t)
     (dolist (file (orgist--project-files))
       (let ((staged (expand-file-name (file-name-nondirectory file) dir))
@@ -1451,7 +1446,7 @@ snapshot changes must not be merged."
                    (length (plist-get result :renamed)))))
     (unless deferred
       (orgist--commit-staged-state dir))
-    (orgist--remove-staging dir)
+    (delete-directory dir t)
     (cond
      (deferred
       (orgist-log 'warn "%s: took over %d file(s) in %.2fs; deferred %s, edited during the sync: its changes come with the next sync"
@@ -1463,15 +1458,6 @@ snapshot changes must not be merged."
       (orgist-log 'debug "%s: no file changed (%.2fs)" name (plist-get result :seconds))))
     (plist-get result :deferred-ids)))
 
-(defun orgist--remove-staging (dir)
-  "Delete staging directory DIR, and the staging area once empty."
-  (when (file-directory-p dir)
-    (delete-directory dir t))
-  (let ((parent (file-name-directory (directory-file-name dir))))
-    (when (and (file-directory-p parent)
-               (null (directory-files parent nil directory-files-no-dot-files-regexp)))
-      (delete-directory parent))))
-
 (defun orgist--commit-staged-state (dir)
   "Take over the state files the subprocess changed in staging DIR."
   (dolist (state (orgist--state-files))
@@ -1479,6 +1465,61 @@ snapshot changes must not be merged."
       (when (and (file-exists-p staged)
                  (not (equal (orgist--file-text staged) (orgist--file-text (car state)))))
         (copy-file staged (car state) t)))))
+
+(defvar orgist--run-directory nil
+  "In a subprocess, the directory of its run (see `orgist--run-file').")
+
+(defvar orgist--subprocess-run-dirs nil
+  "Run directories of the subprocesses whose sentinel has not finished.")
+
+(defun orgist--run-file (name)
+  "In a subprocess, return file NAME in the directory of its run."
+  (expand-file-name name orgist--run-directory))
+
+(defun orgist--leftover-run-p (dir)
+  "Return non-nil if run directory DIR belongs to no run in progress.
+Its name carries the PID of the Emacs that made it.  A directory of
+this Emacs is in progress while registered; one of another Emacs,
+while that Emacs runs."
+  (and (not (member (file-name-as-directory dir) orgist--subprocess-run-dirs))
+       (let ((pid (and (string-match "-\\([0-9]+\\)-[[:alnum:]]+\\'" dir)
+                       (string-to-number (match-string 1 dir)))))
+         (or (null pid)
+             (= pid (emacs-pid))
+             (not (string-match-p
+                   "emacs" (or (alist-get 'comm (process-attributes pid)) "")))))))
+
+(defun orgist--make-run-directory (name)
+  "Make and register a fresh directory for a run of subprocess NAME.
+The run's input, done, state and delta files and its staged copy
+live there: each run has its own, so the sentinel of one run cannot
+remove the files of a later run of the same subprocess.  Directories
+left by runs that never finished are removed first."
+  (let ((runs (expand-file-name "runs/" (orgist--safety-directory))))
+    (when (file-directory-p runs)
+      (dolist (dir (directory-files runs t directory-files-no-dot-files-regexp))
+        (when (orgist--leftover-run-p dir)
+          (condition-case err
+              (if (file-directory-p dir)
+                  (delete-directory dir t)
+                (delete-file dir))
+            (error
+             (orgist-log 'warn "Could not remove leftover run %s: %s"
+                         dir (error-message-string err)))))))
+    (make-directory runs t)
+    (car (push (file-name-as-directory
+                (make-temp-file (expand-file-name (format "%s-%d-" name (emacs-pid)) runs) t))
+               orgist--subprocess-run-dirs))))
+
+(defun orgist--remove-run-directory (dir)
+  "Delete run directory DIR and unregister it; the runs area too once empty."
+  (setq orgist--subprocess-run-dirs (delete dir orgist--subprocess-run-dirs))
+  (when (file-directory-p dir)
+    (delete-directory dir t))
+  (let ((runs (file-name-directory (directory-file-name dir))))
+    (when (and (file-directory-p runs)
+               (null (directory-files runs nil directory-files-no-dot-files-regexp)))
+      (delete-directory runs))))
 
 (defun orgist--subprocess-output-relay (name token)
   "Return a function relaying the output of subprocess NAME.
@@ -1516,21 +1557,39 @@ a failed request, its authorization header included."
 (defun orgist--run-subprocess (plist)
   "Spawn an Emacs subprocess with shared boilerplate.
 The bearer token reaches the subprocess on its standard input, never
-on its command line, and is redacted from the output it logs.
+on its command line, and is redacted from the output it logs.  Each
+run has a directory of its own (see `orgist--make-run-directory'),
+removed when it ends.
 PLIST is a property list with these keys:
   :name          — process name string
-  :data-files    — list of temp files to clean up
-  :done-file     — path to done-file
+  :inputs        — alist of (FILE . TEXT) written to the run directory
   :needs-http    — non-nil to propagate request-backend/curl/gnutls settings
   :extra-settings — list of extra `(setq ...)' sexps
   :open-org-files — non-nil to open .org files and build id-caches
-  :job-body      — list of sexps for the subprocess to execute
+  :job-body      — list of sexps for the subprocess to execute; they
+                   find the inputs with `orgist--run-file', and write
+                   the count of what they did to its \"done\" file
+  :shadow        — non-nil to work on a throwaway copy, taking nothing
+                   over; on-success then gets the copy's directory
   :on-success    — function(count) called on completion
   :on-failure    — function(event) called on failure
 Return the process."
+  (let ((dir (orgist--make-run-directory (plist-get plist :name))))
+    (condition-case err
+        (progn
+          (dolist (input (plist-get plist :inputs))
+            (with-temp-file (expand-file-name (car input) dir)
+              (insert (cdr input))))
+          (orgist--start-subprocess dir plist))
+      (error
+       (orgist--remove-run-directory dir)
+       (signal (car err) (cdr err))))))
+
+(defun orgist--start-subprocess (dir plist)
+  "Start the subprocess `orgist--run-subprocess' describes, in run directory DIR.
+PLIST is as for `orgist--run-subprocess'.  Return the process."
   (let* ((name (plist-get plist :name))
-         (data-files (plist-get plist :data-files))
-         (done-file (plist-get plist :done-file))
+         (done-file (expand-file-name "done" dir))
          (needs-http (plist-get plist :needs-http))
          (extra-settings (plist-get plist :extra-settings))
          (open-org-files (plist-get plist :open-org-files))
@@ -1539,16 +1598,15 @@ Return the process."
          (on-failure (plist-get plist :on-failure))
          ;; The subprocess hands back its snapshot changes here; they
          ;; merge against the snapshots as they are now.
-         (delta-file (expand-file-name (concat name "-snapshot-delta.el") orgist-base-dir))
+         (delta-file (expand-file-name "snapshot-delta.el" dir))
          ;; Reminders, collaborators and user profile, for rendering.
-         (state-file (let ((file (expand-file-name (concat name "-state.el") orgist-base-dir))
+         (state-file (let ((file (expand-file-name "state.el" dir))
                            (print-length nil)
                            (print-level nil)
                            (coding-system-for-write 'utf-8-unix))
                        (with-temp-file file
                          (prin1 (orgist--sync-state) (current-buffer)))
                        file))
-         (data-files (cons state-file data-files))
          (snapshot-base (progn (orgist-load-snapshots)
                                (orgist--copy-snapshots
                                 (or orgist-snapshots (make-hash-table :test 'equal)))))
@@ -1557,7 +1615,7 @@ Return the process."
          (shadow (plist-get plist :shadow))
          ;; With `orgist-sole-writer', the subprocess works on a copy.
          (staging (when (or orgist-sole-writer shadow)
-                    (orgist--stage-project-files name)))
+                    (orgist--stage-project-files (expand-file-name "staging/" dir))))
          (staging-dir (car staging))
          ;; Resolve paths
          (emacs-path (concat invocation-directory invocation-name))
@@ -1610,6 +1668,7 @@ Return the process."
                                  ',(if (boundp 'gnutls-trustfiles)
                                        gnutls-trustfiles nil))))
                      ;; Configure orgist
+                     (setq orgist--run-directory ,dir)
                      (setq orgist-base-dir ,orgist-base-dir)
                      (setq orgist-sync-token-filename ,orgist-sync-token-filename)
                      (setq orgist-snapshot-file ,orgist-snapshot-file)
@@ -1703,10 +1762,6 @@ Return the process."
                              (orgist-build-id-cache))))
                      ;; Job body
                      ,@job-body)))))
-    ;; Remove stale done and delta files
-    (dolist (f (list done-file delta-file))
-      (when (file-exists-p f)
-        (delete-file f)))
     (let ((process
            (make-process
             :name name
@@ -1717,59 +1772,49 @@ Return the process."
             :filter (lambda (_proc output) (funcall relay output))
             :sentinel
             (lambda (_proc event)
-              (funcall relay nil)
-              (cond
-               ((string-match-p "finished" event)
-                (orgist-log 'debug "%s subprocess finished" name)
-                (let ((count (when (file-exists-p done-file)
-                               (with-temp-buffer
-                                 (insert-file-contents done-file)
-                                 (string-to-number (string-trim (buffer-string)))))))
-                  ;; Clean up temp files
-                  (dolist (f data-files)
-                    (when (file-exists-p f)
-                      (delete-file f)))
-                  (when (file-exists-p done-file)
-                    (delete-file done-file))
-                  ;; Take the subprocess's file changes: from its
-                  ;; staging copy, or by reverting what it saved.  A
-                  ;; shadow run's caller reads its copy instead.
-                  (let ((deferred-ids
-                         (cond
-                          (shadow nil)
-                          (staging-dir (orgist--finish-staged-run name staging))
-                          (t (orgist--revert-buffers-from-disk) nil))))
-                    ;; Merge the subprocess's snapshot changes, except
-                    ;; for elements of deferred files.
-                    (when-let* ((delta (orgist--read-snapshot-delta delta-file)))
-                      (when deferred-ids
-                        (setq delta (seq-remove (lambda (change)
-                                                  (gethash (car change) deferred-ids))
-                                                delta)))
-                      (orgist-log 'debug "%s: merged %d snapshot change(s)"
-                                  name (orgist--merge-snapshot-delta delta snapshot-base))
-                      (orgist-save-snapshots)))
-                  (when (file-exists-p delta-file)
-                    (delete-file delta-file))
-                  (orgist--flush-log-buffer)
-                  ;; Call on-success; a shadow run's with its copy,
-                  ;; which the caller deletes.
-                  (when on-success
-                    (funcall on-success (if shadow staging-dir count)))))
-               (t
-                (orgist-log 'warn "%s subprocess failed: %s"
-                            name (string-trim event))
-                ;; Clean up temp files
-                (dolist (f (cons delta-file data-files))
-                  (when (file-exists-p f)
-                    (delete-file f)))
-                (when staging-dir
-                  (orgist--remove-staging staging-dir))
-                (orgist--flush-log-buffer)
-                (if on-failure
-                    (funcall on-failure event)
-                  (message "Orgist: %s failed — %s"
-                           name (string-trim event)))))))))
+              ;; The run's files go with it, whatever happens here.
+              (unwind-protect
+                  (progn
+                    (funcall relay nil)
+                    (cond
+                     ((string-match-p "finished" event)
+                      (orgist-log 'debug "%s subprocess finished" name)
+                      (let ((count (when (file-exists-p done-file)
+                                     (with-temp-buffer
+                                       (insert-file-contents done-file)
+                                       (string-to-number (string-trim (buffer-string)))))))
+                        ;; Take the subprocess's file changes: from its
+                        ;; staging copy, or by reverting what it saved.  A
+                        ;; shadow run's caller reads its copy instead.
+                        (let ((deferred-ids
+                               (cond
+                                (shadow nil)
+                                (staging-dir (orgist--finish-staged-run name staging))
+                                (t (orgist--revert-buffers-from-disk) nil))))
+                          ;; Merge the subprocess's snapshot changes, except
+                          ;; for elements of deferred files.
+                          (when-let* ((delta (orgist--read-snapshot-delta delta-file)))
+                            (when deferred-ids
+                              (setq delta (seq-remove (lambda (change)
+                                                        (gethash (car change) deferred-ids))
+                                                      delta)))
+                            (orgist-log 'debug "%s: merged %d snapshot change(s)"
+                                        name (orgist--merge-snapshot-delta delta snapshot-base))
+                            (orgist-save-snapshots)))
+                        (orgist--flush-log-buffer)
+                        ;; Call on-success; a shadow run's with its copy,
+                        ;; which goes with the run.
+                        (when on-success
+                          (funcall on-success (if shadow staging-dir count)))))
+                     (t
+                      (orgist-log 'warn "%s subprocess failed: %s"
+                                  name (string-trim event))
+                      (orgist--flush-log-buffer)
+                      (if on-failure
+                          (funcall on-failure event)
+                        (message "Orgist: %s failed — %s"
+                                 name (string-trim event))))))
+                (orgist--remove-run-directory dir))))))
       ;; The program reads the token from stdin; ending the input makes
       ;; any later read fail rather than wait forever.  A child that
       ;; died already fails through its sentinel.
@@ -1784,82 +1829,76 @@ Return the process."
 
 (defun orgist--subprocess-pull (data)
   "Process sync DATA in a subprocess to avoid blocking the UI.
-Writes the JSON response to a temp file, spawns `emacs --batch'
-to run the full sync (projects, sections, items), then reverts
-buffers and reloads snapshots when the subprocess finishes."
-  (let* ((json-file (expand-file-name "subprocess-data.json" orgist-base-dir))
-         (done-file (expand-file-name "subprocess-done" orgist-base-dir)))
-    ;; Write JSON to temp file
-    (with-temp-file json-file
-      (let ((json-encoding-pretty-print nil))
-        (insert (json-encode data))))
-    (orgist-log 'debug "Spawning subprocess for sync (%d items)"
-                (length (alist-get 'items data)))
-    (orgist-log 'debug "Orgist: syncing %d items in background..."
-                (length (alist-get 'items data)))
-    (orgist--history-checkpoint "Before pull: local state")
-    (orgist--run-subprocess
-     (list
-      :name "orgist-sync"
-      :data-files (list json-file)
-      :done-file done-file
-      :needs-http nil
-      :extra-settings `((setq orgist-sync-project-filter ,orgist-sync-project-filter)
-                         (setq orgist-sync-attachments ,orgist-sync-attachments))
-      :open-org-files nil
-      :job-body `(;; Read JSON and process
-                  (let* ((json-object-type 'alist)
-                         (json-array-type 'vector)
-                         (json-key-type 'symbol)
-                         (data (json-read-file ,json-file))
-                         (sync-token (alist-get 'sync_token data))
-                         (projects (alist-get 'projects data))
-                         (sections (alist-get 'sections data))
-                         (items (alist-get 'items data))
-                         (filter-ids (orgist-resolve-project-filter projects))
-                         (inhibit-redisplay t)
-                         (orgist--batch-save-pending
-                          (make-hash-table :test 'eq))
-                         (gc-cons-threshold (* 100 1024 1024))
-                         (gc-cons-percentage 0.6))
-                    (when filter-ids
-                      (setq projects
-                            (seq-filter
-                             (lambda (p)
-                               (member (alist-get 'id p) filter-ids))
-                             projects))
-                      (setq sections
-                            (seq-filter
-                             (lambda (s)
-                               (member (alist-get 'project_id s) filter-ids))
-                             sections))
-                      (setq items
-                            (seq-filter
-                             (lambda (i)
-                               (member (alist-get 'project_id i) filter-ids))
-                             items)))
-                    ;; Process everything, guarded: a violation leaves
-                    ;; the files unsaved and fails the subprocess.
-                    (orgist--apply-pull projects sections items)
-                    (orgist--flush-pending-saves)
-                    ;; Save snapshots
-                    (orgist-save-snapshots)
-                    ;; Save sync token only after successful processing.
-                    ;; Don't save when filtering, as we skip other
-                    ;; projects' changes and would lose them.
-                    (unless orgist-sync-project-filter
-                      (orgist-save-sync-token sync-token))
-                    ;; Signal completion
-                    (with-temp-file ,done-file
-                      (insert "done\n"))
-                    (message "orgist subprocess: sync complete")))
-      :on-success (lambda (_count)
-                    (orgist--finish-pull)
-                    (message "Orgist: sync complete"))
-      :on-failure (lambda (event)
-                    (setq orgist-sync-mutex nil)
-                    (message "Orgist: sync failed — %s"
-                             (string-trim event)))))))
+Hands the JSON response to `emacs --batch' to run the full sync
+\(projects, sections, items), then reverts buffers and reloads
+snapshots when the subprocess finishes."
+  (orgist-log 'debug "Spawning subprocess for sync (%d items)"
+              (length (alist-get 'items data)))
+  (orgist-log 'debug "Orgist: syncing %d items in background..."
+              (length (alist-get 'items data)))
+  (orgist--history-checkpoint "Before pull: local state")
+  (orgist--run-subprocess
+   (list
+    :name "orgist-sync"
+    :inputs (list (cons "data.json" (let ((json-encoding-pretty-print nil))
+                                      (json-encode data))))
+    :needs-http nil
+    :extra-settings `((setq orgist-sync-project-filter ,orgist-sync-project-filter)
+                       (setq orgist-sync-attachments ,orgist-sync-attachments))
+    :open-org-files nil
+    :job-body `(;; Read JSON and process
+                (let* ((json-object-type 'alist)
+                       (json-array-type 'vector)
+                       (json-key-type 'symbol)
+                       (data (json-read-file (orgist--run-file "data.json")))
+                       (sync-token (alist-get 'sync_token data))
+                       (projects (alist-get 'projects data))
+                       (sections (alist-get 'sections data))
+                       (items (alist-get 'items data))
+                       (filter-ids (orgist-resolve-project-filter projects))
+                       (inhibit-redisplay t)
+                       (orgist--batch-save-pending
+                        (make-hash-table :test 'eq))
+                       (gc-cons-threshold (* 100 1024 1024))
+                       (gc-cons-percentage 0.6))
+                  (when filter-ids
+                    (setq projects
+                          (seq-filter
+                           (lambda (p)
+                             (member (alist-get 'id p) filter-ids))
+                           projects))
+                    (setq sections
+                          (seq-filter
+                           (lambda (s)
+                             (member (alist-get 'project_id s) filter-ids))
+                           sections))
+                    (setq items
+                          (seq-filter
+                           (lambda (i)
+                             (member (alist-get 'project_id i) filter-ids))
+                           items)))
+                  ;; Process everything, guarded: a violation leaves
+                  ;; the files unsaved and fails the subprocess.
+                  (orgist--apply-pull projects sections items)
+                  (orgist--flush-pending-saves)
+                  ;; Save snapshots
+                  (orgist-save-snapshots)
+                  ;; Save sync token only after successful processing.
+                  ;; Don't save when filtering, as we skip other
+                  ;; projects' changes and would lose them.
+                  (unless orgist-sync-project-filter
+                    (orgist-save-sync-token sync-token))
+                  ;; Signal completion
+                  (with-temp-file (orgist--run-file "done")
+                    (insert "done\n"))
+                  (message "orgist subprocess: sync complete")))
+    :on-success (lambda (_count)
+                  (orgist--finish-pull)
+                  (message "Orgist: sync complete"))
+    :on-failure (lambda (event)
+                  (setq orgist-sync-mutex nil)
+                  (message "Orgist: sync failed — %s"
+                           (string-trim event))))))
 
 (defun orgist--revert-buffers-from-disk ()
   "Revert all orgist-managed buffers from their files on disk.
@@ -1979,8 +2018,9 @@ property; a file without it is not orgist's to move or remove."
 
 (defun orgist--reset-files ()
   "Return the files and directories orgist owns in `orgist-base-dir'.
-Project files (and their Emacs backups), state, logs, subprocess
-scratch files and the attachment directory."
+Project files (and their Emacs backups), state, logs, the subprocess
+scratch files of versions before run directories, and the attachment
+directory."
   (let ((dir (file-name-as-directory (expand-file-name orgist-base-dir))))
     (seq-filter
      #'file-exists-p
@@ -2019,7 +2059,7 @@ project buffer with unsaved changes."
     (when (y-or-n-p (format "Move %d orgist file(s) to %s and sync afresh from Todoist? "
                             (length files) aside))
       ;; Kill any running subprocesses
-      (dolist (name '("orgist-sync" "orgist-comments" "orgist-completed"))
+      (dolist (name '("orgist-sync" "orgist-shadow" "orgist-comments" "orgist-completed"))
         (when-let* ((proc (get-process name)))
           (when (process-live-p proc)
             (delete-process proc))))
@@ -5961,49 +6001,43 @@ and offers to rebuild when problems are found."
 Runs in a subprocess; calls ON-DONE with the snapshot table that pull
 recorded, Todoist's values as a pull writes them, or with nil when it
 failed.  The files, journal and trash it writes stay in the copy."
-  (let ((json-file (expand-file-name "shadow-data.json" orgist-base-dir))
-        (done-file (expand-file-name "shadow-done" orgist-base-dir)))
-    (with-temp-file json-file
-      (let ((json-encoding-pretty-print nil))
-        (insert (json-encode data))))
-    (orgist--run-subprocess
-     (list
-      :name "orgist-shadow"
-      :shadow t
-      :data-files (list json-file)
-      :done-file done-file
-      :needs-http nil
-      :extra-settings '((setq orgist-sync-project-filter nil))
-      :open-org-files nil
-      :job-body
-      `((let* ((json-object-type 'alist)
-               (json-array-type 'vector)
-               (json-key-type 'symbol)
-               (data (json-read-file ,json-file))
-               (inhibit-redisplay t)
-               (orgist--batch-save-pending (make-hash-table :test 'eq))
-               (gc-cons-threshold (* 100 1024 1024)))
-          ;; Without snapshots no pull keeps local text: every value is
-          ;; Todoist's.
-          (setq orgist-snapshots (make-hash-table :test 'equal)
-                orgist--snapshot-delta-file nil)
-          (orgist--apply-pull (alist-get 'projects data) (alist-get 'sections data)
-                              (alist-get 'items data))
-          (orgist--flush-pending-saves)
-          (orgist--write-snapshot-table
-           orgist-snapshots (expand-file-name "shadow-snapshots.el" orgist-base-dir))
-          (with-temp-file ,done-file (insert "done\n"))))
-      :on-success (lambda (staging-dir)
-                    (let ((table (condition-case err
-                                     (orgist--read-snapshot-table
-                                      (expand-file-name "shadow-snapshots.el" staging-dir))
-                                   (error
-                                    (orgist-log 'error "Shadow pull: could not read its snapshots: %s"
-                                                (error-message-string err))
-                                    nil))))
-                      (orgist--remove-staging staging-dir)
-                      (funcall on-done table)))
-      :on-failure (lambda (_event) (funcall on-done nil))))))
+  (orgist--run-subprocess
+   (list
+    :name "orgist-shadow"
+    :shadow t
+    :inputs (list (cons "data.json" (let ((json-encoding-pretty-print nil))
+                                      (json-encode data))))
+    :needs-http nil
+    :extra-settings '((setq orgist-sync-project-filter nil))
+    :open-org-files nil
+    :job-body
+    `((let* ((json-object-type 'alist)
+             (json-array-type 'vector)
+             (json-key-type 'symbol)
+             (data (json-read-file (orgist--run-file "data.json")))
+             (inhibit-redisplay t)
+             (orgist--batch-save-pending (make-hash-table :test 'eq))
+             (gc-cons-threshold (* 100 1024 1024)))
+        ;; Without snapshots no pull keeps local text: every value is
+        ;; Todoist's.
+        (setq orgist-snapshots (make-hash-table :test 'equal)
+              orgist--snapshot-delta-file nil)
+        (orgist--apply-pull (alist-get 'projects data) (alist-get 'sections data)
+                            (alist-get 'items data))
+        (orgist--flush-pending-saves)
+        (orgist--write-snapshot-table
+         orgist-snapshots (expand-file-name "shadow-snapshots.el" orgist-base-dir))
+        (with-temp-file (orgist--run-file "done") (insert "done\n"))))
+    :on-success (lambda (staging-dir)
+                  (funcall on-done
+                           (condition-case err
+                               (orgist--read-snapshot-table
+                                (expand-file-name "shadow-snapshots.el" staging-dir))
+                             (error
+                              (orgist-log 'error "Shadow pull: could not read its snapshots: %s"
+                                          (error-message-string err))
+                              nil))))
+    :on-failure (lambda (_event) (funcall on-done nil)))))
 
 (defun orgist--local-elements ()
   "Return the elements the project files hold, bound to Todoist IDs.
@@ -9630,11 +9664,7 @@ that haven't been pulled yet.  When FORCE is non-nil (manual
     (if (null task-ids)
         (orgist-log 'debug "Comments: nothing to pull%s"
                     (if force "" " (all tasks already pulled)"))
-    (let* ((ids-file (expand-file-name "comments-task-ids.json" orgist-base-dir))
-           (done-file (expand-file-name "comments-done" orgist-base-dir)))
-    ;; Write task IDs to temp file
-      (with-temp-file ids-file
-        (insert (json-encode (vconcat task-ids))))
+    (progn
     (orgist-log 'debug "Spawning comments subprocess for %d tasks" (length task-ids))
     (orgist-log 'debug "Orgist: pulling comments for %d tasks in background..."
                 (length task-ids))
@@ -9642,14 +9672,13 @@ that haven't been pulled yet.  When FORCE is non-nil (manual
     (orgist--run-subprocess
      (list
       :name "orgist-comments"
-      :data-files (list ids-file)
-      :done-file done-file
+      :inputs (list (cons "task-ids.json" (json-encode (vconcat task-ids))))
       :needs-http t
       :extra-settings `((setq orgist-sync-attachments ,orgist-sync-attachments))
       :open-org-files t
       :job-body `(;; Read task ID list
                   (let* ((json-array-type 'list)
-                         (ids (json-read-file ,ids-file))
+                         (ids (json-read-file (orgist--run-file "task-ids.json")))
                          (total (length ids))
                          (count 0)
                          (skipped 0)
@@ -9714,7 +9743,7 @@ that haven't been pulled yet.  When FORCE is non-nil (manual
                     (let* ((total-time (- (float-time) start-time))
                            (minutes (floor (/ total-time 60)))
                            (seconds (floor (mod total-time 60))))
-                      (with-temp-file ,done-file
+                      (with-temp-file (orgist--run-file "done")
                         (insert (format "%d\n" (- total skipped))))
                       (message "Orgist [INFO] Comments: complete — %d tasks in %dm%02ds (%d skipped, %d errors)"
                                total minutes seconds skipped errors))))
@@ -9834,27 +9863,22 @@ uses the full lookback window instead of last pull timestamp."
                           "%Y-%m-%dT%H:%M:%SZ"
                           (time-subtract nil (* orgist-completed-tasks-since-days
                                                 86400))
-                          t)))
-         (config-file (expand-file-name "completed-config.json" orgist-base-dir))
-         (done-file (expand-file-name "completed-done" orgist-base-dir)))
-    ;; Write config
-    (with-temp-file config-file
-      (insert (json-encode `((since . ,since-time) (until . ,until-time)))))
+                          t))))
     (orgist-log 'debug "Spawning completed-tasks subprocess (since %s)" since-time)
     (orgist-log 'debug "Orgist: pulling completed tasks in background...")
     (orgist--history-checkpoint "Before completed-tasks pull: local state")
     (orgist--run-subprocess
      (list
       :name "orgist-completed"
-      :data-files (list config-file)
-      :done-file done-file
+      :inputs (list (cons "config.json"
+                          (json-encode `((since . ,since-time) (until . ,until-time)))))
       :needs-http t
       :extra-settings nil
       :open-org-files t
       :job-body `(;; Read config
                   (let* ((json-object-type 'alist)
                          (json-key-type 'symbol)
-                         (config (json-read-file ,config-file))
+                         (config (json-read-file (orgist--run-file "config.json")))
                          (since (alist-get 'since config))
                          (until (alist-get 'until config))
                          (start-time (float-time)))
@@ -9897,7 +9921,7 @@ uses the full lookback window instead of last pull timestamp."
                       (let* ((total-time (- (float-time) start-time))
                              (minutes (floor (/ total-time 60)))
                              (seconds (floor (mod total-time 60))))
-                        (with-temp-file ,done-file
+                        (with-temp-file (orgist--run-file "done")
                           (insert (format "%d\n" (length tasks))))
                         (if (length> tasks 0)
                             (message "Orgist [INFO] Completed tasks: done — %d tasks in %dm%02ds"
