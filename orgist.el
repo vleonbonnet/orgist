@@ -269,6 +269,13 @@ trash every file it removes; see \\[orgist-journal]."
   :group 'orgist
   :type '(choice (const :tag "Inside orgist-base-dir" nil) directory))
 
+(defcustom orgist-sync-mutex-timeout 120
+  "Seconds after which `orgist-sync-mutex' is considered stale.
+If a sync operation has held the mutex for longer than this,
+the after-save hook treats it as cleared and logs a warning."
+  :group 'orgist
+  :type 'number)
+
 ;;; Local vars
 (defvar orgist-project-buffer-cache nil
   "Cache mapping Todoist project IDs to their corresponding buffers.
@@ -278,11 +285,6 @@ Each entry is of the form (PROJECT-ID . BUFFER).")
   "Mutex for sync operations.
 When active, holds the timestamp at which it was set.
 Considered stale after `orgist-sync-mutex-timeout' seconds.")
-
-(defvar orgist-sync-mutex-timeout 120
-  "Seconds after which `orgist-sync-mutex' is considered stale.
-If a sync operation has held the mutex for longer than this,
-the after-save hook treats it as cleared and logs a warning.")
 
 (defvar orgist--pull-counts nil
   "Counts from the latest sync response, for summary logging.
@@ -8191,10 +8193,12 @@ for note_add commands instead of a content fingerprint."
   (orgist-log 'debug "Updated snapshots from local state for %d command(s)"
               (length commands)))
 
-(defvar orgist-write-back-timeout 30
+(defcustom orgist-write-back-timeout 30
   "Timeout in seconds for write-back API requests.
 The Todoist Sync API can take several seconds for batch commands.
-Increase this if write-back times out on large batches.")
+Increase this if write-back times out on large batches."
+  :group 'orgist
+  :type 'number)
 
 (defcustom orgist-write-back-batch-size 100
   "Maximum number of commands sent in a single Sync API request.
@@ -8561,8 +8565,10 @@ Returns the integer status code, or nil if not an HTTP error."
              (numberp (cadr rest)))
         (cadr rest))))))
 
-(defvar orgist-request-retry-max 3
-  "Maximum number of retries for transient HTTP and transport errors.")
+(defcustom orgist-request-retry-max 3
+  "Maximum number of retries for transient HTTP and transport errors."
+  :group 'orgist
+  :type 'natnum)
 
 (defun orgist--transport-error-p (error-thrown)
   "Return non-nil if ERROR-THROWN is a retryable transport error.
