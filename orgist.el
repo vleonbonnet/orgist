@@ -3297,6 +3297,18 @@ Content is filled in by `orgist-update-element'."
     (orgist--set-element-id id)
     (orgist-id-cache-put id)))
 
+(defun orgist--completion-counted-p (old-count new-count)
+  "Return non-nil unless Todoist's completion counts rule out a completion.
+OLD-COUNT is the `completed_count' the snapshot recorded, NEW-COUNT
+the pulled one.  Todoist adds one on each completion of a recurring
+task and leaves the count alone when only the date changes.  When
+either count is unknown (a snapshot from before the field, or
+write-back off, which keeps no snapshots), a new date counts as a
+completion, as it did before the counts were recorded."
+  (or (not (natnump old-count))
+      (not (natnump new-count))
+      (> new-count old-count)))
+
 (defconst orgist--user-hooks
   '(org-trigger-hook org-after-todo-state-change-hook org-todo-repeat-hook
     org-after-tags-change-hook org-property-changed-functions)
@@ -3377,6 +3389,7 @@ See `orgist-update-element', which guards this."
          ;; Pre-update state, for synthesizing reopen/repeat log entries.
          (old-state (org-get-todo-state))
          (old-scheduled (org-entry-get (point) "SCHEDULED"))
+         (old-completed-count (plist-get old-snap :completed-count))
          ;; Todoist only knows checked/unchecked, so the keyword the user
          ;; chose is kept whenever it already agrees: any done keyword
          ;; (e.g. CANCELED) for checked=t, any not-done keyword (e.g.
@@ -3500,13 +3513,16 @@ See `orgist-update-element', which guards this."
     ;; - Recurring occurrence completed remotely: Todoist advances the
     ;;   due date while the task stays TODO on both sides.  Record the
     ;;   repeat as TODO -> TODO, matching the entries org itself logs
-    ;;   for locally-completed repeaters.
+    ;;   for locally-completed repeaters.  A new date alone may be a
+    ;;   reschedule: see `orgist--completion-counted-p'.
     (when (and new-state due
                (eq (alist-get 'is_recurring due) t)
                (equal old-state new-state)
                (not (member new-state org-done-keywords))
                old-scheduled
-               (not (equal old-scheduled (org-entry-get (point) "SCHEDULED"))))
+               (not (equal old-scheduled (org-entry-get (point) "SCHEDULED")))
+               (orgist--completion-counted-p
+                old-completed-count (alist-get 'completed_count element)))
       (orgist-insert-log-entry new-state old-state
                                (format-time-string
                                 (org-time-stamp-format 'long 'inactive))))
@@ -5460,7 +5476,10 @@ hold local edits that have not been pushed yet."
                                            (orgist--collect-attachment-files)))
                      :metadata-comment-id (when old-snap
                                             (plist-get old-snap :metadata-comment-id))
-                     :last-repeat (org-entry-get (point) "LAST_REPEAT"))
+                     :last-repeat (org-entry-get (point) "LAST_REPEAT")
+                     ;; Tells a completed recurring task from a
+                     ;; rescheduled one on the next pull.
+                     :completed-count (alist-get 'completed_count element))
                orgist-snapshots))))
 
 (defun orgist--snapshot-warn-unibyte (id field-alist)
@@ -7791,6 +7810,12 @@ Todoist's authoritative next occurrence."
                   (lambda (&key data &allow-other-keys)
                     (setq task data))))
       (when task
+        ;; Record the count this close raised, so the pull that echoes
+        ;; it does not log the completion a second time.
+        (when-let* ((count (alist-get 'completed_count task))
+                    (snapshot (and orgist-snapshots (gethash id orgist-snapshots))))
+          (puthash id (plist-put (copy-sequence snapshot) :completed-count count)
+                   orgist-snapshots))
         (let ((due (alist-get 'due task))
               (duration (alist-get 'duration task)))
           (orgist--at-element id nil
