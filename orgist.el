@@ -3377,13 +3377,15 @@ See `orgist-update-element', which guards this."
          ;; Pre-update state, for synthesizing reopen/repeat log entries.
          (old-state (org-get-todo-state))
          (old-scheduled (org-entry-get (point) "SCHEDULED"))
-         ;; A done-type keyword the user chose (e.g. CANCELED) is kept:
-         ;; Todoist only knows checked/unchecked, so any done keyword
-         ;; already satisfies checked=t.
+         ;; Todoist only knows checked/unchecked, so the keyword the user
+         ;; chose is kept whenever it already agrees: any done keyword
+         ;; (e.g. CANCELED) for checked=t, any not-done keyword (e.g.
+         ;; STARTED) for checked=nil.  Rewriting STARTED to TODO was a
+         ;; state change that ran the user's todo hooks on every pull.
          (new-state (when content
                       (if (eq (alist-get 'checked element) t)
                           (if (member old-state org-done-keywords) old-state "DONE")
-                        "TODO"))))
+                        (if (member old-state org-not-done-keywords) old-state "TODO")))))
     (orgist-log 'debug "Updating element %s at point %d"
                 (orgist--id-label id (or content name)) (point))
     ;; Set heading text (convert markdown formatting to org)

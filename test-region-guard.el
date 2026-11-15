@@ -9,8 +9,9 @@
 ;; smeared that element's state and dates across ~90 headings.  Also
 ;; covers the org-blocker-hook guard (a completed Todoist parent with
 ;; open subtasks must still become DONE), preservation of user-chosen
-;; done-type keywords (CANCELED), and the no-op state transition skip
-;; that prevents org-auto-repeat bounces on repeatered DONE tasks.
+;; done-type keywords (CANCELED) and not-done keywords (STARTED), and
+;; the no-op state transition skip that prevents org-auto-repeat
+;; bounces on repeatered DONE tasks.
 
 (add-to-list 'load-path
              (expand-file-name "~/.emacs.d/elpaca/builds/request"))
@@ -29,7 +30,7 @@
   "Run BODY in a temp org buffer containing CONTENT, point at start."
   (declare (indent 1))
   `(with-temp-buffer
-     (let ((org-todo-keywords '((sequence "TODO" "|" "DONE" "CANCELED"))))
+     (let ((org-todo-keywords '((sequence "TODO" "STARTED" "|" "DONE" "CANCELED"))))
        (insert ,content)
        (org-mode)
        (goto-char (point-min))
@@ -39,9 +40,11 @@
 
 (defun orgist-test--element (&rest overrides)
   "Build a minimal Todoist element alist, applying OVERRIDES."
-  (let ((base '((id . "TARGET1") (content . "Target task")
-                (checked . :json-false) (priority . 1)
-                (project_id . "PROJX"))))
+  ;; A fresh copy: `setf' below would otherwise edit the quoted
+  ;; constant, leaking one test's overrides into the next.
+  (let ((base (copy-tree '((id . "TARGET1") (content . "Target task")
+                           (checked . :json-false) (priority . 1)
+                           (project_id . "PROJX")))))
     (dolist (kv overrides base)
       (setf (alist-get (car kv) base) (cdr kv)))))
 
@@ -123,6 +126,66 @@ SCHEDULED: <2026-01-03 Sat ++1w>
     (orgist-update-element (orgist-test--element '(checked . t)) t)
     (orgist-test--goto-id "TARGET1")
     (should (equal "CANCELED" (org-get-todo-state)))))
+
+(ert-deftest orgist-region-guard/not-done-keyword-preserved ()
+  "A user-chosen not-done keyword survives an unchecked pull."
+  (orgist-test--with-org-buffer
+      "* STARTED Target task
+:PROPERTIES:
+:ID:       TARGET1
+:END:
+"
+    (orgist-test--goto-id "TARGET1")
+    (orgist-update-element (orgist-test--element) t)
+    (orgist-test--goto-id "TARGET1")
+    (should (equal "STARTED" (org-get-todo-state)))))
+
+(ert-deftest orgist-region-guard/unchecked-pull-runs-no-todo-hooks ()
+  "An unchecked pull of a STARTED repeater runs no state-change hooks.
+On 2026-09-12 such a pull rewrote STARTED to TODO, which ran a user
+hook that reset the parent's DONE children, and write-back then
+reopened them in Todoist."
+  (orgist-test--with-org-buffer
+      "* STARTED Target task
+SCHEDULED: <2026-09-12 Sat +10y>
+:PROPERTIES:
+:ID:       TARGET1
+:END:
+** DONE Finished child
+:PROPERTIES:
+:ID:       CHILD1
+:END:
+"
+    (let* ((calls 0)
+           (org-after-todo-state-change-hook
+            (list (lambda ()
+                    (setq calls (1+ calls))
+                    (org-map-entries (lambda () (org-todo "TODO"))
+                                     "/DONE" 'tree)))))
+      (orgist-test--goto-id "TARGET1")
+      (orgist-update-element
+       (orgist-test--element
+        '(due . ((date . "2026-09-13") (string . "every 10 years")
+                 (is_recurring . t))))
+       t)
+      (should (= 0 calls)))
+    (orgist-test--goto-id "TARGET1")
+    (should (equal "STARTED" (org-get-todo-state)))
+    (orgist-test--goto-id "CHILD1")
+    (should (equal "DONE" (org-get-todo-state)))))
+
+(ert-deftest orgist-region-guard/reopen-sets-todo ()
+  "A done task reopened in Todoist becomes TODO."
+  (orgist-test--with-org-buffer
+      "* DONE Target task
+:PROPERTIES:
+:ID:       TARGET1
+:END:
+"
+    (orgist-test--goto-id "TARGET1")
+    (orgist-update-element (orgist-test--element) t)
+    (orgist-test--goto-id "TARGET1")
+    (should (equal "TODO" (org-get-todo-state)))))
 
 (ert-deftest orgist-region-guard/no-repeat-bounce-on-unchanged-done ()
   "Re-applying DONE to a repeatered DONE task must not bounce it to TODO."
