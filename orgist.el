@@ -3666,7 +3666,7 @@ touched."
            ((> depth 0)
             (forward-line 1))
            ((looking-at org-outline-regexp-bol)
-            (let* ((id (orgist--element-heading-p))
+            (let* ((id (or (orgist--element-heading-p) (orgist--archived-root-p)))
                    (id-end (and id (orgist--subtree-end))))
               (cond
                ;; Todoist child with a usable subtree end: record it as
@@ -3878,7 +3878,7 @@ Todoist parent is the task.  Returns the number of subtrees moved."
             (when (and desc-level (<= level desc-level))
               (setq desc-level nil))
             (cond
-             ((orgist--element-heading-p)
+             ((or (orgist--element-heading-p) (orgist--archived-root-p))
               (let ((end (min subtree-end (orgist--subtree-end))))
                 (when desc-level
                   (push (cons (point) end) regions))
@@ -4061,8 +4061,9 @@ those first (see `orgist--hoist-nested-elements')."
               (push (cons pos subtree-end) regions)
               (setq pos subtree-end))
           (goto-char (line-beginning-position))
-          (if (orgist--element-heading-p)
-              ;; Element: the gap before it, then skip its subtree.
+          (if (or (orgist--element-heading-p) (orgist--archived-root-p))
+              ;; Element or archived subtree: the gap before it, then
+              ;; skip its subtree.
               (progn
                 (when (< pos (point))
                   (push (cons pos (point)) regions))
@@ -4513,12 +4514,14 @@ at their position, preventing stale references after body edits."
     ;; Check file-level property drawer
     (when-let* ((file-id (orgist--element-id (point-min))))
       (puthash file-id (copy-marker (point-min) t) orgist-id-cache))
-    ;; Scan all headings
+    ;; Scan all headings; those in archived subtrees are not elements
+    ;; (see `orgist--archived-root-p').
     (while (re-search-forward org-property-start-re nil t)
       (when-let* ((id (orgist--element-id)))
         (save-excursion
           (org-back-to-heading-or-point-min t)
-          (puthash id (copy-marker (point) t) orgist-id-cache))))))
+          (unless (orgist--in-archived-subtree-p)
+            (puthash id (copy-marker (point) t) orgist-id-cache)))))))
 
 (defun orgist-rebuild-subtree-cache ()
   "Update ID cache for just the subtree at point.
@@ -4561,7 +4564,8 @@ the rare cache-repair path."
         (let ((pos (save-excursion
                      (org-back-to-heading-or-point-min t)
                      (point))))
-          (when (equal (orgist--element-id pos) element-id)
+          (when (and (equal (orgist--element-id pos) element-id)
+                     (not (orgist--in-archived-subtree-p pos)))
             (setq found pos))))
       found)))
 
@@ -4585,7 +4589,8 @@ every snapshot ID in every file."
                     (save-excursion
                       (goto-char pos)
                       (org-back-to-heading-or-point-min t)
-                      (when (equal (orgist--element-id) element-id)
+                      (when (and (equal (orgist--element-id) element-id)
+                                 (not (orgist--in-archived-subtree-p)))
                         (point))))))
       (or cached
           ;; Stale cache entry — rescan before concluding it is gone.
@@ -6840,7 +6845,8 @@ ID) are included so they can be pushed to the parent task."
           ;; Only direct children (one level deeper), not deeper descendants
           ;; with their own TODO parent.
           (when (and (= (org-current-level) (1+ level))
-                     (not (org-get-todo-state)))
+                     (not (org-get-todo-state))
+                     (not (orgist--archived-root-p)))
             (let ((dir (org-attach-dir nil t)))
               (when (and dir (file-directory-p dir))
                 (dolist (f (org-attach-file-list dir))
@@ -6907,15 +6913,63 @@ without the properties the buffer displays it with."
 Tasks (any TODO keyword), sections, and headings bound to a Todoist
 ID are elements.  Any other heading under a task belongs to the
 task's description; such a heading may carry an org-id of its own,
-which does not make it an element."
+which does not make it an element.  Nothing inside an archived
+subtree is an element (see `orgist--archived-root-p')."
   (save-excursion
     (goto-char (or pom (point)))
-    (or (org-get-todo-state)
-        (org-entry-get (point) "SECTION")
-        (org-entry-get (point) orgist-todoist-id-property)
-        (let ((id (orgist--org-id)))
-          (and id (or (not (orgist--temp-id-p id))
-                      (and orgist-snapshots (gethash id orgist-snapshots))))))))
+    (and (not (orgist--in-archived-subtree-p))
+         (or (org-get-todo-state)
+             (org-entry-get (point) "SECTION")
+             (org-entry-get (point) orgist-todoist-id-property)
+             (let ((id (orgist--org-id)))
+               (and id (or (not (orgist--temp-id-p id))
+                           (and orgist-snapshots (gethash id orgist-snapshots)))))))))
+
+(defun orgist--archived-root-p (&optional pom)
+  "Return non-nil if the heading at POM (default point) roots an archived subtree.
+That is a heading carrying the :ARCHIVE: tag itself, not by
+inheritance, that is not a section.  An archived section is a
+Todoist element.  Any other archived subtree is outside the sync:
+its headings are neither elements nor description, so a task moved
+into one is deleted in Todoist, a task written in one is never
+created there, and replacing the description of the task above it
+keeps it."
+  (save-excursion
+    (goto-char (or pom (point)))
+    (and (org-at-heading-p)
+         (member "ARCHIVE" (org-get-tags nil t))
+         (not (org-entry-get (point) "SECTION")))))
+
+(defvar-local orgist--archived-regions-cache nil
+  "Cons of the buffer's character tick and its `orgist--archived-regions'.")
+
+(defun orgist--archived-regions ()
+  "Return the archived subtrees of the buffer, as a list of (BEG . END).
+See `orgist--archived-root-p'.  Cached until the buffer text changes;
+most buffers have none, which keeps the check per heading cheap."
+  (let ((tick (buffer-chars-modified-tick)))
+    (if (eq (car orgist--archived-regions-cache) tick)
+        (cdr orgist--archived-regions-cache)
+      (let ((regions nil)
+            (case-fold-search nil))
+        (org-with-wide-buffer
+         (goto-char (point-min))
+         (while (re-search-forward "^\\*+ .*:ARCHIVE:" nil t)
+           (goto-char (line-beginning-position))
+           (if (orgist--archived-root-p)
+               (let ((beg (point)))
+                 (goto-char (orgist--subtree-end))
+                 (push (cons beg (point)) regions))
+             (forward-line 1))))
+        (setq regions (nreverse regions))
+        (setq orgist--archived-regions-cache (cons tick regions))
+        regions))))
+
+(defun orgist--in-archived-subtree-p (&optional pom)
+  "Return non-nil if POM (default point) lies in an archived subtree."
+  (let ((pos (if pom (if (markerp pom) (marker-position pom) pom) (point))))
+    (seq-some (lambda (region) (and (>= pos (car region)) (< pos (cdr region))))
+              (orgist--archived-regions))))
 
 (defun orgist--description-subheadings ()
   "Return the description sub-headings of the task at point, as strings.
@@ -6929,7 +6983,7 @@ metadata.  Element subtrees are skipped whole."
       (forward-line 1)
       (while (re-search-forward org-outline-regexp-bol subtree-end t)
         (goto-char (line-beginning-position))
-        (if (orgist--element-heading-p)
+        (if (or (orgist--element-heading-p) (orgist--archived-root-p))
             (goto-char (min subtree-end (orgist--subtree-end)))
           (let* ((stars (make-string (max 1 (- (org-current-level) task-level)) ?*))
                  (title (substring-no-properties (org-get-heading t t t t)))
@@ -7227,6 +7281,8 @@ and every other element and file is still processed."
                                              (and (orgist--temp-id-p org-id)
                                                   (not (gethash org-id orgist-snapshots)))))))
                       (cond
+                       ;; Archived subtree: outside the sync.
+                       ((orgist--in-archived-subtree-p) nil)
                        ((and unbound (org-get-todo-state) (not section))
                         (let ((temp-id (orgist--mint-temp-id)))
                           (push (cons temp-id 'new) file-changes)

@@ -100,7 +100,8 @@ run_ert() {
     for file in test-due-string.el test-region-guard.el test-sync-token.el \
                 test-id-cache.el test-body-spacing.el test-new-item-order.el \
                 test-confirm.el test-local-links.el test-element-identity.el \
-                test-description-subtree.el test-log-notes.el test-repeat-log.el \
+                test-description-subtree.el test-archived-subtree.el \
+                test-log-notes.el test-repeat-log.el \
                 test-safety.el \
                 test-safety-orgist.el test-seams.el; do
         echo "Running ERT suite $file..."

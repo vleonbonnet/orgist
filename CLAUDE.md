@@ -48,6 +48,7 @@ Never run orgist batch code against the real `orgist-base-dir`: in batch, write-
 - `test-local-links.el` — ERT regression tests for local Org links across Markdown conversion
 - `test-element-identity.el` — ERT regression tests for element identity (a pre-existing org-id survives the push; Todoist ID in `TODOIST_ID`)
 - `test-description-subtree.el` — ERT regression tests for task descriptions (non-task child headings travel in the description; unchanged descriptions keep the org body; nested tasks are never deleted)
+- `test-archived-subtree.el` — ERT regression tests for archived subtrees (an `:ARCHIVE:` subtree under a task is outside the sync: its tasks are deleted in Todoist, never created, and kept when the description is replaced)
 - `test-safety.el` — ERT tests for `org-sync-safety` (history backends, journal, trash, guards)
 - `test-safety-orgist.el` — ERT tests for orgist's safety net (journaled deletions, sub-project deletion, rollback on smear or lost element, user hooks exempt, safe reset, journal restore)
 - `test-seams.el` — ERT tests for the M1 seams (project-file registry, element lookup, remote operations and `orgist-read-only`, file policy, subprocess snapshot hand-back, sole-writer staging)
