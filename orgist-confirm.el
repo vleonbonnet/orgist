@@ -232,11 +232,12 @@ Todoist without Todoist having changed."
                                  :attachment-files (plist-get local :attachment-files)))))
     (nreverse fields)))
 
-(defun orgist-confirm--new-notes (pos known-count)
-  "Return the note texts at POS beyond the first KNOWN-COUNT ones."
-  (save-excursion
-    (goto-char pos)
-    (mapcar #'cdr (nthcdr known-count (seq-uniq (orgist-extract-logbook-notes) #'equal)))))
+(defun orgist-confirm--new-notes (buffer pos known-count)
+  "Return the note texts at POS in BUFFER beyond the first KNOWN-COUNT ones."
+  (with-current-buffer buffer
+    (save-excursion
+      (goto-char pos)
+      (mapcar #'cdr (nthcdr known-count (seq-uniq (orgist-extract-logbook-notes) #'equal))))))
 
 (defun orgist-confirm--modified-fields (diff snapshot remote loc)
   "Return (FIELDS . REMOTE-CHANGED) for a modified element.
@@ -250,7 +251,7 @@ state, REMOTE its live state or nil, LOC its (PROJECT BUFFER . POS)."
              (new (cddr change)))
         (cond
          ((eq field :notes)
-          (dolist (note (if loc (orgist-confirm--new-notes (cddr loc) old) nil))
+          (dolist (note (if loc (orgist-confirm--new-notes (cadr loc) (cddr loc) old) nil))
             (push (list :name "note" :new note) fields)))
          (t
           (when (and remote (memq field orgist-confirm--remote-fields))

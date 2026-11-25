@@ -130,6 +130,23 @@ Call the studio.
         (should (plist-get label-item :fixed))
         (should (null (plist-get label-item :data)))))))
 
+(ert-deftest orgist-confirm/new-note-read-from-a-non-org-buffer ()
+  "A new logbook note is read from the task's buffer, not the current one."
+  (orgist-test-confirm--with-project
+    (with-current-buffer buf
+      (goto-char (point-min))
+      (re-search-forward "^:ID: +T1\n:END:\n")
+      (insert ":LOGBOOK:\n- [2026-11-24 Tue 10:00] Note \\\\\n  Picked the adapter seat.\n:END:\n"))
+    (with-temp-buffer
+      (let* ((items (orgist-confirm--items
+                     '(("T1" . ((:notes . (0 . 1)))))
+                     '(((type . "note_add") (uuid . "u5") (temp_id . "N1")
+                        (args . ((item_id . "T1") (content . "Picked the adapter seat.")))))))
+             (modified (orgist-test-confirm--find items "Renew passport")))
+        (should (equal '(("note" . "Picked the adapter seat."))
+                       (mapcar (lambda (f) (cons (plist-get f :name) (plist-get f :new)))
+                               (plist-get modified :fields))))))))
+
 (ert-deftest orgist-confirm/remote-value-replaces-old-and-warns ()
   "The live Todoist value is the old side; a drift from the snapshot warns."
   (orgist-test-confirm--with-project
